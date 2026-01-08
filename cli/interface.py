@@ -57,7 +57,8 @@ def init(workspace, excluded):
 
 @cli.command()
 @click.option("--query", prompt="Enter your request")
-def ask(query):
+@click.option("--num-files", "-n", default=3, prompt="Maximum number of files to embed in request")
+def ask(query, num_files):
     """Ask the AI about your code"""
     workspace = Workspace(".")
     lm_client = LMStudioClient()
@@ -71,7 +72,7 @@ def ask(query):
         query_embedding = lm_client.get_embedding(query)
 
         # Search for relevant files
-        results = embedding_manager.search(query_embedding, k=3)
+        results = embedding_manager.search(query_embedding, k=num_files)
         print(f"\nFound {len(results)} potentially relevant files:")
 
         for i, result in enumerate(results, 1):
