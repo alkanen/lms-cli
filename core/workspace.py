@@ -10,7 +10,10 @@ class Workspace:
             raise ValueError(f"Workspace path {root_path} does not exist")
 
     def list_files(
-        self, extension: str = None, excluded_folders: Optional[Iterable[str]] = None
+        self,
+        included_folders: Iterable[str],
+        extension: str = None,
+        excluded_folders: Optional[Iterable[str]] = None
     ) -> List[Path]:
         """List all files in the workspace with optional extension filter"""
         files = []
@@ -18,14 +21,20 @@ class Workspace:
         for ext in (
             ["*.py", "*.cpp", "*.h", "*cu"] if not extension else [f"*.{extension}"]
         ):
-            files.extend(self.root_path.rglob(ext))
+            for folder in included_folders:
+                files.extend((self.root_path / folder).rglob(ext))
 
         extended_exclusion = [str(self.root_path / folder) for folder in excluded_folders]
+
         accepted_files = []
         for file_path in sorted(files):
+            accepted = True
             for excluded in extended_exclusion:
-                if not str(file_path).startswith(excluded):
-                    accepted_files.append(file_path)
+                if str(file_path).startswith(excluded):
+                    accepted = False
+
+            if accepted:
+                accepted_files.append(file_path)
 
         return accepted_files
 

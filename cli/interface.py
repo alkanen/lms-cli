@@ -19,17 +19,16 @@ def init(workspace, excluded):
     workspace = Workspace(workspace)
     embedding_manager = EmbeddingManager()
 
-    if not click.confirm("This will create an embedding index of your code. Contine?"):
+    if not click.confirm("This will create an embedding index of your code. Continue?"):
         return
 
+    included_set = embedding_manager.inclusion_paths
+    excluded_set = set(excluded)
+    excluded_set.update(embedding_manager.exclusion_paths)
+
     # Get all files in workspace
-    files = workspace.list_files(excluded_folders=excluded)
+    files = workspace.list_files(included_folders=included_set, excluded_folders=excluded_set)
     print(f"Found {len(files)} files to process")
-
-    for file in files:
-        print(f"  {file}")
-
-    exit
 
     # Process files and get embeddings
     lm_client = LMStudioClient()
@@ -51,9 +50,6 @@ def init(workspace, excluded):
             }
         )
 
-        # Clean out old embeddings
-        embedding_manager.delete_with_metadata_key_value({"file": filename})
-
     # Add to index
     embedding_manager.add_embeddings(embeddings, metadata)
     print("Embedding index created successfully")
@@ -62,7 +58,7 @@ def init(workspace, excluded):
 @cli.command()
 @click.option("--query", prompt="Enter your request")
 def ask(query):
-    """Ask the aI about your code"""
+    """Ask the AI about your code"""
     workspace = Workspace(".")
     lm_client = LMStudioClient()
     embedding_manager = EmbeddingManager()
@@ -80,7 +76,7 @@ def ask(query):
 
         for i, result in enumerate(results, 1):
             print(
-                f"{i}. {result['metadata']['file']} (distance: {result['distance']:.2f})"
+                f"{i}. {result['metadata']['file']} (similarity: {result['similarity']:.2f})"
             )
 
         # Prepare context
@@ -111,6 +107,10 @@ def shell():
     lm_client = LMStudioClient()
     tool_registry = ToolRegistry()
 
+    # Prepare messages
+    messages = [
+        {"role": "system", "content": lm_client.system_message},
+    ]
     print("Starting interactive shell. Type 'exit' to quit.")
     while True:
         try:
@@ -118,11 +118,8 @@ def shell():
             if not user_input or user_input.lower() == "exit":
                 break
 
-            # Prepare messages
-            messages = [
-                {"role": "system", "content": lm_client.system_message},
-                {"role": "user", "content": user_input},
-            ]
+            # Add to messages
+            messages.append({"role": "user", "content": user_input})
 
             # Get available tool definitions
             tools = [
