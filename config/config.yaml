@@ -1,0 +1,23 @@
+lm_studio:
+  base_url: "http://192.168.1.8:1234/v1"    # Update to your server, or `null` for default
+  model: "mistralai/devstral-small-2-2512"  # Or whatever model you wish to use
+  api_key: null                             # If authentication is required
+
+embeddings:
+  enabled: false
+  model: "text-embedding-nomic-embed-text-v1.5"
+  dimension: 768  # Should match your embedding model's output size
+  index_path: ".code_assistant_index"
+
+agent:
+  system_message: "You are a helpful coding assistant. You can use tools to interact with \
+this workspace. We precise, avoid flattery, write maintainable code following the code \
+standard in the example files you are provided, if any."
+
+tools:
+  - name: "file_search"
+    description: "Search for files in the workspace"
+    parameters:
+      - name: "query"
+        type: "string"
+        required: true
