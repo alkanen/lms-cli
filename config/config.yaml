@@ -18,9 +18,11 @@ embeddings:
     - "core/embedding_manager_faiss.py"
 
 agent:
-  system_message: "You are a helpful coding assistant. You can use tools to interact with \
-this workspace. We precise, avoid flattery, write maintainable code following the code \
-standard in the example files you are provided, if any."
+  system_message: "You are a coding assistant. You can use tools to interact with \
+this workspace. Be precise, avoid flattery, write maintainable code following the code \
+standard in the example files you are provided, if any. The current task is to \
+implement an OpenAI API compatible AI CLI tool. Focus on the last message in a request \
+and merely use the earlier messages for context, not something to respond to."
 
 tools:
   - name: "file_search"
