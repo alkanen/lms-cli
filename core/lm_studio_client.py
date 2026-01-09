@@ -26,9 +26,9 @@ class LMStudioClient:
     def _make_request(
         self, endpoint: str, method: str = "POST", data: Optional[Dict] = None
     ) -> Dict:
-        headers = {"Contetn-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_ley}"
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self.base_url}/{endpoint}"
         response = requests.request(method, url, json=data, headers=headers)
