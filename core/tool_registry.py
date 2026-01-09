@@ -28,7 +28,7 @@ class ToolRegistry:
             "type": "function",
             "function": {
                 "name": name,
-                "description": self.tols[name]["description"],
+                "description": self.tools[name]["description"],
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -16,10 +16,13 @@ def cli():
 @cli.command()
 @click.option("--workspace", default=".", help="Workspace directory")
 @click.option("--excluded", multiple=True, help="Folders to exclude")
-def init(workspace, excluded):
+@click.option(
+    "--config", help="Optional configuration file", default="config/config.yaml"
+)
+def init(workspace, excluded, config):
     """Initialize the workspace and create embeddings index"""
     workspace = Workspace(workspace)
-    embedding_manager = EmbeddingManager()
+    embedding_manager = EmbeddingManager(config_path=config)
 
     if not click.confirm("This will create an embedding index of your code. Continue?"):
         return
@@ -35,7 +38,7 @@ def init(workspace, excluded):
     print(f"Found {len(files)} files to process")
 
     # Process files and get embeddings
-    lm_client = LMStudioClient()
+    lm_client = LMStudioClient(config_path=config)
     embeddings = []
     metadata = []
 
@@ -64,10 +67,13 @@ def init(workspace, excluded):
 @click.option(
     "--num-files", "-n", default=3, help="Maximum number of files to embed in request"
 )
-def ask(query, num_files):
+@click.option(
+    "--config", help="Optional configuration file", default="config/config.yaml"
+)
+def ask(query, num_files, config):
     """Ask the AI about your code"""
-    lm_client = LMStudioClient()
-    embedding_manager = EmbeddingManager()
+    lm_client = LMStudioClient(config_path=config)
+    embedding_manager = EmbeddingManager(config_path=config)
 
     # First check if we have an index
     try:
@@ -120,10 +126,14 @@ def ask(query, num_files):
 
 
 @cli.command()
-def shell():
+@click.option(
+    "--config", help="Optional configuration file", default="config/config.yaml"
+)
+def shell(config):
     """Interactive shell mode"""
-    lm_client = LMStudioClient()
+    lm_client = LMStudioClient(config_path=config)
     tool_registry = ToolRegistry()
+    tool_registry.load_from_config(config_path=config)
 
     # Prepare initial messages
     messages = [
