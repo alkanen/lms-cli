@@ -14,7 +14,7 @@ class LMStudioClient:
         # If no embedding model is specified, revert to main model
         self.embedding_model = self.config["embeddings"].get("model", self.model)
 
-        self.system_message = self.system_message = self.config.get("agent", {}).get(
+        self.system_message = self.config.get("agent", {}).get(
             "system_message", None
         )
         if not self.system_message:

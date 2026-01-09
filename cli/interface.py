@@ -3,7 +3,7 @@ from core.lm_studio_client import LMStudioClient
 from core.workspace import Workspace
 from core.tool_registry import ToolRegistry
 from core.embedding_manager import EmbeddingManager
-
+from core.file_reference_parser import FileReferenceParser
 
 @click.group()
 def cli():
@@ -108,16 +108,19 @@ def shell():
     lm_client = LMStudioClient()
     tool_registry = ToolRegistry()
 
-    # Prepare messages
+    # Prepare initial messages
     messages = [
         {"role": "system", "content": lm_client.system_message},
     ]
     print("Starting interactive shell. Type 'exit' to quit.")
+
     while True:
         try:
             user_input = input("\n> ").strip()
             if not user_input or user_input.lower() == "exit":
                 break
+
+            user_input = FileReferenceParser.parse_message(user_input)
 
             # Add to messages
             messages.append({"role": "user", "content": user_input})
@@ -127,19 +130,38 @@ def shell():
                 tool_registry.get_tool_definition(name) for name in tool_registry.tools
             ]
 
-            # First call without tools to see if we need any
+            # Get response from AI
             response = lm_client.chat_completion(messages, tools=tools)
+
+            # Process the response
+            try:
+                assistant_message = response["choices"][0]["message"]
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_message["content"],
+                        **(
+                            {
+                                k: v for k, v in assistant_message.items()
+                                if k != "content"
+                            }
+                            if "tool_calls" in assistant_message else {}
+                        )
+                    }
+                )
+            except (KeyError, IndexError):
+                continue
 
             # Check for tool calls
             tool_calls = lm_client.parse_tool_calls(response)
 
             while tool_calls:
                 print("\nTool calls detected:")
-                for tc in tool_Calls:
+                for tc in tool_calls:
                     print(f"- {tc['function']['name']}({tc['function']['arguments']})")
 
-                # Execute tools
-                new_messages = []
+                # Execute tools and collect responses
+                tool_responses = []
                 for tc in tool_calls:
                     try:
                         result = tool_registry.execute_tool(
@@ -148,7 +170,7 @@ def shell():
                         print(f"\nTool {tc['function']['name']} returned: {result}")
 
                         # Add tool response to messages
-                        new_messages.append(
+                        tool_responses.append(
                             {
                                 "role": "tool",
                                 "content": str(result),
@@ -156,7 +178,7 @@ def shell():
                             }
                         )
                     except Exception as e:
-                        new_messages.append(
+                        tool_responses.append(
                             {
                                 "role": "tool",
                                 "content": f"Error {str(e)}",
@@ -165,14 +187,28 @@ def shell():
                         )
 
                 # Add tool responses to messages
-                messages.extend(new_messages)
+                messages.extend(tool_responses)
 
                 # Continue conversation with tool results
                 response = lm_client.chat_completion(messages, tools=tools)
+                assistant_message = response["choices"][0]["message"]
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_message["content"],
+                        **(
+                            {
+                                k: v for k, v in assistant_message.items()
+                                if k != "content"
+                            }
+                            if "tool_calls" in assistant_message else {}
+                        )
+                    }
+                )
                 tool_calls = lm_client.parse_tool_calls(response)
 
             # Print final response
-            print("\nAssistant:", response["choices"][0]["message"]["content"])
+            print("\nAssistant:", messages[-1]["content"])
 
         except KeyboardInterrupt:
             break
