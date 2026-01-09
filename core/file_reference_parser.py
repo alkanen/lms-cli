@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import List
 
+
 class FileReferenceParser:
     @staticmethod
     def parse_message(message: str) -> str:
@@ -18,7 +19,7 @@ class FileReferenceParser:
         Raises:
             ValueError: If line numbers are invalid or file doesn't exist
         """
-        parts = []
+        parts: List[str] = []
         original_parts = message.split()
 
         for i, part in enumerate(original_parts):
@@ -33,7 +34,9 @@ class FileReferenceParser:
                         filename, line_numbers = filename.split(":", 1)
 
                         if "-" in line_numbers:
-                            start_line, end_line = [int(x) for x in line_numbers.split("-", 1)]
+                            start_line, end_line = [
+                                int(x) for x in line_numbers.split("-", 1)
+                            ]
                             start_line -= 1
                         else:
                             start_line = int(line_numbers) - 1
@@ -61,7 +64,9 @@ class FileReferenceParser:
                         section = f"line {start_line + 1}"
 
                     # Add file section header
-                    parts.append(f"\n=== START FILE SECTION '{filename}', {section} ===\n")
+                    parts.append(
+                        f"\n=== START FILE SECTION '{filename}', {section} ===\n"
+                    )
 
                     # Add content based on line range
                     if end_line == -1:
@@ -73,7 +78,7 @@ class FileReferenceParser:
 
                     parts.append(f"\n=== END FILE SECTION '{filename}' ===\n")
 
-                except (ValueError, FileNotFoundError) as e:
+                except (ValueError, FileNotFoundError):
                     # Keep original reference if there's an error
                     parts.append(part)
             else:
@@ -95,17 +100,18 @@ class FileReferenceParser:
             UnicodeDecodeError: If file cannot be decoded
         """
         try:
-            return file_path.read_text(encoding='utf-8')
+            return file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             # Fallback to latin-1 for binary files
-            return file_path.read_text(encoding='latin-1')
+            return file_path.read_text(encoding="latin-1")
+
 
 def main():
     test_cases = [
         "Read the contents of @core/file_reference_parser.py please",
         "Check lines 5-10 of @core/file_reference_parser.py:5-10",
         "Look at line 20 of @nonexistent_file.txt:20",
-        "Multiple @file1.py and @file2.py references"
+        "Multiple @file1.py and @file2.py references",
     ]
 
     for message in test_cases:
@@ -113,6 +119,7 @@ def main():
         print("Parsed:")
         print(FileReferenceParser.parse_message(message))
         print("-" * 50)
+
 
 if __name__ == "__main__":
     main()

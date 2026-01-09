@@ -1,9 +1,11 @@
 import click
-from core.lm_studio_client import LMStudioClient
-from core.workspace import Workspace
-from core.tool_registry import ToolRegistry
+
 from core.embedding_manager import EmbeddingManager
 from core.file_reference_parser import FileReferenceParser
+from core.lm_studio_client import LMStudioClient
+from core.tool_registry import ToolRegistry
+from core.workspace import Workspace
+
 
 @click.group()
 def cli():
@@ -27,7 +29,9 @@ def init(workspace, excluded):
     excluded_set.update(embedding_manager.exclusion_paths)
 
     # Get all files in workspace
-    files = workspace.list_files(included_folders=included_set, excluded_folders=excluded_set)
+    files = workspace.list_files(
+        included_folders=included_set, excluded_folders=excluded_set
+    )
     print(f"Found {len(files)} files to process")
 
     # Process files and get embeddings
@@ -46,7 +50,7 @@ def init(workspace, excluded):
         metadata.append(
             {
                 "file": filename,
-                "content": content[:500] + "...",  # Store first 500 chars aas preview
+                "content": content[:500] + "...",  # Store first 500 chars as preview
             }
         )
 
@@ -57,10 +61,11 @@ def init(workspace, excluded):
 
 @cli.command()
 @click.option("--query", prompt="Enter your request")
-@click.option("--num-files", "-n", default=3, prompt="Maximum number of files to embed in request")
+@click.option(
+    "--num-files", "-n", default=3, help="Maximum number of files to embed in request"
+)
 def ask(query, num_files):
     """Ask the AI about your code"""
-    workspace = Workspace(".")
     lm_client = LMStudioClient()
     embedding_manager = EmbeddingManager()
 
@@ -77,12 +82,14 @@ def ask(query, num_files):
 
         for i, result in enumerate(results, 1):
             print(
-                f"{i}. {result['metadata']['file']} (similarity: {result['similarity']:.2f})"
+                f"{i}. {result['metadata']['file']} "
+                f"(similarity: {result['similarity']:.2f})"
             )
 
         # Prepare context
         context = "\n\n".join(
-            f"File: {result['metadata']['file']}\nContent:\n{result['metadata']['content']}"
+            f"File: {result['metadata']['file']}\n"
+            f"Content:\n{result['metadata']['content']}"
             for result in results
         )
 
@@ -96,15 +103,25 @@ def ask(query, num_files):
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
     ]
 
-    # Get response
-    response = lm_client.chat_completion(messages)
-    print("\nAssistant:", response["choices"][0]["message"]["content"])
+    # Get response with streaming
+    print("\nAssistant:")
+    chunks = []
+    for chunk in lm_client.chat_completion(messages, stream=True):
+        click.echo(chunk, nl=False)
+        chunks.append(chunk)
+
+    if chunks:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "".join(chunks),
+            }
+        )
 
 
 @cli.command()
 def shell():
     """Interactive shell mode"""
-    workspace = Workspace(".")
     lm_client = LMStudioClient()
     tool_registry = ToolRegistry()
 
@@ -130,30 +147,42 @@ def shell():
                 tool_registry.get_tool_definition(name) for name in tool_registry.tools
             ]
 
-            # Get response from AI
-            response = lm_client.chat_completion(messages, tools=tools)
+            # Stream the response while collecting full message
+            print("\nAssistant:")
+            chunks = []
+            tool_calls = []
 
-            # Process the response
-            try:
-                assistant_message = response["choices"][0]["message"]
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_message["content"],
-                        **(
-                            {
-                                k: v for k, v in assistant_message.items()
-                                if k != "content"
-                            }
-                            if "tool_calls" in assistant_message else {}
-                        )
-                    }
-                )
-            except (KeyError, IndexError):
-                continue
+            # First stream chunks to display them immediately
+            for partial in lm_client.chat_completion(
+                messages, tools=tools, stream=True
+            ):
+                if "chunk" in partial:
+                    chunk = partial["chunk"]
+                    click.echo(chunk, nl=False)
+                    chunks.append(chunk)
+
+                if "tool_calls" in partial:
+                    tool_calls.extend(partial["tool_calls"])
+
+            # Add to messages with all fields (including tool_calls if present)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "".join(chunks),
+                    **(
+                        {
+                            "tool_calls": tool_calls
+                        }
+                        if tool_calls else {}
+                    ),
+                }
+            )
 
             # Check for tool calls
-            tool_calls = lm_client.parse_tool_calls(response)
+            if tool_calls:
+                tool_calls = lm_client.parse_tool_calls(
+                    {"choices": [{"message": {"tool_calls": tool_calls}}]}
+                )
 
             while tool_calls:
                 print("\nTool calls detected:")
@@ -189,31 +218,44 @@ def shell():
                 # Add tool responses to messages
                 messages.extend(tool_responses)
 
-                # Continue conversation with tool results
-                response = lm_client.chat_completion(messages, tools=tools)
-                assistant_message = response["choices"][0]["message"]
+                # Continue conversation with tool results (stream again)
+                print("\nAssistant:")
+                chunks = []
+                tool_calls = []
+
+                for partial in lm_client.chat_completion(
+                    messages, tools=tools, stream=True
+                ):
+                    if "chunk" in partial:
+                        chunk = partial["chunk"]
+                        click.echo(chunk, nl=False)
+                        chunks.append(chunk)
+
+                    if "tool_calls" in partial:
+                        tool_calls.extend(partial["tool_calls"])
+
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": assistant_message["content"],
+                        "content": "".join(chunks),
                         **(
                             {
-                                k: v for k, v in assistant_message.items()
-                                if k != "content"
+                                "tool_calls": tool_calls
                             }
-                            if "tool_calls" in assistant_message else {}
-                        )
+                            if tool_calls else {}
+                        ),
                     }
                 )
-                tool_calls = lm_client.parse_tool_calls(response)
-
-            # Print final response
-            print("\nAssistant:", messages[-1]["content"])
+                if tool_calls:
+                    # Not sure if anything should be done with this...
+                    tool_calls = lm_client.parse_tool_calls(
+                        {"choices": [{"message": {"tool_calls": tool_calls}}]}
+                    )
 
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Cli::shell(): Error: {e}")
 
 
 if __name__ == "__main__":

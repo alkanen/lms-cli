@@ -1,4 +1,5 @@
-from typing import Dict, List, Callable, Any
+from typing import Any, Callable, Dict, List
+
 import yaml
 
 
@@ -7,7 +8,7 @@ class ToolRegistry:
         self.tools = {}
 
     def register_tool(
-        self, name: str, func: Callable, descrition: str, parameters: List[Dict]
+        self, name: str, func: Callable, description: str, parameters: List[Dict]
     ):
         """Register a tool with the registry"""
         self.tools[name] = {
@@ -19,7 +20,9 @@ class ToolRegistry:
     def get_tool_definition(self, name: str) -> Dict:
         """Get the definition of a registered tool"""
         if name not in self.tools:
-            raise ValueError(f"Tool {name} not found")
+            raise ValueError(
+                f"ToolRegistry::get_tool_definition(): Tool {name} not found"
+            )
 
         return {
             "type": "function",
@@ -44,7 +47,7 @@ class ToolRegistry:
     def execute_tool(self, name: str, arguments: Dict) -> Any:
         """Execute a registered tool with given arguments"""
         if name not in self.tools:
-            raise ValueError(f"Tool {name} not found")
+            raise ValueError(f"ToolRegistry::execute_tool(): Tool {name} not found")
 
         return self.tools[name]["function"](**arguments)
 

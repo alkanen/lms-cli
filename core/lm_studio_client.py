@@ -1,6 +1,8 @@
+from typing import Dict, Iterator, Optional
+
+import json
 import requests
 import yaml
-from typing import Optional, Dict, Any
 
 
 class LMStudioClient:
@@ -14,13 +16,11 @@ class LMStudioClient:
         # If no embedding model is specified, revert to main model
         self.embedding_model = self.config["embeddings"].get("model", self.model)
 
-        self.system_message = self.config.get("agent", {}).get(
-            "system_message", None
-        )
+        self.system_message = self.config.get("agent", {}).get("system_message", None)
         if not self.system_message:
             self.system_message = (
-                "You are a helpful coding assistant. Use the provided file contexts to answer "
-                "questions about the code."
+                "You are a helpful coding assistant. Use the provided file contexts to "
+                "answer questions about the code."
             )
 
     def _make_request(
@@ -36,9 +36,24 @@ class LMStudioClient:
 
         return response.json()
 
+    def _make_streaming_request(
+        self, endpoint: str, data: Optional[Dict] = None
+    ) -> Iterator[Dict]:
+        """Make a streaming request and yield chunks"""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.base_url}/{endpoint}"
+        with requests.post(url, json=data, headers=headers, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    yield line.decode("utf-8")
+
     def get_embedding(self, text: str) -> list:
         """Get embedding for a text snippet"""
-        endpoint = f"embeddings"
+        endpoint = "embeddings"
         data = {"model": self.embedding_model, "input": text}
 
         response = self._make_request(endpoint, data=data)
@@ -48,14 +63,51 @@ class LMStudioClient:
             print("No embeddings returned")
             return []
 
-    def chat_completion(self, messages: list, tools: Optional[list] = None) -> Dict:
-        """Get chat completion with optional tool calls"""
-        endpoint = f"chat/completions"
+    def chat_completion(
+        self, messages: list, tools: Optional[list] = None, stream: bool = False
+    ) -> Dict:
+        """Get chat completion with optional tool calls and streaming support"""
+        endpoint = "chat/completions"
         data = {"model": self.model, "messages": messages}
         if tools:
             data["tools"] = tools
+        if stream:
+            data["stream"] = True
 
-        return self._make_request(endpoint, data=data)
+        if stream:
+            # Handle streaming response
+            for chunk in self._make_streaming_request(endpoint, data=data):
+                try:
+                    chunk_data = chunk.strip()
+                    if not chunk_data.startswith("data: "):
+                        continue
+                    json_str = chunk_data[6:]  # Remove "data: " prefix
+                    if json_str == "[DONE]":
+                        break
+
+                    chunk_json = json.loads(json_str)
+                    delta = chunk_json["choices"][0]["delta"]
+
+                    partial = {}
+
+                    if "content" in delta:
+                        partial["chunk"] = delta["content"]
+                    if "tool_calls" in delta:
+                        partial["chunk"] = delta["tool_calls"]
+
+                    if partial:
+                        yield partial
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Error processing stream chunk: {e}")
+                    continue
+
+            # After streaming is complete, stop iteration
+            return
+
+        else:
+            # Non-streaming request
+            return self._make_request(endpoint, data=data)
 
     def parse_tool_calls(self, response: Dict) -> list:
         """Parse tool calls from chat completion response"""

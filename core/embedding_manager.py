@@ -1,9 +1,10 @@
 import json
-from datetime import datetime
 import os
-import numpy as np
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List
+
+import numpy as np
 import yaml
 
 """Index format:
@@ -42,10 +43,7 @@ class EmbeddingManager:
                 for filename in data:
                     vector = np.array(data[filename]["vector"]).astype("float32")
                     metadata = data[filename]["metadata"]
-                    self.index[filename] = {
-                        "vector": vector,
-                        "metadata": metadata
-                    }
+                    self.index[filename] = {"vector": vector, "metadata": metadata}
 
             print(f"Loaded existing index from '{self.index_path}'")
 
@@ -87,7 +85,11 @@ class EmbeddingManager:
 
             if filename in self.index:
                 add_time = self.index[filename]["metadata"].get("timestamp")
-                if add_time and datetime.strptime(add_time, "%Y-%m-%dT%H:%M:%S") >= file_modified:
+                if (
+                    add_time
+                    and datetime.strptime(add_time, "%Y-%m-%dT%H:%M:%S")
+                    >= file_modified
+                ):
                     # print(f"File '{filename}' not changed, skipping")
                     continue
 
@@ -99,8 +101,8 @@ class EmbeddingManager:
                 "vector": emb_array,
                 "metadata": {
                     **metadata[i],
-                    "timestamp": datetime.strftime(datetime.now(), "%Y-%m-%dT%H:%M:%S")
-                }
+                    "timestamp": datetime.strftime(datetime.now(), "%Y-%m-%dT%H:%M:%S"),
+                },
             }
 
             count += 1
@@ -125,7 +127,11 @@ class EmbeddingManager:
             raise ValueError("Index not initialized")
 
         # Converet query to numpy array
-        query_array = np.array([query_embedding]).astype("float32").reshape((len(query_embedding),))
+        query_array = (
+            np.array([query_embedding])
+            .astype("float32")
+            .reshape((len(query_embedding),))
+        )
 
         # Search index
         found = []
@@ -147,7 +153,9 @@ class EmbeddingManager:
                         break
 
                 if worse_idx >= 0:
-                    found.insert(worse_idx, {"similarity": similarity, "filename": filename})
+                    found.insert(
+                        worse_idx, {"similarity": similarity, "filename": filename}
+                    )
                     found.pop(-1)
 
         # Return results with metadata
