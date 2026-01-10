@@ -31,14 +31,14 @@ tools:
       - name: "extension"
         type: "string"
         required: false
-        descripton: "An optional file extension to filter on, e.g. 'txt'"
+        description: "An optional file extension to filter on, e.g. 'txt'"
   - name: "write_file"
     description: "Write contents to a file in the workspace"
     parameters:
       - name: "file_path"
         type: "string"
         required: true
-        descripton: "A relative path to the file"
+        description: "A relative path to the file"
       - name: "content"
         type: "string"
         required: true
@@ -49,7 +49,7 @@ tools:
       - name: "file_path"
         type: "string"
         required: true
-        descripton: "A relative path to the file"
+        description: "A relative path to the file"
       - name: "start_line"
         type: "integer"
         required: false
