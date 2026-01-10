@@ -129,11 +129,12 @@ def ask(query, num_files, config):
 
 @cli.command()
 @click.option(
-    "--config", help="Optional configuration file", default="config/config.yaml"
+    "--config", help="Optional configuration file", default="config/config.yaml")
+@click.option(
+    "--workspace", help="Path to workspace folder", default="."
 )
-def shell(config):
+def shell(config, workspace):
     """Interactive shell mode"""
-    workspace = "."
     lm_client = LMStudioClient(config_path=config)
     tool_registry = ToolRegistry(config_path=config, workspace=workspace)
     tool_registry.load_from_config()

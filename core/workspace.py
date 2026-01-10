@@ -4,7 +4,7 @@ from typing import Iterable, List, Optional
 
 class Workspace:
     def __init__(self, root_path: str = "."):
-        self.root_path = Path(root_path).absolute()
+        self.root_path = Path(root_path).resolve()
         if not self.root_path.exists():
             raise ValueError(f"Workspace(): Workspace path {root_path} does not exist")
 
@@ -18,7 +18,7 @@ class Workspace:
         files = []
 
         for ext in (
-            ["*.py", "*.cpp", "*.h", "*cu"] if not extension else [f"*.{extension}"]
+            ["*"] if not extension else [f"*.{extension}"]
         ):
             for folder in included_folders:
                 files.extend((self.root_path / folder).rglob(ext))
@@ -49,12 +49,42 @@ class Workspace:
 
         return full_path.read_text()
 
-    def write_file(self, file_path: Path, content: str):
+    def write_file(self, file_path: Path, content: str) -> str:
         """Write content to a file"""
-        full_path = self.root_path / file_path
+        full_path = (self.root_path / file_path).resolve()
+
+        if not str(full_path).startswith(str(self.root_path)):
+            return "Error: Trying to write to files outside of workspace not supported"
+
         # Ensure directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content)
+        size = full_path.write_text(content)
+
+        return f"A total of {size} bytes written to {file_path}"
+
+    def read_file(self, file_path: Path, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+        """Read content from a file"""
+        full_path = (self.root_path / file_path).resolve()
+
+        if not str(full_path).startswith(str(self.root_path)):
+            return "Error: Trying to write from files outside of workspace not supported"
+
+        if not full_path.exists():
+            return f"File '{file_path}' does not exist in workspace"
+
+        content_lines = full_path.read_text().splitlines()
+
+        if start_line is None:
+            start_line = 0
+        else:
+            start_line = max(0, start_line-1)
+
+        if end_line is None:
+            end_line = len(content_lines)
+        else:
+            end_line = min(end_line, len(content_lines))
+
+        return "\n".join(content_lines[start_line:end_line])
 
     def get_file_context(self, file_path: Path, max_lines: int = 50) -> str:
         """Get context around a specific line in a file"""

@@ -32,3 +32,29 @@ tools:
         type: "string"
         required: false
         descripton: "An optional file extension to filter on, e.g. 'txt'"
+  - name: "write_file"
+    description: "Write contents to a file in the workspace"
+    parameters:
+      - name: "file_path"
+        type: "string"
+        required: true
+        descripton: "A relative path to the file"
+      - name: "content"
+        type: "string"
+        required: true
+        description: "The content to write to the file"
+  - name: "read_file"
+    description: "Read contents from a file in the workspace"
+    parameters:
+      - name: "file_path"
+        type: "string"
+        required: true
+        descripton: "A relative path to the file"
+      - name: "start_line"
+        type: "integer"
+        required: false
+        description: "Optional first line to read, starts from 1"
+      - name: "end_line"
+        type: "integer"
+        required: false
+        description: "Optional last line to read, starts from 1"
