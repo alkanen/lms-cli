@@ -7,8 +7,8 @@ from typing import Any, Callable, Dict, List
 import json
 import yaml
 
-from core.workspace import Workspace
-from core.embedding_manager import EmbeddingManager
+from lms_cli.core.workspace import Workspace
+from lms_cli.core.embedding_manager import EmbeddingManager
 
 
 class ToolRegistry:

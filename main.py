@@ -1,4 +1,4 @@
-from cli.interface import cli
+from lms_cli.cli.interface import cli
 
 
 if __name__ == "__main__":

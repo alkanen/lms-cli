@@ -1,4 +1,5 @@
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Callable
+from collections import defaultdict
 
 import json
 import requests
@@ -67,10 +68,62 @@ class LMStudioClient:
             print("No embeddings returned")
             return []
 
+    def _process_tool_chunks(self, tool_chunks: list) -> list:
+        """Process streaming tool call chunks into complete tool calls"""
+        tool_calls = defaultdict(dict)
+        tool_name = "<unknown>"
+        tool_id = "-1"
+
+        for chunks in tool_chunks:
+            for chunk in chunks:
+                index = chunk["index"]
+                tool_type = chunk["type"]
+
+                try:
+                    tool_id = chunk["id"]
+                except KeyError:
+                    pass
+
+                try:
+                    tool_name = chunk["function"]["name"]
+                except KeyError:
+                    pass
+
+                # Initialize the function call if not already present
+                if index not in tool_calls:
+                    tool_calls[index] = {
+                        "id": tool_id,
+                        "type": tool_type,
+                        "function": {"name": tool_name, "arguments": ""},
+                    }
+
+                # Append the arguments chunk
+                tool_calls[index]["function"]["arguments"] += chunk["function"].get(
+                    "arguments", ""
+                )
+
+        # Convert to a list of completed function calls
+        return list(tool_calls.values())
+
     def chat_completion(
-        self, messages: list, tools: Optional[list] = None, stream: bool = False
+        self,
+        messages: list,
+        tools: Optional[list] = None,
+        stream: bool = False,
+        on_chunk_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict:
-        """Get chat completion with optional tool calls and streaming support"""
+        """
+        Get chat completion with optional tool calls and streaming support.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            tools: Optional list of tool definitions
+            stream: Whether to stream the response
+            on_chunk_callback: Optional callback for content chunks as they arrive
+
+        Returns:
+            Dict with 'content' (str) and 'tool_calls' (list)
+        """
         endpoint = "chat/completions"
         data = {"model": self.model, "messages": messages}
         if tools:
@@ -80,6 +133,9 @@ class LMStudioClient:
 
         if stream:
             # Handle streaming response
+            full_content = []
+            tool_chunks = []
+
             for chunk in self._make_streaming_request(endpoint, data=data):
                 try:
                     chunk_data = chunk.strip()
@@ -92,33 +148,54 @@ class LMStudioClient:
                     chunk_json = json.loads(json_str)
                     delta = chunk_json["choices"][0]["delta"]
 
-                    partial = {}
-
                     if "content" in delta:
-                        chunk = delta["content"]
-                        if type(chunk) is str:
-                            partial["chunk"] = chunk
-                        elif type(chunk) is list:
-                            partial["tool_chunks"] = chunk
+                        content_chunk = delta["content"]
+                        if type(content_chunk) is str:
+                            full_content.append(content_chunk)
+                            if on_chunk_callback:
+                                on_chunk_callback(content_chunk)
+                        elif type(content_chunk) is list:
+                            tool_chunks.append(content_chunk)
                         else:
-                            print("Unknown chunk of type", type(chunk), "-", chunk)
+                            print(
+                                "Unknown chunk of type",
+                                type(content_chunk),
+                                "-",
+                                content_chunk,
+                            )
 
                     if "tool_calls" in delta:
-                        partial["tool_chunks"] = delta["tool_calls"]
-
-                    if partial:
-                        yield partial
+                        tool_chunks.append(delta["tool_calls"])
 
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"Error processing stream chunk: {e}")
                     continue
 
-            # After streaming is complete, stop iteration
-            return
+            # Process tool chunks into complete tool calls
+            tool_calls = self._process_tool_chunks(tool_chunks) if tool_chunks else []
+
+            return {"content": "".join(full_content), "tool_calls": tool_calls}
 
         else:
             # Non-streaming request
-            return self._make_request(endpoint, data=data)
+            response = self._make_request(endpoint, data=data)
+
+            # Extract content and tool_calls
+            if not response.get("choices"):
+                return {"content": "", "tool_calls": []}
+
+            choice = response["choices"][0]
+            message = choice.get("message", {})
+            content = message.get("content", "")
+
+            # Call callback with full content if provided
+            if on_chunk_callback and content:
+                on_chunk_callback(content)
+
+            # Extract tool calls
+            tool_calls = self.parse_tool_calls(response)
+
+            return {"content": content, "tool_calls": tool_calls}
 
     def parse_tool_calls(self, response: Dict) -> list:
         """Parse tool calls from chat completion response"""

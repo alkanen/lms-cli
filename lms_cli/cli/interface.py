@@ -2,11 +2,11 @@ import click
 
 import json
 
-from core.embedding_manager import EmbeddingManager
-from core.file_reference_parser import FileReferenceParser
-from core.lm_studio_client import LMStudioClient
-from core.tool_registry import ToolRegistry
-from core.workspace import Workspace
+from lms_cli.core.embedding_manager import EmbeddingManager
+from lms_cli.core.file_reference_parser import FileReferenceParser
+from lms_cli.core.lm_studio_client import LMStudioClient
+from lms_cli.core.tool_registry import ToolRegistry
+from lms_cli.core.workspace import Workspace
 
 
 @click.group()
@@ -113,18 +113,17 @@ def ask(query, num_files, config):
 
     # Get response with streaming
     print("\nAssistant:")
-    chunks = []
-    for chunk in lm_client.chat_completion(messages, stream=True):
-        click.echo(chunk, nl=False)
-        chunks.append(chunk)
 
-    if chunks:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": "".join(chunks),
-            }
-        )
+    def output_chunk(chunk: str):
+        click.echo(chunk, nl=False)
+
+    result = lm_client.chat_completion(
+        messages, stream=True, on_chunk_callback=output_chunk
+    )
+    print()  # Newline after streaming
+
+    if result["content"]:
+        messages.append({"role": "assistant", "content": result["content"]})
 
 
 @cli.command()
@@ -161,43 +160,27 @@ def shell(config, workspace):
                 tool_registry.get_tool_definition(name) for name in tool_registry.tools
             ]
 
-            # Stream the response while collecting full message
-            chunks = []
-            tool_chunks = []
+            # Define callback to output chunks as they arrive
+            def output_chunk(chunk: str):
+                click.echo(chunk, nl=False)
 
-            # First stream chunks to display them immediately
-            for partial in lm_client.chat_completion(
-                messages, tools=tools, stream=True
-            ):
-                if "chunk" in partial:
-                    chunk = partial["chunk"]
-                    click.echo(chunk, nl=False)
-                    chunks.append(chunk)
-
-                if "tool_chunks" in partial:
-                    tool_chunks.append(partial["tool_chunks"])
-
-            tool_calls = ToolRegistry.process_tool_chunks(tool_chunks)
+            # Get response with streaming and tool support
+            result = lm_client.chat_completion(
+                messages, tools=tools, stream=True, on_chunk_callback=output_chunk
+            )
+            print()  # Newline after streaming
 
             # Add to messages with all fields (including tool_calls if present)
             messages.append(
                 {
                     "role": "assistant",
-                    "content": "".join(chunks),
-                    **(
-                        {
-                            "tool_calls": tool_calls
-                        }
-                        if tool_calls else {}
-                    ),
+                    "content": result["content"],
+                    **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
                 }
             )
 
-            # Check for tool calls
-            if tool_calls:
-                tool_calls = lm_client.parse_tool_calls(
-                    {"choices": [{"message": {"tool_calls": tool_calls}}]}
-                )
+            # Get tool calls from result
+            tool_calls = result["tool_calls"]
 
             while tool_calls:
                 # print("\nTool calls detected:")
@@ -236,39 +219,22 @@ def shell(config, workspace):
 
                 # Continue conversation with tool results (stream again)
                 print("\nAssistant:")
-                chunks = []
-                tool_chunks = []
 
-                for partial in lm_client.chat_completion(
-                    messages, tools=tools, stream=True
-                ):
-                    if "chunk" in partial:
-                        chunk = partial["chunk"]
-                        click.echo(chunk, nl=False)
-                        chunks.append(chunk)
-
-                    if "tool_chunks" in partial:
-                        tool_chunks.append(partial["tool_chunks"])
-
-                tool_calls = ToolRegistry.process_tool_chunks(tool_chunks)
+                result = lm_client.chat_completion(
+                    messages, tools=tools, stream=True, on_chunk_callback=output_chunk
+                )
+                print()  # Newline after streaming
 
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": "".join(chunks),
-                        **(
-                            {
-                                "tool_calls": tool_calls
-                            }
-                            if tool_calls else {}
-                        ),
+                        "content": result["content"],
+                        **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
                     }
                 )
-                if tool_calls:
-                    # Not sure if anything should be done with this...
-                    tool_calls = lm_client.parse_tool_calls(
-                        {"choices": [{"message": {"tool_calls": tool_calls}}]}
-                    )
+
+                # Get tool calls from result for next iteration
+                tool_calls = result["tool_calls"]
 
         except KeyboardInterrupt:
             break
