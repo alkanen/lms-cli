@@ -1,5 +1,7 @@
 import click
 
+import json
+
 from core.embedding_manager import EmbeddingManager
 from core.file_reference_parser import FileReferenceParser
 from core.lm_studio_client import LMStudioClient
@@ -131,9 +133,10 @@ def ask(query, num_files, config):
 )
 def shell(config):
     """Interactive shell mode"""
+    workspace = "."
     lm_client = LMStudioClient(config_path=config)
-    tool_registry = ToolRegistry()
-    tool_registry.load_from_config(config_path=config)
+    tool_registry = ToolRegistry(config_path=config, workspace=workspace)
+    tool_registry.load_from_config()
 
     # Prepare initial messages
     messages = [
@@ -158,9 +161,8 @@ def shell(config):
             ]
 
             # Stream the response while collecting full message
-            print("\nAssistant:")
             chunks = []
-            tool_calls = []
+            tool_chunks = []
 
             # First stream chunks to display them immediately
             for partial in lm_client.chat_completion(
@@ -171,8 +173,10 @@ def shell(config):
                     click.echo(chunk, nl=False)
                     chunks.append(chunk)
 
-                if "tool_calls" in partial:
-                    tool_calls.extend(partial["tool_calls"])
+                if "tool_chunks" in partial:
+                    tool_chunks.append(partial["tool_chunks"])
+
+            tool_calls = ToolRegistry.process_tool_chunks(tool_chunks)
 
             # Add to messages with all fields (including tool_calls if present)
             messages.append(
@@ -195,33 +199,34 @@ def shell(config):
                 )
 
             while tool_calls:
-                print("\nTool calls detected:")
-                for tc in tool_calls:
-                    print(f"- {tc['function']['name']}({tc['function']['arguments']})")
+                # print("\nTool calls detected:")
+                # for tc in tool_calls:
+                #     print(f"- {tc['function']['name']}({tc['function']['arguments']})")
 
                 # Execute tools and collect responses
                 tool_responses = []
                 for tc in tool_calls:
                     try:
                         result = tool_registry.execute_tool(
-                            tc["function"]["name"], eval(tc["function"]["arguments"])
+                            tc["function"]["name"], tc["function"]["arguments"]
                         )
-                        print(f"\nTool {tc['function']['name']} returned: {result}")
+                        # print(f"\nTool {tc['function']['name']} returned: {result}")
 
                         # Add tool response to messages
                         tool_responses.append(
                             {
                                 "role": "tool",
-                                "content": str(result),
                                 "tool_call_id": tc["id"],
+                                "content": json.dumps(result)
                             }
                         )
                     except Exception as e:
+                        print(f"Tool call `{tc['function']['name']}({tc['function']['arguments']}) failed: {str(e)}")
                         tool_responses.append(
                             {
                                 "role": "tool",
-                                "content": f"Error {str(e)}",
                                 "tool_call_id": tc["id"],
+                                "content": f"Error {str(e)}"
                             }
                         )
 
@@ -231,7 +236,7 @@ def shell(config):
                 # Continue conversation with tool results (stream again)
                 print("\nAssistant:")
                 chunks = []
-                tool_calls = []
+                tool_chunks = []
 
                 for partial in lm_client.chat_completion(
                     messages, tools=tools, stream=True
@@ -241,8 +246,10 @@ def shell(config):
                         click.echo(chunk, nl=False)
                         chunks.append(chunk)
 
-                    if "tool_calls" in partial:
-                        tool_calls.extend(partial["tool_calls"])
+                    if "tool_chunks" in partial:
+                        tool_chunks.append(partial["tool_chunks"])
+
+                tool_calls = ToolRegistry.process_tool_chunks(tool_chunks)
 
                 messages.append(
                     {
@@ -264,8 +271,8 @@ def shell(config):
 
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            print(f"Cli::shell(): Error: {e}")
+        # except Exception as e:
+        #     print(f"Cli::shell(): Error: {e}")
 
 
 if __name__ == "__main__":

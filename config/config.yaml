@@ -28,6 +28,7 @@ tools:
   - name: "file_search"
     description: "Search for files in the workspace"
     parameters:
-      - name: "query"
+      - name: "extension"
         type: "string"
-        required: true
+        required: false
+        descripton: "An optional file extension to filter on, e.g. 'txt'"

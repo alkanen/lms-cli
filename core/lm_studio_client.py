@@ -46,6 +46,10 @@ class LMStudioClient:
 
         url = f"{self.base_url}/{endpoint}"
         with requests.post(url, json=data, headers=headers, stream=True) as response:
+            if response.status_code >= 400:
+                import pdb
+                pdb.set_trace()
+
             response.raise_for_status()
             for line in response.iter_lines():
                 if line:
@@ -91,9 +95,16 @@ class LMStudioClient:
                     partial = {}
 
                     if "content" in delta:
-                        partial["chunk"] = delta["content"]
+                        chunk = delta["content"]
+                        if type(chunk) is str:
+                            partial["chunk"] = chunk
+                        elif type(chunk) is list:
+                            partial["tool_chunks"] = chunk
+                        else:
+                            print("Unknown chunk of type", type(chunk), "-", chunk)
+
                     if "tool_calls" in delta:
-                        partial["chunk"] = delta["tool_calls"]
+                        partial["tool_chunks"] = delta["tool_calls"]
 
                     if partial:
                         yield partial

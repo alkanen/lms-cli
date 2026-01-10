@@ -64,3 +64,10 @@ class Workspace:
         # Get last <max_lines> lines
         start_line = max(0, len(lines) - max_lines)
         return "\n".join(lines[start_line:])
+
+    def strip_workspace_folder_from_filename(self, filepath: Path | str) -> str:
+        file_string = str(filepath)
+        root_string = str(self.root_path)
+
+        if file_string.startswith(root_string):
+            return "." + file_string[len(root_string):]
