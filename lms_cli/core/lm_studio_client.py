@@ -7,12 +7,18 @@ import yaml
 
 
 class LMStudioClient:
-    def __init__(self, config_path: str = "config/config.yaml"):
+    def __init__(
+        self,
+        config_path: str = "config/config.yaml",
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
-        self.base_url = self.config["lm_studio"]["base_url"]
-        self.model = self.config["lm_studio"]["model"]
+        # Use provided values or fall back to config
+        self.base_url = base_url if base_url is not None else self.config["lm_studio"]["base_url"]
+        self.model = model if model is not None else self.config["lm_studio"]["model"]
         self.api_key = self.config["lm_studio"].get("api_key", "")
         # If no embedding model is specified, revert to main model
         self.embedding_model = self.config["embeddings"].get("model", self.model)
@@ -71,34 +77,46 @@ class LMStudioClient:
     def _process_tool_chunks(self, tool_chunks: list) -> list:
         """Process streaming tool call chunks into complete tool calls"""
         tool_calls = defaultdict(dict)
+        tool_type = "<unknown>"
         tool_name = "<unknown>"
-        tool_id = "-1"
+        # tool_id = "-1"
 
         for chunks in tool_chunks:
             for chunk in chunks:
                 index = chunk["index"]
-                tool_type = chunk["type"]
-
-                try:
-                    tool_id = chunk["id"]
-                except KeyError:
-                    pass
-
-                try:
-                    tool_name = chunk["function"]["name"]
-                except KeyError:
-                    pass
-
                 # Initialize the function call if not already present
                 if index not in tool_calls:
-                    tool_calls[index] = {
-                        "id": tool_id,
-                        "type": tool_type,
-                        "function": {"name": tool_name, "arguments": ""},
-                    }
+                    tool_calls[index] = {}
+
+                try:
+                    tool_calls[index]["id"] = chunk["id"]
+                except KeyError:
+                    pass
+                tool_id = tool_calls[index]["id"]
+
+                try:
+                    tool_calls[index]["type"] = chunk["type"]
+                except KeyError:
+                    pass
+                tool_type = tool_calls[index]["type"]
+
+                # For now we only support function tools
+                if tool_type != "function":
+                    print(f"Error: tool request for unknown tool type '{tool_type}'")
+                    del tool_calls[index]
+                    break
+
+                if not tool_type in tool_calls[index]:
+                    tool_calls[index][tool_type] = {"name": "<unknown>", "arguments": ""}
+
+                try:
+                    tool_calls[index][tool_type]["name"] = chunk[tool_type]["name"]
+                except KeyError:
+                    pass
+                tool_name = tool_calls[index][tool_type]["name"]
 
                 # Append the arguments chunk
-                tool_calls[index]["function"]["arguments"] += chunk["function"].get(
+                tool_calls[index][tool_type]["arguments"] += chunk[tool_type].get(
                     "arguments", ""
                 )
 
