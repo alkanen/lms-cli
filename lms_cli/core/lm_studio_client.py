@@ -129,6 +129,7 @@ class LMStudioClient:
         tools: Optional[list] = None,
         stream: bool = False,
         on_chunk_callback: Optional[Callable[[str], None]] = None,
+        usage_callback: Optional[Callable[[Dict], None]] = None,
     ) -> Dict:
         """
         Get chat completion with optional tool calls and streaming support.
@@ -138,6 +139,7 @@ class LMStudioClient:
             tools: Optional list of tool definitions
             stream: Whether to stream the response
             on_chunk_callback: Optional callback for content chunks as they arrive
+            usage_callback: Optional callback for token usage data
 
         Returns:
             Dict with 'content' (str) and 'tool_calls' (list)
@@ -148,6 +150,8 @@ class LMStudioClient:
             data["tools"] = tools
         if stream:
             data["stream"] = True
+
+        data["stream_options"] = {"include_usage": True}
 
         if stream:
             # Handle streaming response
@@ -164,6 +168,12 @@ class LMStudioClient:
                         break
 
                     chunk_json = json.loads(json_str)
+                    # Handle usage data
+                    if len(chunk_json.get("choices", [])) == 0:
+                        if "usage" in chunk_json and usage_callback:
+                            usage_callback(chunk_json["usage"])
+                        continue
+
                     delta = chunk_json["choices"][0]["delta"]
 
                     if "content" in delta:

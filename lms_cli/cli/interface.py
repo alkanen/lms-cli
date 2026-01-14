@@ -3,6 +3,7 @@ from typing import List, Tuple
 import click
 import enquiries
 import json
+import yaml
 
 from lms_cli.core.embedding_manager import EmbeddingManager
 from lms_cli.core.file_reference_parser import FileReferenceParser
@@ -181,6 +182,9 @@ def shell(config, workspace):
         permission_request_cb=permission_requests,
     )
     tool_registry.load_tools()
+    with open(config) as f:
+        configuration = yaml.safe_load(f)
+    max_tokens = configuration["lm_studio"].get("max_tokens", 4096)
 
     # Prepare initial messages
     messages = [
@@ -205,14 +209,41 @@ def shell(config, workspace):
             ]
 
             # Define callback to output chunks as they arrive
+            first_chunk = True
             def output_chunk(chunk: str):
+                nonlocal first_chunk
+                if first_chunk:
+                    print("\nAssistant:\n")
                 click.echo(chunk, nl=False)
+                first_chunk = False
+
+            def output_usage(usage: dict):
+                # Don't write any usage data if we haven't gotten a proper reply
+                nonlocal first_chunk
+                if first_chunk:
+                    return
+
+                # {'prompt_tokens': 537, 'completion_tokens': 42, 'total_tokens': 579}
+                prompt_tokens = usage["prompt_tokens"]
+                completion_tokens = usage["completion_tokens"]
+                total_tokens = usage["total_tokens"]
+
+                click.echo("\n")
+                click.echo(
+                    f"\n[Usage] Prompt tokens: {prompt_tokens}, "
+                    f"Completion tokens: {completion_tokens}, "
+                    f"Total tokens: {total_tokens} "
+                    f"out of {max_tokens} ({100 * total_tokens / max_tokens:.2f} %)"
+                )
 
             # Get response with streaming and tool support
             result = lm_client.chat_completion(
-                messages, tools=tools, stream=True, on_chunk_callback=output_chunk
+                messages,
+                tools=tools,
+                stream=True,
+                on_chunk_callback=output_chunk,
+                usage_callback=output_usage
             )
-            print()  # Newline after streaming
 
             # Add to messages with all fields (including tool_calls if present)
             messages.append(
@@ -227,10 +258,6 @@ def shell(config, workspace):
             tool_calls = result["tool_calls"]
 
             while tool_calls:
-                # print("\nTool calls detected:")
-                # for tc in tool_calls:
-                #     print(f"- {tc['function']['name']}({tc['function']['arguments']})")
-
                 # Execute tools and collect responses
                 tool_responses = []
                 for tc in tool_calls:
@@ -238,7 +265,6 @@ def shell(config, workspace):
                         result = tool_registry.execute_tool(
                             tc["function"]["name"], tc["function"]["arguments"]
                         )
-                        # print(f"\nTool {tc['function']['name']} returned: {result}")
 
                         # Add tool response to messages
                         tool_responses.append(
@@ -262,8 +288,6 @@ def shell(config, workspace):
                 messages.extend(tool_responses)
 
                 # Continue conversation with tool results (stream again)
-                print("\nAssistant:")
-
                 result = lm_client.chat_completion(
                     messages, tools=tools, stream=True, on_chunk_callback=output_chunk
                 )
