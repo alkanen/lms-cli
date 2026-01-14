@@ -2,3 +2,4 @@ numpy
 click
 pyyaml
 requests
+slugify

@@ -3,6 +3,7 @@ lm_studio:
   model: "mistralai/devstral-small-2-2512"  # Or whatever model you wish to use
   api_key: null                             # If authentication is required
   max_tokens: 45000                         # The number of tokens available in the context
+  stream: true
 
 embeddings:
   enabled: false
