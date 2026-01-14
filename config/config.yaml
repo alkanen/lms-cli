@@ -2,6 +2,7 @@ lm_studio:
   base_url: "http://192.168.1.8:1234/v1"    # Update to your server, or `null` for default
   model: "mistralai/devstral-small-2-2512"  # Or whatever model you wish to use
   api_key: null                             # If authentication is required
+  max_tokens: 45000                         # The number of tokens available in the context
 
 embeddings:
   enabled: false
@@ -23,46 +24,25 @@ agent:
 this workspace. Be precise, avoid flattery, write maintainable code following the code \
 standard in the example files you are provided, if any. The current task is to \
 implement an OpenAI API compatible AI CLI tool. Focus on the last message in a request \
-and merely use the earlier messages for context, not something to respond to."
+and merely use the earlier messages for context, not something to respond to. When \
+asked to carry out anything but simple tasks, start with writing an overview, then \
+flesh out a more detailed step-by-step plan before beginning solving the task. Before \
+each step reason about how to solve it before starting. After each step is completed, \
+state what the remaining goals are and then continue with the next step. "
 
 tools:
-  - name: "file_search"
-    description: "Search for files in the workspace"
-    parameters:
-      - name: "extension"
-        type: "string"
-        required: false
-        description: "An optional file extension to filter on, e.g. 'txt'"
-  - name: "write_file"
-    description: "Write contents to a file in the workspace"
-    parameters:
-      - name: "file_path"
-        type: "string"
-        required: true
-        description: "A relative path to the file"
-      - name: "content"
-        type: "string"
-        required: true
-        description: "The content to write to the file"
-  - name: "read_file"
-    description: "Read contents from a file in the workspace"
-    parameters:
-      - name: "file_path"
-        type: "string"
-        required: true
-        description: "A relative path to the file"
-      - name: "start_line"
-        type: "integer"
-        required: false
-        description: "Optional first line to read, starts from 1"
-      - name: "end_line"
-        type: "integer"
-        required: false
-        description: "Optional last line to read, starts from 1"
-  - name: "run_test"
-    description: "Run a pytest script and return the captured output"
-    parameters:
-      - name: "test_path"
-        type: "string"
-        required: true
-        description: "Path to the test file, relative to the workspace root"
+  tools_folder: "lms_cli/tools"
+  tools_settings:
+    - name: "file_search"
+      permission_required: true
+    - name: "write_file"
+      permission_required: true
+    - name: "read_file"
+      permission_required: true
+      allow_outside_workspace: true
+    - name: "run_test"
+      permission_required: true
+    - name: "generate_uuid"
+      # This is safe to run
+      permission_required: false
+      disabled: true

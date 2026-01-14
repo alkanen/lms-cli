@@ -39,6 +39,39 @@ class Workspace:
 
         return accepted_files
 
+    def file_exists(self, file_path: Path | str) -> bool:
+        """Returns True if file_path exists within workspace."""
+        # Turn path into an absolute Path object
+        file_path = Path(file_path).resolve()
+
+        # Make sure the file exists
+        if not file_path.exists():
+            return False
+
+        # Make sure it's actually a file
+        if not file_path.is_file():
+            return False
+
+        root_parts = self.root_path.parts
+        path_parts = file_path.parts
+
+        # Make sure that the file is within the workspace
+        try:
+            for i, part in enumerate(root_parts):
+                if part != path_parts[i]:
+                    return False
+        except IndexError:
+            return False
+
+        return True
+
+    def strip_root_path(self, file_path: str | Path) -> str:
+        """Removes the root directory of the workspace from the provided path and returns the
+        relative path string.  Assumes that file_path is within the workspace or results are
+        undefined and may cause exceptions."""
+        file_path = str(Path(file_path).resolve())
+        return "." + file_path[len(str(self.root_path)):]
+
     def read_file(self, file_path: Path) -> str:
         """Read content of a file"""
         full_path = self.root_path / file_path
@@ -53,14 +86,14 @@ class Workspace:
         """Write content to a file"""
         full_path = (self.root_path / file_path).resolve()
 
-        if not str(full_path).startswith(str(self.root_path)):
+        if not full_path.is_relative_to(self.root_path):
             return "Error: Trying to write to files outside of workspace not supported"
 
         # Ensure directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
         size = full_path.write_text(content)
 
-        return f"A total of {size} bytes written to {file_path}"
+        return f"Success: A total of {size} bytes written to '{file_path}'"
 
     def read_file(self, file_path: Path, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         """Read content from a file"""
@@ -70,7 +103,7 @@ class Workspace:
             return "Error: Trying to write from files outside of workspace not supported"
 
         if not full_path.exists():
-            return f"File '{file_path}' does not exist in workspace"
+            return f"Error: File '{file_path}' does not exist in workspace"
 
         content_lines = full_path.read_text().splitlines()
 

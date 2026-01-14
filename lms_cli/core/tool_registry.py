@@ -1,8 +1,9 @@
 from collections import defaultdict
 import importlib
+import inspect
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Tuple, Optional
 
 import json
 import yaml
@@ -11,8 +12,60 @@ from lms_cli.core.workspace import Workspace
 from lms_cli.core.embedding_manager import EmbeddingManager
 
 
+# Default permission request response values. If extra options are provided and
+# selected, response value will be the index of the selected option.
+TOOL_PERMISSION_YES = -1
+TOOL_PERMISSION_ALWAYS = -2
+TOOL_PERMISSION_NO = -3
+TOOL_PERMISSION_USER_SUGGESTION = -4
+
+
+class Tool:
+    def __init__(
+        self,
+        _context: dict,
+        name: str,
+        description: Optional[str] = None,
+        permission_required: bool = False,
+    ):
+        self.name = name
+        self.description = description
+        self.permission_required = permission_required
+
+        registry = _context["tool_registry"]
+        ws = _context["workspace"]
+        em = _context["embedding_manager"]
+        self.always_allow = False
+        self.registry = registry
+        self.workspace = ws
+        self.embedding_manager = em
+
+    def definition(self) -> dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": []
+        }
+
+    def request_permission(self, *args, **kwargs) -> Tuple[bool, str]:
+        # If no setting exists, assume not required
+        if not self.permission_required:
+            return True
+
+        # If setting exists and is truthy, make a permission request
+        return self.registry.request_permission([])
+
+    def execute(self, *args, **kwargs) -> str:
+        return "This tool performs no action and returns no useful data"
+
+
 class ToolRegistry:
-    def __init__(self, config_path: str = "config/config.yaml", workspace: str = "."):
+    def __init__(
+        self,
+        permission_request_cb: Callable[List[str], Tuple[int, str]],
+        config_path: str = "config/config.yaml",
+        workspace: str = ".",
+    ):
         self.tools = {}
         self.config_path = config_path
         with open(config_path) as f:
@@ -20,14 +73,16 @@ class ToolRegistry:
         self.context = {
             "workspace": Workspace(workspace),
             "embedding_manager": EmbeddingManager(self.config_path),
+            "tool_registry": self,
         }
+        self.request_permission = permission_request_cb
 
     def register_tool(
-        self, name: str, func: Callable, description: str, parameters: List[Dict]
+        self, name: str, tool: Tool, description: str, parameters: List[Dict]
     ):
         """Register a tool with the registry"""
         self.tools[name] = {
-            "function": func,
+            "object": func,
             "description": description,
             "parameters": parameters,
         }
@@ -39,25 +94,7 @@ class ToolRegistry:
                 f"ToolRegistry::get_tool_definition(): Tool {name} not found"
             )
 
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": self.tools[name]["description"],
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        param["name"]: {"type": param["type"]}
-                        for param in self.tools[name]["parameters"]
-                    },
-                    "required": [
-                        param["name"]
-                        for param in self.tools[name]["parameters"]
-                        if param.get("required", False)
-                    ],
-                },
-            },
-        }
+        return self.tools[name]["class"].definition()
 
     def execute_tool(self, name: str, arguments: str) -> Any:
         """Execute a registered tool with given arguments"""
@@ -65,47 +102,83 @@ class ToolRegistry:
             raise ValueError(f"ToolRegistry::execute_tool(): Tool {name} not found")
 
         arguments_dict = json.loads(arguments)
+        tool = self.tools[name]["class"]
 
-        return self.tools[name]["function"](_context=self.context, **arguments_dict)
+        # Make sure we have permission or report back a rejection reason to the agent
+        allowed, reason = tool.request_permission(**arguments_dict)
+        if not allowed:
+            return reason
 
-    def load_from_config(self):
-        """Load tools from configuration file"""
-        for tool in self.config.get("tools", []):
-            # Dynamically import and register the tool module
-            self._load_tool_module(tool)
+        # Permission granted, perform the tool function
+        return self.tools[name]["class"].execute(**arguments_dict)
 
-    def _load_tool_module(self, tool: Dict[str, Any]) -> Callable:
-        """Dynamically load a tool module from the tools folder"""
+    def load_tools(self):
+        """Load tools from tools folder in configuration file"""
+        tools_conf = self.config.get("tools", {})
+        if not tools_conf:
+            print("No tools loaded")
+            return
 
-        tool_name = tool["name"]
-        tool_description = tool["description"]
-        tool_parameters = tool["parameters"]
-
-        root_folder = Path(__file__).resolve().parent
-        tools_folder = (root_folder / "../tools").resolve()
-        module_path = (tools_folder / f"{tool_name}.py").resolve()
-
-        if not module_path.exists():
-            raise ValueError(
-                f"Registered tool '{tool_name}' does not exist in '{tools_folder}'"
-            )
-
-        spec = importlib.util.spec_from_file_location(tool_name, module_path)
-        if spec is None:
-            raise ValueError(f"Could not load tool module {tool_name}")
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[tool_name] = module
-        spec.loader.exec_module(module)
-
-        self.tools[tool_name] = {
-            "description": tool_description,
-            "parameters": tool_parameters,
+        # Copy any customization settings that might exist so we can send them to the initializer
+        settings = tools_conf["tools_settings"]
+        settings = {
+            item["name"]: {
+                key: value
+                for key, value in item.items() if key != "name"
+            } for item in settings
         }
-        # Extract the function name from the tool name
-        func_name = tool_name
-        if hasattr(module, func_name):
-            self.tools[tool_name]["function"] = getattr(module, func_name)
+
+        # Go through the tools folder looking for implementations of the Tool interface
+        folder = Path(tools_conf["tools_folder"])
+        if not folder.exists():
+            print(f"Tools folder does not exist: '{folder}'")
+            return
+
+        if not folder.is_dir():
+            print(f"'{folder}' is not a folder")
+            return
+
+        for script in folder.glob("*.py"):
+            filename = str(script)
+
+            # Skip special scripts
+            if filename.startswith("_"):
+                continue
+
+            module_name = filename[:-3]  # Remove extension
+
+            try:
+                # Import the module dynamically
+                spec = importlib.util.spec_from_file_location(module_name, script)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                # Iterate over all members in the module
+                for name, obj in inspect.getmembers(module):
+                    tool_settings = settings.get(name, {})
+                    if tool_settings.get("disabled", False):
+                        continue
+
+                    # Remove disabled flag from setting to avoid problems initializing
+                    tool_settings.pop("disabled", None)
+
+                    if (
+                        inspect.isclass(obj)
+                        and hasattr(obj, "__bases__")
+                        and any(base.__name__ == "Tool" for base in obj.__bases__)
+                    ):
+                        self.tools[name] = {
+                            "class": obj(
+                                _context=self.context,
+                                **tool_settings
+                            )
+                        }
+                        print(f"Loaded tool '{name}'")
+
+            except Exception as e:
+                print(f"Error importing module {module_name}: {e}")
+                raise e
 
     @staticmethod
     def process_tool_chunks(tool_chunks):
@@ -133,10 +206,7 @@ class ToolRegistry:
                     tool_calls[index] = {
                         "id": tool_id,
                         "type": tool_type,
-                        "function": {
-                            "name": tool_name,
-                            "arguments": ""
-                        }
+                        "function": {"name": tool_name, "arguments": ""},
                     }
 
                 # Append the arguments chunk

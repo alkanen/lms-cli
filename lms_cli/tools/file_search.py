@@ -1,20 +1,58 @@
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Set, Tuple
 
-from lms_cli.core.workspace import Workspace
-from lms_cli.core.embedding_manager import EmbeddingManager
+from lms_cli.core.tool_registry import Tool, ToolRegistry
+from lms_cli.core.tool_registry import (
+    TOOL_PERMISSION_YES,
+    TOOL_PERMISSION_ALWAYS,
+    TOOL_PERMISSION_NO,
+    TOOL_PERMISSION_USER_SUGGESTION,
+)
 
 
-def file_search(_context: dict, extension: Optional[str] = None) -> str:
-    em = _context["embedding_manager"]
-    ws = _context["workspace"]
+class file_search(Tool):
+    def __init__(self, _context: dict, permission_required: bool = False):
+        super().__init__(
+            _context=_context,
+            permission_required=permission_required,
+            name="file_search",
+            description="Search for files in the workspace",
+        )
+        self.allowed_folders: Set[str] = set()
 
-    included_set = em.inclusion_paths
-    excluded_set = em.exclusion_paths
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "extension": {
+                            "type": "string",
+                            "required": False,
+                            "description": "An optional file extension to filter on",
+                        }
+                    },
+                },
+            },
+        }
 
-    files = ws.list_files(
-        extension=extension,
-        included_folders=included_set,
-        excluded_folders=excluded_set
-    )
+    def request_permission(self, extension: Optional[str] = None) -> Tuple[bool, str]:
+        return True, ""
 
-    return [ws.strip_workspace_folder_from_filename(f) for f in files]
+    def execute(self, extension: Optional[str] = None) -> str:
+        em = self.embedding_manager
+        ws = self.workspace
+
+        included_set = em.inclusion_paths
+        excluded_set = em.exclusion_paths
+
+        files = ws.list_files(
+            extension=extension,
+            included_folders=included_set,
+            excluded_folders=excluded_set,
+        )
+
+        return [ws.strip_workspace_folder_from_filename(f) for f in files]

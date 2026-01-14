@@ -34,7 +34,7 @@ def run_test(_context: dict, test_path: str) -> str:
                 [python_executable_path, "-m", "pytest", test_file_path, "-v"],
                 capture_output=True,
                 text=True,
-                check=False
+                check=False,
             )
             combined_output = result.stdout + result.stderr
             return combined_output

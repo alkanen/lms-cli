@@ -1,12 +1,29 @@
-import click
+from typing import List, Tuple
 
+import click
+import enquiries
 import json
 
 from lms_cli.core.embedding_manager import EmbeddingManager
 from lms_cli.core.file_reference_parser import FileReferenceParser
 from lms_cli.core.lm_studio_client import LMStudioClient
 from lms_cli.core.tool_registry import ToolRegistry
+from lms_cli.core.tool_registry import (
+    TOOL_PERMISSION_YES,
+    TOOL_PERMISSION_ALWAYS,
+    TOOL_PERMISSION_NO,
+    TOOL_PERMISSION_USER_SUGGESTION,
+)
 from lms_cli.core.workspace import Workspace
+
+
+class Choice:
+    def __init__(self, i: int, message: str):
+        self.i = i
+        self.message = message
+
+    def __str__(self):
+        return self.message
 
 
 @click.group()
@@ -134,9 +151,36 @@ def ask(query, num_files, config):
 )
 def shell(config, workspace):
     """Interactive shell mode"""
+    def permission_requests(question: str, options: List[str]) -> Tuple[int, str]:
+        # Default options
+        choices = [
+            Choice(TOOL_PERMISSION_YES, "Yes"),
+            Choice(TOOL_PERMISSION_ALWAYS, "Always allow tool"),
+            Choice(TOOL_PERMISSION_NO, "No"),
+        ]
+
+        for i, option in enumerate(options):
+            choices.append(Choice(i, option))
+
+        choices.append(
+            Choice(TOOL_PERMISSION_USER_SUGGESTION, "Abort and suggest something else")
+        )
+
+        permission_string = "<no permisson string>"
+        choice = enquiries.choose(question, choices)
+        if choice.i == TOOL_PERMISSION_USER_SUGGESTION:
+            # permission_string = click.prompt(" Enter suggested behaviour:", type=str)
+            permission_string = input(" Enter suggested behaviour: ")
+
+        return choice.i, permission_string
+
     lm_client = LMStudioClient(config_path=config)
-    tool_registry = ToolRegistry(config_path=config, workspace=workspace)
-    tool_registry.load_from_config()
+    tool_registry = ToolRegistry(
+        config_path=config,
+        workspace=workspace,
+        permission_request_cb=permission_requests,
+    )
+    tool_registry.load_tools()
 
     # Prepare initial messages
     messages = [
