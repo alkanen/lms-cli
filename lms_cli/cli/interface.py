@@ -146,12 +146,17 @@ def ask(query, num_files, config):
 
 @cli.command()
 @click.option(
-    "--config", help="Optional configuration file", default="config/config.yaml")
-@click.option(
-    "--workspace", help="Path to workspace folder", default="."
+    "--config", help="Optional configuration file", default="config/config.yaml"
 )
-def shell(config, workspace):
+@click.option("--workspace", help="Path to workspace folder", default=".")
+@click.option(
+    "--prompt",
+    help="Immediate prompt, either a string to send or '@file'",
+    default=None,
+)
+def shell(config: str, workspace: str, prompt: str):
     """Interactive shell mode"""
+
     def permission_requests(question: str, options: List[str]) -> Tuple[int, str]:
         # Default options
         choices = [
@@ -193,27 +198,37 @@ def shell(config, workspace):
     print("Starting interactive shell. Type 'exit' to quit.")
 
     while True:
+        # Get available tool definitions
+        tools = [
+            tool_registry.get_tool_definition(name) for name in tool_registry.tools
+        ]
+
         try:
-            user_input = input("\n> ").strip()
-            if not user_input or user_input.lower() == "exit":
-                break
+            if prompt:
+                if prompt.startswith("@"):
+                    with open(prompt[1:]) as f:
+                        content = f.read()
+                else:
+                    content = prompt
 
-            user_input = FileReferenceParser.parse_message(user_input)
+                prompt = None
+            else:
+                user_input = input("\n> ").strip()
+                if not user_input or user_input.lower() == "exit":
+                    break
 
-            # Add to messages
-            messages.append({"role": "user", "content": user_input})
+                content = FileReferenceParser.parse_message(user_input)
 
-            # Get available tool definitions
-            tools = [
-                tool_registry.get_tool_definition(name) for name in tool_registry.tools
-            ]
+            # Add to messages, begin with provided prompt if any
+            messages.append({"role": "user", "content": content})
 
             # Define callback to output chunks as they arrive
             first_chunk = True
+
             def output_chunk(chunk: str):
                 nonlocal first_chunk
                 if first_chunk:
-                    print("\nAssistant:\n")
+                    click.echo("\nAssistant:\n")
                 click.echo(chunk, nl=False)
                 first_chunk = False
 
@@ -221,16 +236,17 @@ def shell(config, workspace):
                 # Don't write any usage data if we haven't gotten a proper reply
                 nonlocal first_chunk
                 if first_chunk:
-                    return
+                    trigger = "[Tool call]"
+                else:
+                    trigger = "[Usage]"
 
                 # {'prompt_tokens': 537, 'completion_tokens': 42, 'total_tokens': 579}
                 prompt_tokens = usage["prompt_tokens"]
                 completion_tokens = usage["completion_tokens"]
                 total_tokens = usage["total_tokens"]
 
-                click.echo("\n")
                 click.echo(
-                    f"\n[Usage] Prompt tokens: {prompt_tokens}, "
+                    f"\n{trigger} Prompt tokens: {prompt_tokens}, "
                     f"Completion tokens: {completion_tokens}, "
                     f"Total tokens: {total_tokens} "
                     f"out of {max_tokens} ({100 * total_tokens / max_tokens:.2f} %)"
@@ -242,7 +258,7 @@ def shell(config, workspace):
                 tools=tools,
                 stream=True,
                 on_chunk_callback=output_chunk,
-                usage_callback=output_usage
+                usage_callback=output_usage,
             )
 
             # Add to messages with all fields (including tool_calls if present)
@@ -250,7 +266,11 @@ def shell(config, workspace):
                 {
                     "role": "assistant",
                     "content": result["content"],
-                    **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
+                    **(
+                        {"tool_calls": result["tool_calls"]}
+                        if result["tool_calls"]
+                        else {}
+                    ),
                 }
             )
 
@@ -271,16 +291,18 @@ def shell(config, workspace):
                             {
                                 "role": "tool",
                                 "tool_call_id": tc["id"],
-                                "content": json.dumps(result)
+                                "content": json.dumps(result),
                             }
                         )
                     except Exception as e:
-                        print(f"Tool call `{tc['function']['name']}({tc['function']['arguments']}) failed: {str(e)}")
+                        print(
+                            f"Tool call `{tc['function']['name']}({tc['function']['arguments']}) failed: {str(e)}"
+                        )
                         tool_responses.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": tc["id"],
-                                "content": f"Error {str(e)}"
+                                "content": f"Error {str(e)}",
                             }
                         )
 
@@ -297,7 +319,11 @@ def shell(config, workspace):
                     {
                         "role": "assistant",
                         "content": result["content"],
-                        **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
+                        **(
+                            {"tool_calls": result["tool_calls"]}
+                            if result["tool_calls"]
+                            else {}
+                        ),
                     }
                 )
 

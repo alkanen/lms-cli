@@ -6,6 +6,9 @@ import requests
 import yaml
 
 
+enable_message_logs = False
+
+
 class LMStudioClient:
     def __init__(
         self,
@@ -51,6 +54,10 @@ class LMStudioClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        if enable_message_logs:
+            with open("messages.log", "a") as f:
+                f.write(f'User: {data["messages"][-1]}\n')
+
         url = f"{self.base_url}/{endpoint}"
         with requests.post(url, json=data, headers=headers, stream=True) as response:
             if response.status_code >= 400:
@@ -58,9 +65,18 @@ class LMStudioClient:
                 pdb.set_trace()
 
             response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    yield line.decode("utf-8")
+            if enable_message_logs:
+                with open("messages.log", "a") as f:
+                    f.write("Agent: ")
+                    for line in response.iter_lines():
+                        if line:
+                            line = line.decode("utf-8")
+                            f.write(f"{line}\n")
+                            yield line
+            else:
+                for line in response.iter_lines():
+                    if line:
+                        yield line.decode("utf-8")
 
     def get_embedding(self, text: str) -> list:
         """Get embedding for a text snippet"""
