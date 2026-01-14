@@ -64,19 +64,18 @@ class LMStudioClient:
                 import pdb
                 pdb.set_trace()
 
-            response.raise_for_status()
             if enable_message_logs:
                 with open("messages.log", "a") as f:
                     f.write("Agent: ")
-                    for line in response.iter_lines():
-                        if line:
-                            line = line.decode("utf-8")
+
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    line = line.decode("utf-8")
+                    if enable_message_logs:
+                        with open("messages.log", "a") as f:
                             f.write(f"{line}\n")
-                            yield line
-            else:
-                for line in response.iter_lines():
-                    if line:
-                        yield line.decode("utf-8")
+                    yield line
 
     def get_embedding(self, text: str) -> list:
         """Get embedding for a text snippet"""

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Tuple
 
 import click
@@ -8,6 +9,7 @@ import yaml
 from lms_cli.core.embedding_manager import EmbeddingManager
 from lms_cli.core.file_reference_parser import FileReferenceParser
 from lms_cli.core.lm_studio_client import LMStudioClient
+from lms_cli.core.session_handler import SessionHandler
 from lms_cli.core.tool_registry import ToolRegistry
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
@@ -154,7 +156,13 @@ def ask(query, num_files, config):
     help="Immediate prompt, either a string to send or '@file'",
     default=None,
 )
-def shell(config: str, workspace: str, prompt: str):
+@click.option(
+    "--resume",
+    "resume",
+    flag_value=True,
+    default=False,
+)
+def shell(config: str, workspace: str, prompt: str, resume):
     """Interactive shell mode"""
 
     def permission_requests(question: str, options: List[str]) -> Tuple[int, str]:
@@ -190,11 +198,31 @@ def shell(config: str, workspace: str, prompt: str):
     with open(config) as f:
         configuration = yaml.safe_load(f)
     max_tokens = configuration["lm_studio"].get("max_tokens", 4096)
+    stream = configuration["lm_studio"].get("stream", False)
+    session_handler = None
+
+    messages = []
 
     # Prepare initial messages
-    messages = [
-        {"role": "system", "content": lm_client.system_message},
-    ]
+    if resume:
+        sessions = SessionHandler.list_available_sessions()
+        session_choices = [
+            Choice(i, f'{datetime.strptime(session.rsplit("_", 1)[1], "%Y-%m-%dT%Hh%Mm%Ss")}')
+            for i, session in enumerate(sessions)
+        ]
+        if sessions:
+            session = enquiries.choose("which session should be restored?", session_choices)
+            if session_handler := SessionHandler.restore_session(sessions[session.i]):
+                messages = session_handler.load_recent_history()
+
+    if not messages:
+        # Create new session handler and save system message if necessary
+        session_handler = SessionHandler(workspace)
+        messages = [
+            {"role": "system", "content": lm_client.system_message},
+        ]
+        session_handler.save_message(messages[-1])
+
     print("Starting interactive shell. Type 'exit' to quit.")
 
     while True:
@@ -204,6 +232,9 @@ def shell(config: str, workspace: str, prompt: str):
         ]
 
         try:
+            # This is an ugly hack
+            is_compaction_request = False
+
             if prompt:
                 if prompt.startswith("@"):
                     with open(prompt[1:]) as f:
@@ -217,10 +248,32 @@ def shell(config: str, workspace: str, prompt: str):
                 if not user_input or user_input.lower() == "exit":
                     break
 
-                content = FileReferenceParser.parse_message(user_input)
+                if user_input.startswith("/compact"):
+                    is_compaction_request = True
+                    compaction_instruction = user_input[8:].strip()
+                    if not compaction_instruction:
+                        compaction_instruction = (
+                            "Include key details, decisions made, unresolved "
+                            "questions, and any important context or goals discussed. "
+                            "Ensure the summary retains enough detail to allow the "
+                            "conversation to continue seamlessly without losing "
+                            "critical information."
+                        )
+
+                    content = (
+                        "Summarize the entire message history up to this point in a "
+                        "structured, concise manner. "
+                        f"Instructions: {compaction_instruction}"
+                    )
+
+                else:
+                    content = FileReferenceParser.parse_message(user_input)
 
             # Add to messages, begin with provided prompt if any
             messages.append({"role": "user", "content": content})
+
+            # Save user message to session
+            session_handler.save_message(messages[-1])
 
             # Define callback to output chunks as they arrive
             first_chunk = True
@@ -255,8 +308,8 @@ def shell(config: str, workspace: str, prompt: str):
             # Get response with streaming and tool support
             result = lm_client.chat_completion(
                 messages,
-                tools=tools,
-                stream=True,
+                tools=tools if not is_compaction_request else None,
+                stream=stream,
                 on_chunk_callback=output_chunk,
                 usage_callback=output_usage,
             )
@@ -273,6 +326,13 @@ def shell(config: str, workspace: str, prompt: str):
                     ),
                 }
             )
+
+            # Save assistant message to session
+            session_handler.save_message(messages[-1])
+
+            # Replace history if this is a compaction request
+            if is_compaction_request:
+                messages = session_handler.compact_recent_history()
 
             # Get tool calls from result
             tool_calls = result["tool_calls"]
@@ -306,13 +366,21 @@ def shell(config: str, workspace: str, prompt: str):
                             }
                         )
 
+                    # Save tool responses to session
+                    session_handler.save_message(tool_responses[-1])
+
                 # Add tool responses to messages
                 messages.extend(tool_responses)
 
                 # Continue conversation with tool results (stream again)
                 result = lm_client.chat_completion(
-                    messages, tools=tools, stream=True, on_chunk_callback=output_chunk
+                    messages,
+                    tools=tools,
+                    stream=stream,
+                    on_chunk_callback=output_chunk,
+                    usage_callback=output_usage,
                 )
+                # TODO: Remove? Use for a while and check behaviour
                 print()  # Newline after streaming
 
                 messages.append(
@@ -326,6 +394,9 @@ def shell(config: str, workspace: str, prompt: str):
                         ),
                     }
                 )
+
+                # Save assistant response to session
+                session_handler.save_message(messages[-1])
 
                 # Get tool calls from result for next iteration
                 tool_calls = result["tool_calls"]
