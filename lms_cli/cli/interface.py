@@ -4,8 +4,8 @@ from typing import List, Tuple
 import click
 import enquiries
 import json
-import yaml
 
+from lms_cli.core.context import CLIContext
 from lms_cli.core.embedding_manager import EmbeddingManager
 from lms_cli.core.file_reference_parser import FileReferenceParser
 from lms_cli.core.lm_studio_client import LMStudioClient
@@ -32,46 +32,55 @@ class Choice:
 @click.group()
 def cli():
     """Interactive CLI code assistant"""
-    pass
 
 
 @cli.command()
-@click.option("--workspace", default=".", help="Workspace directory")
+@click.option("--workspace", "workspace_root", default=".", help="Workspace directory")
 @click.option("--excluded", multiple=True, help="Folders to exclude")
 @click.option(
     "--config", help="Optional configuration file", default="config/config.yaml"
 )
-def init(workspace, excluded, config):
+def init(workspace_root, excluded, config):
     """Initialize the workspace and create embeddings index"""
-    workspace = Workspace(workspace)
-    embedding_manager = EmbeddingManager(config_path=config)
+    context = CLIContext(config_path=config, workspace_root=workspace_root)
 
     if not click.confirm("This will create an embedding index of your code. Continue?"):
         return
 
-    included_set = embedding_manager.inclusion_paths
+    included_set = context.embedding_manager.inclusion_paths
     excluded_set = set(excluded)
-    excluded_set.update(embedding_manager.exclusion_paths)
+    excluded_set.update(context.embedding_manager.exclusion_paths)
 
     # Get all files in workspace
-    files = workspace.list_files(
+    files = context.workspace.list_files(
         included_folders=included_set, excluded_folders=excluded_set
     )
     print(f"Found {len(files)} files to process")
 
     # Process files and get embeddings
-    lm_client = LMStudioClient(config_path=config)
     embeddings = []
     metadata = []
 
-    embedding_manager.initialize_index()
+    context.embedding_manager.initialize_index()
 
     for file_path in files:
-        content = workspace.read_file(file_path)
-        embedding = lm_client.get_embedding(content)
+        if not file_path.is_file():
+            # Skip folders etc
+            continue
+
+        if "__pycache__" in str(file_path):
+            continue
+
+        if str(file_path).endswith("~"):
+            continue
+
+        print(f"Reading {file_path}")
+
+        content = context.workspace.read_file(file_path)
+        embedding = context.lm_studio_client.get_embedding(content, is_query=False)
 
         embeddings.append(embedding)
-        filename = str(file_path.relative_to(workspace.root_path))
+        filename = str(file_path.relative_to(context.workspace.root_path))
         metadata.append(
             {
                 "file": filename,
@@ -80,7 +89,7 @@ def init(workspace, excluded, config):
         )
 
     # Add to index
-    embedding_manager.add_embeddings(embeddings, metadata)
+    context.embedding_manager.add_embeddings(embeddings, metadata)
     print("Embedding index created successfully")
 
 
@@ -92,20 +101,20 @@ def init(workspace, excluded, config):
 @click.option(
     "--config", help="Optional configuration file", default="config/config.yaml"
 )
-def ask(query, num_files, config):
+@click.option("--workspace", "workspace_root", default=".", help="Workspace directory")
+def ask(query: str, num_files: int, config: str, workspace_root: str):
     """Ask the AI about your code"""
-    lm_client = LMStudioClient(config_path=config)
-    embedding_manager = EmbeddingManager(config_path=config)
+    context = CLIContext(config_path=config, workspace_root=workspace_root)
 
     # First check if we have an index
     try:
-        embedding_manager.initialize_index()
+        context.embedding_manager.initialize_index()
 
         # Get query embedding
-        query_embedding = lm_client.get_embedding(query)
+        query_embedding = context.lm_studio_client.get_embedding(query, is_query=True)
 
         # Search for relevant files
-        results = embedding_manager.search(query_embedding, k=num_files)
+        results = context.embedding_manager.search(query_embedding, k=num_files)
         print(f"\nFound {len(results)} potentially relevant files:")
 
         for i, result in enumerate(results, 1):
@@ -115,7 +124,7 @@ def ask(query, num_files, config):
             )
 
         # Prepare context
-        context = "\n\n".join(
+        embedding_context = "\n\n".join(
             f"File: {result['metadata']['file']}\n"
             f"Content:\n{result['metadata']['content']}"
             for result in results
@@ -123,12 +132,15 @@ def ask(query, num_files, config):
 
     except Exception as e:
         print(f"Could not use embeddings index: {e}")
-        context = "No relevant files found in the embedding index."
+        embedding_context = "No relevant files found in the embedding index."
 
     # Prepare messages for chat completion
     messages = [
-        {"role": "system", "content": lm_client.system_message},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+        {"role": "system", "content": context.lm_studio_client.system_message},
+        {
+            "role": "user",
+            "content": f"Context:\n{embedding_context}\n\nQuestion: {query}",
+        },
     ]
 
     # Get response with streaming
@@ -137,7 +149,7 @@ def ask(query, num_files, config):
     def output_chunk(chunk: str):
         click.echo(chunk, nl=False)
 
-    result = lm_client.chat_completion(
+    result = context.lm_studio_client.chat_completion(
         messages, stream=True, on_chunk_callback=output_chunk
     )
     print()  # Newline after streaming
@@ -148,24 +160,29 @@ def ask(query, num_files, config):
 
 @cli.command()
 @click.option(
-    "--config", help="Optional configuration file", default="config/config.yaml"
+    "--resume",
+    "resume",
+    flag_value=True,
+    default=False,
 )
-@click.option("--workspace", help="Path to workspace folder", default=".")
 @click.option(
     "--prompt",
     help="Immediate prompt, either a string to send or '@file'",
     default=None,
 )
 @click.option(
-    "--resume",
-    "resume",
-    flag_value=True,
-    default=False,
+    "--config", help="Optional configuration file", default="config/config.yaml"
 )
-def shell(config: str, workspace: str, prompt: str, resume):
+@click.option(
+    "--workspace",
+    "workspace_root",
+    help="Path to workspace folder",
+    default=".",
+)
+def shell(config: str, workspace_root: str, prompt: str, resume):
     """Interactive shell mode"""
 
-    def permission_requests(question: str, options: List[str]) -> Tuple[int, str]:
+    def permission_request(question: str, options: List[str]) -> Tuple[int, str]:
         # Default options
         choices = [
             Choice(TOOL_PERMISSION_YES, "Yes"),
@@ -188,18 +205,15 @@ def shell(config: str, workspace: str, prompt: str, resume):
 
         return choice.i, permission_string
 
-    lm_client = LMStudioClient(config_path=config)
-    tool_registry = ToolRegistry(
+    context = CLIContext(
         config_path=config,
-        workspace=workspace,
-        permission_request_cb=permission_requests,
+        workspace_root=workspace_root,
+        permission_callback=permission_request
     )
-    tool_registry.load_tools()
-    with open(config) as f:
-        configuration = yaml.safe_load(f)
-    max_tokens = configuration["lm_studio"].get("max_tokens", 4096)
-    stream = configuration["lm_studio"].get("stream", False)
-    session_handler = None
+    context.tool_registry.load_tools()
+    max_tokens = context.config["lm_studio"].get("max_tokens", 4096)
+    stream = context.config["lm_studio"].get("stream", False)
+    sh = None
 
     messages = []
 
@@ -207,28 +221,37 @@ def shell(config: str, workspace: str, prompt: str, resume):
     if resume:
         sessions = SessionHandler.list_available_sessions()
         session_choices = [
-            Choice(i, f'{datetime.strptime(session.rsplit("_", 1)[1], "%Y-%m-%dT%Hh%Mm%Ss")}')
+            Choice(
+                i,
+                f'{datetime.strptime(session.rsplit("_", 1)[1], "%Y-%m-%dT%Hh%Mm%Ss")}',
+            )
             for i, session in enumerate(sessions)
         ]
         if sessions:
-            session = enquiries.choose("which session should be restored?", session_choices)
-            if session_handler := SessionHandler.restore_session(sessions[session.i]):
-                messages = session_handler.load_recent_history()
+            session = enquiries.choose(
+                "which session should be restored?", session_choices
+            )
+            if sh := SessionHandler.restore_session(sessions[session.i]):
+                messages = sh.load_recent_history()
 
     if not messages:
         # Create new session handler and save system message if necessary
-        session_handler = SessionHandler(workspace)
+        sh = SessionHandler(context.workspace)
         messages = [
-            {"role": "system", "content": lm_client.system_message},
+            {"role": "system", "content": context.lm_studio_client.system_message},
         ]
-        session_handler.save_message(messages[-1])
+        sh.save_message(messages[-1])
+
+    # Replace the default session handler to support resuming etc
+    context.session_handler = sh
 
     print("Starting interactive shell. Type 'exit' to quit.")
 
     while True:
         # Get available tool definitions
         tools = [
-            tool_registry.get_tool_definition(name) for name in tool_registry.tools
+            context.tool_registry.get_tool_definition(name)
+            for name in context.tool_registry.tools
         ]
 
         try:
@@ -273,7 +296,7 @@ def shell(config: str, workspace: str, prompt: str, resume):
             messages.append({"role": "user", "content": content})
 
             # Save user message to session
-            session_handler.save_message(messages[-1])
+            context.session_handler.save_message(messages[-1])
 
             # Define callback to output chunks as they arrive
             first_chunk = True
@@ -306,7 +329,7 @@ def shell(config: str, workspace: str, prompt: str, resume):
                 )
 
             # Get response with streaming and tool support
-            result = lm_client.chat_completion(
+            result = context.lm_studio_client.chat_completion(
                 messages,
                 tools=tools if not is_compaction_request else None,
                 stream=stream,
@@ -328,11 +351,11 @@ def shell(config: str, workspace: str, prompt: str, resume):
             )
 
             # Save assistant message to session
-            session_handler.save_message(messages[-1])
+            context.session_handler.save_message(messages[-1])
 
             # Replace history if this is a compaction request
             if is_compaction_request:
-                messages = session_handler.compact_recent_history()
+                messages = context.session_handler.compact_recent_history()
 
             # Get tool calls from result
             tool_calls = result["tool_calls"]
@@ -342,7 +365,7 @@ def shell(config: str, workspace: str, prompt: str, resume):
                 tool_responses = []
                 for tc in tool_calls:
                     try:
-                        result = tool_registry.execute_tool(
+                        result = context.tool_registry.execute_tool(
                             tc["function"]["name"], tc["function"]["arguments"]
                         )
 
@@ -367,13 +390,13 @@ def shell(config: str, workspace: str, prompt: str, resume):
                         )
 
                     # Save tool responses to session
-                    session_handler.save_message(tool_responses[-1])
+                    context.session_handler.save_message(tool_responses[-1])
 
                 # Add tool responses to messages
                 messages.extend(tool_responses)
 
                 # Continue conversation with tool results (stream again)
-                result = lm_client.chat_completion(
+                result = context.lm_studio_client.chat_completion(
                     messages,
                     tools=tools,
                     stream=stream,
@@ -396,7 +419,7 @@ def shell(config: str, workspace: str, prompt: str, resume):
                 )
 
                 # Save assistant response to session
-                session_handler.save_message(messages[-1])
+                context.session_handler.save_message(messages[-1])
 
                 # Get tool calls from result for next iteration
                 tool_calls = result["tool_calls"]

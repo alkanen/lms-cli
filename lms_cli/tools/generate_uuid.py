@@ -1,26 +1,24 @@
 from typing import Optional
 import uuid
 
-from lms_cli.core.embedding_manager import EmbeddingManager
-from lms_cli.core.tool_registry import Tool, ToolRegistry
+from lms_cli.core.context import CLIContext
+from lms_cli.core.tool_registry import Tool
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
     TOOL_PERMISSION_ALWAYS,
     TOOL_PERMISSION_NO,
     TOOL_PERMISSION_USER_SUGGESTION,
 )
-from lms_cli.core.workspace import Workspace
 
 
 class generate_uuid(Tool):
-    def __init__(self, _context: dict, permission_required: bool):
+    def __init__(self, context: CLIContext, permission_required: bool):
         super().__init__(
-            _context=_context,
+            context=context,
             permission_required=permission_required,
             name="generate_uuid",
             description="Generate a UUID string based on the provided 'name'",
         )
-
         self.always_allowed_names = set()
         self.namespace = uuid.UUID("e00851a0-efc5-11f0-b00c-115acf816a78")
 
@@ -59,7 +57,8 @@ class generate_uuid(Tool):
             return True, ""
 
         # If setting exists and is truthy, make a permission request
-        option, reason = self.registry.request_permission(
+        option, reason = self.context.tool_registry.request_permission(
+            f"Generate UUID from '{name}'?",
             [f"Always allow UUID generation for '{name}'"]
         )
 
