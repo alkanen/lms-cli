@@ -2,7 +2,7 @@ lm_studio:
   base_url: "http://192.168.1.8:1234/v1"    # Update to your server, or `null` for default
   model: "mistralai/devstral-small-2-2512"  # Or whatever model you wish to use
   api_key: null                             # If authentication is required
-  max_tokens: 45000                         # The number of tokens available in the context
+  max_tokens: 64000                         # The number of tokens available in the context
   stream: true
 
 embeddings:
@@ -56,7 +56,8 @@ tools:
       allow_outside_workspace: true
     - name: "run_test"
       permission_required: true
+      disabled: true
     - name: "generate_uuid"
       # This is safe to run
-      permission_required: false
-      disabled: true
+      permission_required: true
+      disabled: false

@@ -1,11 +1,14 @@
 """
 Session handler for managing message history and compaction.
 """
+
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 from slugify import slugify
+
+from lms_cli.core.workspace import Workspace
 
 
 SESSIONS_DIR = Path.home() / ".lms-cli" / "sessions"
@@ -22,7 +25,7 @@ class SessionHandler:
         recent_history_path: Path to the recent history file.
     """
 
-    def __init__(self, workspace_path: str, sessions_dir: Optional[str] = None):
+    def __init__(self, workspace: Workspace, sessions_dir: Optional[str] = None):
         """
         Initialize the SessionHandler with a workspace path.
 
@@ -31,9 +34,12 @@ class SessionHandler:
             sessions_dir: Optional path to the directory where session files are stored.
                 If not provided, the default SESSIONS_DIR is used.
         """
-        self.session_id = self._generate_session_id(str(Path(workspace_path).resolve()))
+        workspace_path = str(workspace.root_path)
+        self.session_id = self._generate_session_id(workspace_path)
         self.session_dir = Path(sessions_dir if sessions_dir else SESSIONS_DIR)
-        self.complete_history_path = self.session_dir / f"{self.session_id}_complete.jsonl"
+        self.complete_history_path = (
+            self.session_dir / f"{self.session_id}_complete.jsonl"
+        )
         self.recent_history_path = self.session_dir / f"{self.session_id}_recent.jsonl"
 
     def _generate_session_id(self, workspace_path: str) -> str:
@@ -151,7 +157,9 @@ class SessionHandler:
 
         # Overwrite the recent history with the system message and summary
         compacted_history: List[Dict[str, str]] = [complete_history[0]]
-        compacted_history.extend(recent_history[-2:])  # Keep compaction request and response
+        compacted_history.extend(
+            recent_history[-2:]
+        )  # Keep compaction request and response
 
         # Write the compacted history to the recent file
         with open(self.recent_history_path, "w", encoding="utf-8") as f:
@@ -186,7 +194,9 @@ class SessionHandler:
         return sorted(sessions, reverse=True)
 
     @classmethod
-    def restore_session(cls, session_id: str, sessions_dir: Optional[str] = None) -> Optional["SessionHandler"]:
+    def restore_session(
+        cls, session_id: str, sessions_dir: Optional[str] = None
+    ) -> Optional["SessionHandler"]:
         """
         Restore a session by loading its complete and recent histories into a new SessionHandler instance.
 
@@ -204,10 +214,16 @@ class SessionHandler:
 
         # Create a new SessionHandler instance with the restored session ID
         session_dir = Path(sessions_dir) if sessions_dir else SESSIONS_DIR
-        restored_handler = cls.__new__(cls)  # Create an instance without calling __init__
+        restored_handler = cls.__new__(
+            cls
+        )  # Create an instance without calling __init__
         restored_handler.session_id = session_id
         restored_handler.session_dir = session_dir
-        restored_handler.complete_history_path = session_dir / f"{session_id}_complete.jsonl"
-        restored_handler.recent_history_path = session_dir / f"{session_id}_recent.jsonl"
+        restored_handler.complete_history_path = (
+            session_dir / f"{session_id}_complete.jsonl"
+        )
+        restored_handler.recent_history_path = (
+            session_dir / f"{session_id}_recent.jsonl"
+        )
 
         return restored_handler

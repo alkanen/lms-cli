@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
+from lms_cli.core.context import CLIContext
 from lms_cli.core.tool_registry import Tool, ToolRegistry
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
@@ -11,12 +12,16 @@ from lms_cli.core.tool_registry import (
 
 
 class write_file(Tool):
-    def __init__(self, _context: dict, permission_required: bool = False):
+    def __init__(
+        self,
+        context: CLIContext,
+        permission_required: bool = False,
+    ):
         super().__init__(
-            _context=_context,
+            context=context,
             permission_required=permission_required,
             name="write_file",
-            description="Write contents to a file in the workspace",
+            description="Write contents to a file in the workspace, can append or overwrite",
         )
         self.allowed_files: Set[str] = set()
         self.allowed_folders: Set[str] = set()
@@ -40,6 +45,11 @@ class write_file(Tool):
                             "required": True,
                             "description": "The content to write to the file",
                         },
+                        "append": {
+                            "type": "boolean",
+                            "required": False,
+                            "description": "True to append, False to overwrite file",
+                        },
                     },
                 },
             },
@@ -49,6 +59,7 @@ class write_file(Tool):
         self,
         file_path: str,
         content: str,
+        append: bool = False,
     ) -> Tuple[bool, str]:
         if file_path in self.allowed_files:
             return True, ""
@@ -56,10 +67,17 @@ class write_file(Tool):
         if self._in_allowed_folders(file_path):
             return True, ""
 
+        if not Path(file_path).resolve().is_relative_to(self.context.workspace.root_path):
+            return False, "Writing outside of the workspace is not allowed"
+
         if self.always_allow:
             return True, ""
 
-        stripped_path = self.workspace.strip_root_path(file_path)
+        if not self.context.tool_registry.request_permission:
+            print("Warning: No permission requester is registered, aborting tool")
+            return False, f"Unable to grant access to '{self.name}'"
+
+        stripped_path = self.context.workspace.strip_root_path(file_path)
         stripped_parts = Path(stripped_path).parts
 
         progressive_paths = [
@@ -73,14 +91,24 @@ class write_file(Tool):
         )
         options.append(f"Allows allow on '{progressive_paths[-1]}'")
 
-        if len(file_path) < 60:
-            question = f"Allow agent to write to file '{file_path}'?"
+        if Path(file_path).exists():
+            if append:
+                if len(file_path) < 60:
+                    question = f"Allow agent to append to file '{file_path}'?"
+                else:
+                    question = f"Allow agent to append to file '{file_path[:26]}...{file_path[-26:]}'?"
+            else:
+                if len(file_path) < 60:
+                    question = f"Allow agent to overwrite file '{file_path}'?"
+                else:
+                    question = f"Allow agent to overwrite file '{file_path[:26]}...{file_path[-26:]}'?"
         else:
-            question = (
-                f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
-            )
+            if len(file_path) < 60:
+                question = f"Allow agent to write to file '{file_path}'?"
+            else:
+                question = f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
 
-        option, reason = self.registry.request_permission(question, options)
+        option, reason = self.context.tool_registry.request_permission(question, options)
 
         if option == TOOL_PERMISSION_ALWAYS:
             self.always_allow = True
@@ -92,7 +120,7 @@ class write_file(Tool):
         elif option == TOOL_PERMISSION_USER_SUGGESTION:
             return False, f"User aborted write_file and instead suggested: {reason}"
         elif option == 0:  # Always allow entire workspace
-            self.allowed_folders.add(str(self.workspace.root_path))
+            self.allowed_folders.add(str(self.context.workspace.root_path))
             return True, ""
         elif option == len(options) - 1:  # Always allow on specific file
             self.allowed_files.add(file_path)
@@ -107,10 +135,11 @@ class write_file(Tool):
     def execute(
         self,
         file_path: str,
-        content: str
+        content: str,
+        append: bool = False,
     ) -> str:
         try:
-            return self.workspace.write_file(file_path, content)
+            return self.context.workspace.write_file(file_path, content, append)
         except Exception as e:
             return f"Unable to write to file '{file_path}': {e}"
 
