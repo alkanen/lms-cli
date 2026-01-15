@@ -86,7 +86,7 @@ class Workspace:
 
         return full_path.read_text()
 
-    def write_file(self, file_path: Path, content: str) -> str:
+    def write_file(self, file_path: Path, content: str, append: bool=False) -> str:
         """Write content to a file"""
         full_path = (self.root_path / file_path).resolve()
 
@@ -95,7 +95,8 @@ class Workspace:
 
         # Ensure directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        size = full_path.write_text(content)
+        with full_path.open("a" if append else "w") as f:
+            size = f.write(content)
 
         return f"Success: A total of {size} bytes written to '{file_path}'"
 

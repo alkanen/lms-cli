@@ -228,9 +228,8 @@ def ask(query: str, num_files: int, config: str, workspace_root: str):
 )
 def shell(config: str, workspace_root: str, prompt: str, resume):
     """Interactive shell mode"""
-    context = CLIContext(config_path=config, workspace_root=workspace_root)
 
-    def permission_requests(question: str, options: List[str]) -> Tuple[int, str]:
+    def permission_request(question: str, options: List[str]) -> Tuple[int, str]:
         # Default options
         choices = [
             Choice(TOOL_PERMISSION_YES, "Yes"),
@@ -253,6 +252,11 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
 
         return choice.i, permission_string
 
+    context = CLIContext(
+        config_path=config,
+        workspace_root=workspace_root,
+        permission_callback=permission_request
+    )
     context.tool_registry.load_tools()
     max_tokens = context.config["lm_studio"].get("max_tokens", 4096)
     stream = context.config["lm_studio"].get("stream", False)
@@ -279,7 +283,7 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
 
     if not messages:
         # Create new session handler and save system message if necessary
-        sh = SessionHandler(workspace)
+        sh = SessionHandler(context.workspace)
         messages = [
             {"role": "system", "content": context.lm_studio_client.system_message},
         ]
@@ -431,6 +435,7 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
                                 "content": f"Error {str(e)}",
                             }
                         )
+                        raise e
 
                     # Save tool responses to session
                     context.session_handler.save_message(tool_responses[-1])

@@ -8,8 +8,9 @@ from typing import Any, Callable, Dict, List, Tuple, Optional
 import json
 import yaml
 
-from lms_cli.core.workspace import Workspace
+# from lms_cli.core.context import CLIContext
 from lms_cli.core.embedding_manager import EmbeddingManager
+from lms_cli.core.workspace import Workspace
 
 
 # Default permission request response values. If extra options are provided and
@@ -23,7 +24,7 @@ TOOL_PERMISSION_USER_SUGGESTION = -4
 class Tool:
     def __init__(
         self,
-        _context: dict,
+        context: "CLIContext",
         name: str,
         description: Optional[str] = None,
         permission_required: bool = False,
@@ -31,14 +32,8 @@ class Tool:
         self.name = name
         self.description = description
         self.permission_required = permission_required
-
-        registry = _context["tool_registry"]
-        ws = _context["workspace"]
-        em = _context["embedding_manager"]
+        self.context = context
         self.always_allow = not self.permission_required
-        self.registry = registry
-        self.workspace = ws
-        self.embedding_manager = em
 
     def definition(self) -> dict:
         return {"name": self.name, "description": self.description, "parameters": []}
@@ -49,7 +44,7 @@ class Tool:
             return True
 
         # If setting exists and is truthy, make a permission request
-        return self.registry.request_permission([])
+        return self.context.tool_registry.request_permission([])
 
     def execute(self, *args, **kwargs) -> str:
         return "This tool performs no action and returns no useful data"
@@ -58,20 +53,11 @@ class Tool:
 class ToolRegistry:
     def __init__(
         self,
-        permission_request_cb: Callable[List[str], Tuple[int, str]],
-        config_path: str = "config/config.yaml",
-        workspace: str = ".",
+        context: "CLIContext"
     ):
+        self.context = context
         self.tools = {}
-        self.config_path = config_path
-        with open(config_path) as f:
-            self.config = yaml.safe_load(f)
-        self.context = {
-            "workspace": Workspace(workspace),
-            "embedding_manager": EmbeddingManager(self.config_path),
-            "tool_registry": self,
-        }
-        self.request_permission = permission_request_cb
+        self.request_permission = context.permission_callback
 
     def register_tool(
         self, name: str, tool: Tool, description: str, parameters: List[Dict]
@@ -94,6 +80,7 @@ class ToolRegistry:
 
     def execute_tool(self, name: str, arguments: str) -> Any:
         """Execute a registered tool with given arguments"""
+        # print(f"== execute_tool('{name}') ==")
         if name not in self.tools:
             raise ValueError(f"ToolRegistry::execute_tool(): Tool {name} not found")
 
@@ -101,16 +88,18 @@ class ToolRegistry:
         tool = self.tools[name]["class"]
 
         # Make sure we have permission or report back a rejection reason to the agent
+        # print("== Request permission ==")
         allowed, reason = tool.request_permission(**arguments_dict)
         if not allowed:
             return reason
 
         # Permission granted, perform the tool function
+        # print("== Execute ==")
         return self.tools[name]["class"].execute(**arguments_dict)
 
     def load_tools(self):
         """Load tools from tools folder in configuration file"""
-        tools_conf = self.config.get("tools", {})
+        tools_conf = self.context.config.get("tools", {})
         if not tools_conf:
             print("No tools loaded")
             return
@@ -163,7 +152,7 @@ class ToolRegistry:
                         and any(base.__name__ == "Tool" for base in obj.__bases__)
                     ):
                         self.tools[name] = {
-                            "class": obj(_context=self.context, **tool_settings)
+                            "class": obj(context=self.context, **tool_settings)
                         }
                         print(f"Loaded tool '{name}'")
 

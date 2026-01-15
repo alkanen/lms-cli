@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
+from lms_cli.core.context import CLIContext
 from lms_cli.core.tool_registry import Tool, ToolRegistry
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
@@ -11,9 +12,13 @@ from lms_cli.core.tool_registry import (
 
 
 class write_file(Tool):
-    def __init__(self, _context: dict, permission_required: bool = False):
+    def __init__(
+        self,
+        context: CLIContext,
+        permission_required: bool = False,
+    ):
         super().__init__(
-            _context=_context,
+            context=context,
             permission_required=permission_required,
             name="write_file",
             description="Write contents to a file in the workspace, supports appending",
@@ -56,16 +61,23 @@ class write_file(Tool):
         content: str,
         append: bool = False,
     ) -> Tuple[bool, str]:
-        if self.always_allow:
-            return True, ""
-
         if file_path in self.allowed_files:
             return True, ""
 
         if self._in_allowed_folders(file_path):
             return True, ""
 
-        stripped_path = self.workspace.strip_root_path(file_path)
+        if not Path(file_path).resolve().is_relative_to(self.context.workspace.root_path):
+            return False, "Writing outside of the workspace is not allowed"
+
+        if self.always_allow:
+            return True, ""
+
+        if not self.context.tool_registry.request_permission:
+            click.echo("Warning: No permission requester is registered, aborting tool")
+            return False, f"Unable to grant access to '{self.name}'"
+
+        stripped_path = self.context.workspace.strip_root_path(file_path)
         stripped_parts = Path(stripped_path).parts
 
         progressive_paths = [
@@ -96,7 +108,7 @@ class write_file(Tool):
             else:
                 question = f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
 
-        option, reason = self.registry.request_permission(question, options)
+        option, reason = self.context.tool_registry.request_permission(question, options)
 
         if option == TOOL_PERMISSION_ALWAYS:
             self.always_allow = True
@@ -108,7 +120,7 @@ class write_file(Tool):
         elif option == TOOL_PERMISSION_USER_SUGGESTION:
             return False, f"User aborted write_file and instead suggested: {reason}"
         elif option == 0:  # Always allow entire workspace
-            self.allowed_folders.add(str(self.workspace.root_path))
+            self.allowed_folders.add(str(self.context.workspace.root_path))
             return True, ""
         elif option == len(options) - 1:  # Always allow on specific file
             self.allowed_files.add(file_path)
@@ -127,7 +139,7 @@ class write_file(Tool):
         append: bool = False,
     ) -> str:
         try:
-            return self.workspace.write_file(file_path, content)
+            return self.context.workspace.write_file(file_path, content, append)
         except Exception as e:
             return f"Unable to write to file '{file_path}': {e}"
 

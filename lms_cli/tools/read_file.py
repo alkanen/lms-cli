@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
+from lms_cli.core.context import CLIContext
 from lms_cli.core.tool_registry import Tool, ToolRegistry
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
@@ -13,12 +14,12 @@ from lms_cli.core.tool_registry import (
 class read_file(Tool):
     def __init__(
         self,
-        _context: dict,
+        context: CLIContext,
         permission_required: bool = False,
         allow_outside_workspace: bool = False,
     ):
         super().__init__(
-            _context=_context,
+            context=context,
             permission_required=permission_required,
             name="read_file",
             description="Read contents from a file in the workspace",
@@ -62,9 +63,6 @@ class read_file(Tool):
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
     ) -> Tuple[bool, str]:
-        if self.always_allow:
-            return True, ""
-
         if file_path in self.allowed_files:
             return True, ""
 
@@ -75,10 +73,17 @@ class read_file(Tool):
             if not Path(file_path).exists():
                 return False, "File does not exist"
         else:
-            if not self.workspace.file_exists(file_path):
+            if not self.context.workspace.file_exists(file_path):
                 return False, "File does not exist in workspace"
 
-        stripped_path = self.workspace.strip_root_path(file_path)
+        if self.always_allow:
+            return True, ""
+
+        if not self.context.tool_registry.request_permission:
+            click.echo("Warning: No permission requester is registered, aborting tool")
+            return False, f"Unable to grant access to '{self.name}'"
+
+        stripped_path = self.context.workspace.strip_root_path(file_path)
         stripped_parts = Path(stripped_path).parts
 
         progressive_paths = [
@@ -105,7 +110,11 @@ class read_file(Tool):
         else:
             question = f"Allow agent to read file '{file_path[:26]}...{file_path[-26:]}'{lines}?"
 
-        option, reason = self.registry.request_permission(question, options)
+        if not self.context.tool_registry.request_permission:
+            click.echo("Warning: No permission requester is registered, aborting tool")
+            return False, "Unable to grant access to tool"
+
+        option, reason = self.context.tool_registry.request_permission(question, options)
 
         if option == TOOL_PERMISSION_ALWAYS:
             self.always_allow = True
@@ -117,7 +126,7 @@ class read_file(Tool):
         elif option == TOOL_PERMISSION_USER_SUGGESTION:
             return False, f"User aborted read_file and instead suggested: {reason}"
         elif option == 0:  # Always allow entire workspace
-            self.allowed_folders.add(str(self.workspace.root_path))
+            self.allowed_folders.add(str(self.context.workspace.root_path))
             return True, ""
         elif option == len(options) - 1:  # Always allow on specific file
             self.allowed_files.add(file_path)
@@ -136,7 +145,7 @@ class read_file(Tool):
         end_line: Optional[int] = None,
     ) -> str:
         try:
-            return self.workspace.read_file(file_path, start_line, end_line)
+            return self.context.workspace.read_file(file_path, start_line, end_line)
         except:
             return f"Unable to read from file '{file_path}'"
 
