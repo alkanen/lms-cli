@@ -20,7 +20,9 @@ class LMStudioClient:
             self.config = yaml.safe_load(f)
 
         # Use provided values or fall back to config
-        self.base_url = base_url if base_url is not None else self.config["lm_studio"]["base_url"]
+        self.base_url = (
+            base_url if base_url is not None else self.config["lm_studio"]["base_url"]
+        )
         self.model = model if model is not None else self.config["lm_studio"]["model"]
         self.api_key = self.config["lm_studio"].get("api_key", "")
         # If no embedding model is specified, revert to main model
@@ -62,6 +64,7 @@ class LMStudioClient:
         with requests.post(url, json=data, headers=headers, stream=True) as response:
             if response.status_code >= 400:
                 import pdb
+
                 pdb.set_trace()
 
             if enable_message_logs:
@@ -77,10 +80,13 @@ class LMStudioClient:
                             f.write(f"{line}\n")
                     yield line
 
-    def get_embedding(self, text: str) -> list:
+    def get_embedding(self, text: str, is_query: bool = True) -> list:
         """Get embedding for a text snippet"""
         endpoint = "embeddings"
-        data = {"model": self.embedding_model, "input": text}
+        data = {
+            "model": self.embedding_model,
+            "input": f"search_{'query' if is_query else 'document'}: {text}",
+        }
 
         response = self._make_request(endpoint, data=data)
         try:
@@ -122,7 +128,10 @@ class LMStudioClient:
                     break
 
                 if not tool_type in tool_calls[index]:
-                    tool_calls[index][tool_type] = {"name": "<unknown>", "arguments": ""}
+                    tool_calls[index][tool_type] = {
+                        "name": "<unknown>",
+                        "arguments": "",
+                    }
 
                 try:
                     tool_calls[index][tool_type]["name"] = chunk[tool_type]["name"]

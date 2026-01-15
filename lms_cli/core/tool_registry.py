@@ -35,17 +35,13 @@ class Tool:
         registry = _context["tool_registry"]
         ws = _context["workspace"]
         em = _context["embedding_manager"]
-        self.always_allow = False
+        self.always_allow = not self.permission_required
         self.registry = registry
         self.workspace = ws
         self.embedding_manager = em
 
     def definition(self) -> dict:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": []
-        }
+        return {"name": self.name, "description": self.description, "parameters": []}
 
     def request_permission(self, *args, **kwargs) -> Tuple[bool, str]:
         # If no setting exists, assume not required
@@ -122,10 +118,8 @@ class ToolRegistry:
         # Copy any customization settings that might exist so we can send them to the initializer
         settings = tools_conf["tools_settings"]
         settings = {
-            item["name"]: {
-                key: value
-                for key, value in item.items() if key != "name"
-            } for item in settings
+            item["name"]: {key: value for key, value in item.items() if key != "name"}
+            for item in settings
         }
 
         # Go through the tools folder looking for implementations of the Tool interface
@@ -169,10 +163,7 @@ class ToolRegistry:
                         and any(base.__name__ == "Tool" for base in obj.__bases__)
                     ):
                         self.tools[name] = {
-                            "class": obj(
-                                _context=self.context,
-                                **tool_settings
-                            )
+                            "class": obj(_context=self.context, **tool_settings)
                         }
                         print(f"Loaded tool '{name}'")
 

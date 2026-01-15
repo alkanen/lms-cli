@@ -103,9 +103,7 @@ class read_file(Tool):
         if len(file_path) < 60:
             question = f"Allow agent to read file '{file_path}'{lines}?"
         else:
-            question = (
-                f"Allow agent to read file '{file_path[:26]}...{file_path[-26:]}'{lines}?"
-            )
+            question = f"Allow agent to read file '{file_path[:26]}...{file_path[-26:]}'{lines}?"
 
         option, reason = self.registry.request_permission(question, options)
 

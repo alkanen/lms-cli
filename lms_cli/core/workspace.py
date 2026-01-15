@@ -18,7 +18,11 @@ class Workspace:
         files = []
 
         for ext in (
-            ["*"] if not extension else [f"*.{extension}"]
+            ["*"]
+            if not extension
+            else [
+                f"*.{extension}" if not extension.startswith(".") else f"*{extension}"
+            ]
         ):
             for folder in included_folders:
                 files.extend((self.root_path / folder).rglob(ext))
@@ -70,7 +74,7 @@ class Workspace:
         relative path string.  Assumes that file_path is within the workspace or results are
         undefined and may cause exceptions."""
         file_path = str(Path(file_path).resolve())
-        return "." + file_path[len(str(self.root_path)):]
+        return "." + file_path[len(str(self.root_path)) :]
 
     def read_file(self, file_path: Path) -> str:
         """Read content of a file"""
@@ -95,12 +99,19 @@ class Workspace:
 
         return f"Success: A total of {size} bytes written to '{file_path}'"
 
-    def read_file(self, file_path: Path, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    def read_file(
+        self,
+        file_path: Path,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> str:
         """Read content from a file"""
         full_path = (self.root_path / file_path).resolve()
 
         if not str(full_path).startswith(str(self.root_path)):
-            return "Error: Trying to write from files outside of workspace not supported"
+            return (
+                "Error: Trying to write from files outside of workspace not supported"
+            )
 
         if not full_path.exists():
             return f"Error: File '{file_path}' does not exist in workspace"
@@ -110,7 +121,7 @@ class Workspace:
         if start_line is None:
             start_line = 0
         else:
-            start_line = max(0, start_line-1)
+            start_line = max(0, start_line - 1)
 
         if end_line is None:
             end_line = len(content_lines)
@@ -133,4 +144,4 @@ class Workspace:
         root_string = str(self.root_path)
 
         if file_string.startswith(root_string):
-            return "." + file_string[len(root_string):]
+            return "." + file_string[len(root_string) :]

@@ -16,7 +16,7 @@ class write_file(Tool):
             _context=_context,
             permission_required=permission_required,
             name="write_file",
-            description="Write contents to a file in the workspace",
+            description="Write contents to a file in the workspace, supports appending",
         )
         self.allowed_files: Set[str] = set()
         self.allowed_folders: Set[str] = set()
@@ -40,6 +40,11 @@ class write_file(Tool):
                             "required": True,
                             "description": "The content to write to the file",
                         },
+                        "append": {
+                            "type": "boolean",
+                            "required": False,
+                            "description": "True to append, False to overwrite file",
+                        },
                     },
                 },
             },
@@ -49,14 +54,15 @@ class write_file(Tool):
         self,
         file_path: str,
         content: str,
+        append: bool = False,
     ) -> Tuple[bool, str]:
+        if self.always_allow:
+            return True, ""
+
         if file_path in self.allowed_files:
             return True, ""
 
         if self._in_allowed_folders(file_path):
-            return True, ""
-
-        if self.always_allow:
             return True, ""
 
         stripped_path = self.workspace.strip_root_path(file_path)
@@ -73,12 +79,22 @@ class write_file(Tool):
         )
         options.append(f"Allows allow on '{progressive_paths[-1]}'")
 
-        if len(file_path) < 60:
-            question = f"Allow agent to write to file '{file_path}'?"
+        if Path(file_path).exists():
+            if append:
+                if len(file_path) < 60:
+                    question = f"Allow agent to append to file '{file_path}'?"
+                else:
+                    question = f"Allow agent to append to file '{file_path[:26]}...{file_path[-26:]}'?"
+            else:
+                if len(file_path) < 60:
+                    question = f"Allow agent to overwrite file '{file_path}'?"
+                else:
+                    question = f"Allow agent to overwrite file '{file_path[:26]}...{file_path[-26:]}'?"
         else:
-            question = (
-                f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
-            )
+            if len(file_path) < 60:
+                question = f"Allow agent to write to file '{file_path}'?"
+            else:
+                question = f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
 
         option, reason = self.registry.request_permission(question, options)
 
@@ -107,7 +123,8 @@ class write_file(Tool):
     def execute(
         self,
         file_path: str,
-        content: str
+        content: str,
+        append: bool = False,
     ) -> str:
         try:
             return self.workspace.write_file(file_path, content)
