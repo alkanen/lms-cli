@@ -1,5 +1,6 @@
-numpy
 click
+enquiries
+numpy
 pyyaml
 requests
-slugify
+python-slugify
