@@ -100,9 +100,7 @@ class Workspace:
         full_path = (self.root_path / file_path).resolve()
 
         if not str(full_path).startswith(str(self.root_path)):
-            return (
-                "Error: Trying to read from files outside of workspace not supported"
-            )
+            return "Error: Trying to read from files outside of workspace not supported"
 
         if not full_path.exists():
             return f"Error: File '{file_path}' does not exist in workspace"
