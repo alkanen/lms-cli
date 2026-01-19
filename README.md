@@ -38,7 +38,7 @@ pip install -r requirements.txt
 Copy and edit the configuration file:
 
 ```bash
-cp config/config.yaml config/config.yaml
+cp config/config.yaml.example config/config.yaml
 ```
 
 ### config/config.yaml
