@@ -430,5 +430,46 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
         #     print(f"Cli::shell(): Error: {e}")
 
 
+@cli.command("rich")
+@click.option(
+    "--resume",
+    "resume",
+    flag_value=True,
+    default=False,
+    help="Resume a previous session",
+)
+@click.option(
+    "--prompt",
+    help="Immediate prompt, either a string to send or '@file'",
+    default=None,
+)
+@click.option(
+    "--config", help="Optional configuration file", default="config/config.yaml"
+)
+@click.option(
+    "--workspace",
+    "workspace_root",
+    help="Path to workspace folder",
+    default=".",
+)
+def rich_shell(config: str, workspace_root: str, prompt: str, resume: bool):
+    """Interactive shell mode with Rich UI.
+
+    Provides a visually enhanced terminal interface with:
+    - Styled message panels
+    - Token usage progress bar
+    - Syntax-highlighted code previews
+    - Streaming response display
+    """
+    from lms_cli.cli.rich_interface import run_rich_shell
+
+    run_rich_shell(
+        config=config,
+        workspace_root=workspace_root,
+        prompt=prompt,
+        resume=resume,
+    )
+
+
 if __name__ == "__main__":
     cli()
