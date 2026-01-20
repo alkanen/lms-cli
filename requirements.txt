@@ -4,3 +4,4 @@ numpy
 pyyaml
 requests
 python-slugify
+rich
