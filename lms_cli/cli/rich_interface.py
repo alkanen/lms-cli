@@ -61,8 +61,17 @@ class RichUI:
             percentage = self.tokens_used / self.max_tokens
             bar_width = 30
             filled = int(percentage * bar_width)
-            bar = "[green]" + "\u2588" * filled + "[/green][dim]" + "\u2591" * (bar_width - filled) + "[/dim]"
-            token_display = f"Tokens: {self.tokens_used:,} / {self.max_tokens:,} {bar} {percentage:.0%}"
+            bar = (
+                "[green]"
+                + "\u2588" * filled
+                + "[/green][dim]"
+                + "\u2591" * (bar_width - filled)
+                + "[/dim]"
+            )
+            token_display = (
+                f"Tokens: {self.tokens_used:,} / {self.max_tokens:,} "
+                f"{bar} {percentage:.0%}"
+            )
         else:
             token_display = f"Tokens: {self.tokens_used:,}"
 
@@ -79,7 +88,10 @@ class RichUI:
         table.add_row(
             "",
             token_display,
-            f"[dim]Prompt:[/dim] {self.prompt_tokens:,} [dim]Completion:[/dim] {self.completion_tokens:,}",
+            (
+                f"[dim]Prompt:[/dim] {self.prompt_tokens:,} "
+                f"[dim]Completion:[/dim] {self.completion_tokens:,}"
+            ),
         )
 
         return Panel(table, style="dim", padding=(0, 1))
@@ -91,14 +103,16 @@ class RichUI:
         self.tokens_used = usage.get("total_tokens", 0)
 
     @staticmethod
-    def render_user_message(content: str, attachments: Optional[List[str]] = None) -> Panel:
+    def render_user_message(
+        content: str, attachments: Optional[List[str]] = None
+    ) -> Panel:
         """Render a user message panel."""
         body_parts = [content]
 
         if attachments:
             body_parts.append("")
             for attachment in attachments:
-                body_parts.append(f"[cyan]\U0001F4CE Attached: {attachment}[/cyan]")
+                body_parts.append(f"[cyan]\U0001f4ce Attached: {attachment}[/cyan]")
 
         return Panel(
             "\n".join(body_parts),
@@ -158,7 +172,9 @@ class RichUI:
             else:
                 params_table.add_row(f"{key}:", str(value))
 
-        elements.append(Panel(params_table, title="[dim]Parameters[/dim]", border_style="dim"))
+        elements.append(
+            Panel(params_table, title="[dim]Parameters[/dim]", border_style="dim")
+        )
 
         # Add syntax-highlighted preview for file operations
         if preview_content:
@@ -169,7 +185,9 @@ class RichUI:
 
             preview_text = "\n".join(preview_lines)
             if truncated:
-                preview_text += f"\n[dim]\u22ee ... ({len(preview_lines) - 12} more lines)[/dim]"
+                preview_text += (
+                    f"\n[dim]\u22ee ... ({len(preview_lines) - 12} more lines)[/dim]"
+                )
 
             # Detect language from file extension
             lexer = "text"
@@ -201,7 +219,9 @@ class RichUI:
                     theme="monokai",
                     word_wrap=True,
                 )
-                elements.append(Panel(syntax, title="[dim]Preview[/dim]", border_style="dim"))
+                elements.append(
+                    Panel(syntax, title="[dim]Preview[/dim]", border_style="dim")
+                )
             else:
                 elements.append(
                     Panel(
@@ -244,7 +264,9 @@ class RichUI:
         )
 
     @staticmethod
-    def render_error(title: str, message: str, suggestion: Optional[str] = None) -> Panel:
+    def render_error(
+        title: str, message: str, suggestion: Optional[str] = None
+    ) -> Panel:
         """Render an error panel."""
         body = f"[red]{message}[/red]"
         if suggestion:
@@ -312,9 +334,7 @@ class RichUI:
         return Panel(help_text, title="[bold]Help[/bold]", border_style="cyan")
 
 
-def permission_request_rich(
-    question: str, options: List[str]
-) -> Tuple[int, str]:
+def permission_request_rich(question: str, options: List[str]) -> Tuple[int, str]:
     """
     Rich-based permission request dialog.
 
@@ -348,7 +368,9 @@ def permission_request_rich(
     console.print()
 
     # Get input
-    valid_choices = ["y", "a", "n", "s", "f"] + [str(i + 1) for i in range(len(options))]
+    valid_choices = ["y", "a", "n", "s", "f"] + [
+        str(i + 1) for i in range(len(options))
+    ]
     choice = Prompt.ask(
         "[bold]Choice[/bold]",
         choices=valid_choices,
@@ -427,7 +449,10 @@ def run_rich_shell(
                 session_index = int(choice) - 1
                 if sh := SessionHandler.restore_session(sessions[session_index]):
                     messages = sh.load_recent_history()
-                    console.print(f"[green]\u2713 Restored session with {len(messages)} messages[/green]")
+                    console.print(
+                        f"[green]\u2713 Restored session with {len(messages)} "
+                        "messages[/green]"
+                    )
 
     # Create new session if not resuming or resume failed
     if not messages:
@@ -536,10 +561,12 @@ def run_rich_shell(
                     attachments = file_refs
 
             # Display user message
-            console.print(RichUI.render_user_message(
-                user_input if not is_compaction_request else "/compact",
-                attachments if attachments else None
-            ))
+            console.print(
+                RichUI.render_user_message(
+                    user_input if not is_compaction_request else "/compact",
+                    attachments if attachments else None,
+                )
+            )
 
             # Add to messages
             messages.append({"role": "user", "content": content})
@@ -568,10 +595,15 @@ def run_rich_shell(
                 refresh_per_second=10,
                 transient=True,
             ) as live:
+
                 def live_chunk(chunk: str):
                     nonlocal response_content
                     response_content += chunk
-                    live.update(RichUI.render_assistant_message(response_content, streaming=True))
+                    live.update(
+                        RichUI.render_assistant_message(
+                            response_content, streaming=True
+                        )
+                    )
 
                 result = context.lm_studio_client.chat_completion(
                     messages,
@@ -583,17 +615,25 @@ def run_rich_shell(
 
             # Display final assistant message
             if result["content"]:
-                console.print(RichUI.render_assistant_message(result["content"], streaming=False))
+                console.print(
+                    RichUI.render_assistant_message(result["content"], streaming=False)
+                )
 
             # Update status bar with new token count
             console.print(ui.render_status_bar())
 
             # Add assistant message to history
-            messages.append({
-                "role": "assistant",
-                "content": result["content"],
-                **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": result["content"],
+                    **(
+                        {"tool_calls": result["tool_calls"]}
+                        if result["tool_calls"]
+                        else {}
+                    ),
+                }
+            )
             context.session_handler.save_message(messages[-1])
 
             # Handle compaction
@@ -627,12 +667,14 @@ def run_rich_shell(
                         file_path = tool_args.get("file_path", "")
 
                     # Display tool request
-                    console.print(RichUI.render_tool_request(
-                        tool_name,
-                        tool_args,
-                        preview_content=preview_content,
-                        file_path=file_path,
-                    ))
+                    console.print(
+                        RichUI.render_tool_request(
+                            tool_name,
+                            tool_args,
+                            preview_content=preview_content,
+                            file_path=file_path,
+                        )
+                    )
 
                     try:
                         # Execute tool
@@ -641,32 +683,48 @@ def run_rich_shell(
                         )
 
                         # Display success
-                        result_str = json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result
-                        console.print(RichUI.render_tool_result(
-                            tool_name,
-                            success=True,
-                            message=result_str[:200] + "..." if len(result_str) > 200 else result_str,
-                        ))
+                        result_str = (
+                            json.dumps(tool_result)
+                            if not isinstance(tool_result, str)
+                            else tool_result
+                        )
+                        console.print(
+                            RichUI.render_tool_result(
+                                tool_name,
+                                success=True,
+                                message=(
+                                    result_str[:200] + "..."
+                                    if len(result_str) > 200
+                                    else result_str
+                                ),
+                            )
+                        )
 
-                        tool_responses.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": json.dumps(tool_result),
-                        })
+                        tool_responses.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": json.dumps(tool_result),
+                            }
+                        )
 
                     except Exception as e:
                         error_msg = str(e)
-                        console.print(RichUI.render_tool_result(
-                            tool_name,
-                            success=False,
-                            message=error_msg,
-                        ))
+                        console.print(
+                            RichUI.render_tool_result(
+                                tool_name,
+                                success=False,
+                                message=error_msg,
+                            )
+                        )
 
-                        tool_responses.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": f"Error: {error_msg}",
-                        })
+                        tool_responses.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
 
                     # Save tool response
                     context.session_handler.save_message(tool_responses[-1])
@@ -683,10 +741,15 @@ def run_rich_shell(
                     refresh_per_second=10,
                     transient=True,
                 ) as live:
+
                     def live_chunk_continued(chunk: str):
                         nonlocal response_content
                         response_content += chunk
-                        live.update(RichUI.render_assistant_message(response_content, streaming=True))
+                        live.update(
+                            RichUI.render_assistant_message(
+                                response_content, streaming=True
+                            )
+                        )
 
                     result = context.lm_studio_client.chat_completion(
                         messages,
@@ -698,17 +761,27 @@ def run_rich_shell(
 
                 # Display final response
                 if result["content"]:
-                    console.print(RichUI.render_assistant_message(result["content"], streaming=False))
+                    console.print(
+                        RichUI.render_assistant_message(
+                            result["content"], streaming=False
+                        )
+                    )
 
                 # Update status bar
                 console.print(ui.render_status_bar())
 
                 # Add to messages
-                messages.append({
-                    "role": "assistant",
-                    "content": result["content"],
-                    **({"tool_calls": result["tool_calls"]} if result["tool_calls"] else {}),
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": result["content"],
+                        **(
+                            {"tool_calls": result["tool_calls"]}
+                            if result["tool_calls"]
+                            else {}
+                        ),
+                    }
+                )
                 context.session_handler.save_message(messages[-1])
 
                 # Check for more tool calls
@@ -718,8 +791,10 @@ def run_rich_shell(
             console.print("\n[dim]Interrupted. Type 'exit' to quit.[/dim]")
             continue
         except Exception as e:
-            console.print(RichUI.render_error(
-                "Error",
-                str(e),
-                suggestion="Check your configuration and try again.",
-            ))
+            console.print(
+                RichUI.render_error(
+                    "Error",
+                    str(e),
+                    suggestion="Check your configuration and try again.",
+                )
+            )

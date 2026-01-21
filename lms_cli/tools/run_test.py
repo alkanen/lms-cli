@@ -1,4 +1,3 @@
-from pathlib import Path
 import subprocess
 import sys
 
@@ -20,7 +19,8 @@ def run_test(_context: dict, test_path: str) -> str:
     # Helper function
     def run_pytest_test(python_executable_path: str, test_file_path: str) -> str:
         """
-        Run a pytest test file using the specified pytest executable and capture the output.
+        Run a pytest test file using the specified pytest executable and capture the
+        output from both stdout and stderr.
 
         Args:
             python_executable_path (str): Path to the python executable.

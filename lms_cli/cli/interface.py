@@ -6,18 +6,14 @@ import enquiries
 import json
 
 from lms_cli.core.context import CLIContext
-from lms_cli.core.embedding_manager import EmbeddingManager
 from lms_cli.core.file_reference_parser import FileReferenceParser
-from lms_cli.core.lm_studio_client import LMStudioClient
 from lms_cli.core.session_handler import SessionHandler
-from lms_cli.core.tool_registry import ToolRegistry
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
     TOOL_PERMISSION_ALWAYS,
     TOOL_PERMISSION_NO,
     TOOL_PERMISSION_USER_SUGGESTION,
 )
-from lms_cli.core.workspace import Workspace
 
 
 class Choice:
@@ -208,7 +204,7 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
     context = CLIContext(
         config_path=config,
         workspace_root=workspace_root,
-        permission_callback=permission_request
+        permission_callback=permission_request,
     )
     context.tool_registry.load_tools()
     max_tokens = context.config["lm_studio"].get("max_tokens", 4096)
@@ -310,7 +306,6 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
 
             def output_usage(usage: dict):
                 # Don't write any usage data if we haven't gotten a proper reply
-                nonlocal first_chunk
                 if first_chunk:
                     trigger = "[Tool call]"
                 else:
@@ -379,7 +374,9 @@ def shell(config: str, workspace_root: str, prompt: str, resume):
                         )
                     except Exception as e:
                         print(
-                            f"Tool call `{tc['function']['name']}({tc['function']['arguments']}) failed: {str(e)}"
+                            f"Tool call `{tc['function']['name']}"
+                            f"({tc['function']['arguments']}) "
+                            f"failed: {str(e)}"
                         )
                         tool_responses.append(
                             {

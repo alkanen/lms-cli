@@ -29,7 +29,7 @@ class EmbeddingManager:
         self.exclusion_paths = set(self.config["embeddings"]["exclude_paths"])
         self.index = {}
 
-    def initialize_index(self):
+    def initialize_index(self) -> None:
         """Initialize or load naïve index"""
         self.index = {}
 
@@ -47,7 +47,7 @@ class EmbeddingManager:
 
             print(f"Loaded existing index from '{self.index_path}'")
 
-    def delete_with_metadata_key_value(self, metadata: Dict):
+    def delete_with_metadata_key_value(self, metadata: Dict[str, str]) -> None:
         """Delete item from index where all the keys in metadata match the indexed
         metadata.  Keys not in argument will not be compared."""
 
@@ -72,7 +72,9 @@ class EmbeddingManager:
         for filename in to_delete:
             del self.index[filename]
 
-    def add_embeddings(self, embeddings: List[List[float]], metadata: List[Dict]):
+    def add_embeddings(
+        self, embeddings: List[List[float]], metadata: List[Dict[str, str]]
+    ) -> None:
         """Add embeddings to the index"""
         # If file already exists in database, check if it has changed since last time
 

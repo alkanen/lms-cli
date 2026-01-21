@@ -3,10 +3,9 @@ import importlib
 import inspect
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import json
-import yaml
 
 
 # Default permission request response values. If extra options are provided and
@@ -20,7 +19,7 @@ TOOL_PERMISSION_USER_SUGGESTION = -4
 class Tool:
     def __init__(
         self,
-        context: "CLIContext",
+        context: "CLIContext",  # noqa: F821
         name: str,
         description: Optional[str] = None,
         permission_required: bool = False,
@@ -47,10 +46,7 @@ class Tool:
 
 
 class ToolRegistry:
-    def __init__(
-        self,
-        context: "CLIContext"
-    ):
+    def __init__(self, context: "CLIContext"):  # noqa: F821
         self.context = context
         self.tools = {}
         self.request_permission = context.permission_callback
@@ -58,9 +54,9 @@ class ToolRegistry:
     def register_tool(
         self, name: str, tool: Tool, description: str, parameters: List[Dict]
     ):
-        """Register a tool with the registry"""
+        """Register a custom-made tool with the registry"""
         self.tools[name] = {
-            "object": func,
+            "class": tool,
             "description": description,
             "parameters": parameters,
         }
@@ -100,7 +96,8 @@ class ToolRegistry:
             print("No tools loaded")
             return
 
-        # Copy any customization settings that might exist so we can send them to the initializer
+        # Copy any customization settings that might exist so we can send them
+        # to the initializer
         settings = tools_conf["tools_settings"]
         settings = {
             item["name"]: {key: value for key, value in item.items() if key != "name"}

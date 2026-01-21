@@ -35,7 +35,7 @@ class CLIContext:
         workspace_root: str = ".",
         model: str | None = None,
         base_url: str | None = None,
-        permission_callback: Callable[[str, List[str]], Tuple[int, str]] | None = None
+        permission_callback: Callable[[str, List[str]], Tuple[int, str]] | None = None,
     ):
         """
         Initialize the CLI context.

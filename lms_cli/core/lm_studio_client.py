@@ -99,8 +99,6 @@ class LMStudioClient:
         """Process streaming tool call chunks into complete tool calls"""
         tool_calls = defaultdict(dict)
         tool_type = "<unknown>"
-        tool_name = "<unknown>"
-        # tool_id = "-1"
 
         for chunks in tool_chunks:
             for chunk in chunks:
@@ -113,7 +111,6 @@ class LMStudioClient:
                     tool_calls[index]["id"] = chunk["id"]
                 except KeyError:
                     pass
-                tool_id = tool_calls[index]["id"]
 
                 try:
                     tool_calls[index]["type"] = chunk["type"]
@@ -127,7 +124,7 @@ class LMStudioClient:
                     del tool_calls[index]
                     break
 
-                if not tool_type in tool_calls[index]:
+                if tool_type not in tool_calls[index]:
                     tool_calls[index][tool_type] = {
                         "name": "<unknown>",
                         "arguments": "",
@@ -137,7 +134,6 @@ class LMStudioClient:
                     tool_calls[index][tool_type]["name"] = chunk[tool_type]["name"]
                 except KeyError:
                     pass
-                tool_name = tool_calls[index][tool_type]["name"]
 
                 # Append the arguments chunk
                 tool_calls[index][tool_type]["arguments"] += chunk[tool_type].get(

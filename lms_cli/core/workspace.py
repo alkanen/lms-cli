@@ -70,9 +70,9 @@ class Workspace:
         return True
 
     def strip_root_path(self, file_path: str | Path) -> str:
-        """Removes the root directory of the workspace from the provided path and returns the
-        relative path string.  Assumes that file_path is within the workspace or results are
-        undefined and may cause exceptions."""
+        """Removes the root directory of the workspace from the provided path and
+        returns the relative path string.  Assumes that file_path is within the
+        workspace or results are undefined and may cause exceptions."""
         file_path = str(Path(file_path).resolve())
         return "." + file_path[len(str(self.root_path)) :]
 

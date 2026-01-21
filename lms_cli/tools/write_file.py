@@ -1,8 +1,8 @@
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Set, Tuple
 
 from lms_cli.core.context import CLIContext
-from lms_cli.core.tool_registry import Tool, ToolRegistry
+from lms_cli.core.tool_registry import Tool
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
     TOOL_PERMISSION_ALWAYS,
@@ -21,7 +21,9 @@ class write_file(Tool):
             context=context,
             permission_required=permission_required,
             name="write_file",
-            description="Write contents to a file in the workspace, can append or overwrite",
+            description=(
+                "Write contents to a file in the workspace, can append or overwrite"
+            ),
         )
         self.allowed_files: Set[str] = set()
         self.allowed_folders: Set[str] = set()
@@ -67,7 +69,11 @@ class write_file(Tool):
         if self._in_allowed_folders(file_path):
             return True, ""
 
-        if not Path(file_path).resolve().is_relative_to(self.context.workspace.root_path):
+        if (
+            not Path(file_path)
+            .resolve()
+            .is_relative_to(self.context.workspace.root_path)
+        ):
             return False, "Writing outside of the workspace is not allowed"
 
         if self.always_allow:
@@ -96,19 +102,30 @@ class write_file(Tool):
                 if len(file_path) < 60:
                     question = f"Allow agent to append to file '{file_path}'?"
                 else:
-                    question = f"Allow agent to append to file '{file_path[:26]}...{file_path[-26:]}'?"
+                    question = (
+                        "Allow agent to append to file "
+                        f"'{file_path[:26]}...{file_path[-26:]}'?"
+                    )
             else:
                 if len(file_path) < 60:
                     question = f"Allow agent to overwrite file '{file_path}'?"
                 else:
-                    question = f"Allow agent to overwrite file '{file_path[:26]}...{file_path[-26:]}'?"
+                    question = (
+                        "Allow agent to overwrite file "
+                        f"'{file_path[:26]}...{file_path[-26:]}'?"
+                    )
         else:
             if len(file_path) < 60:
                 question = f"Allow agent to write to file '{file_path}'?"
             else:
-                question = f"Allow agent to write to file '{file_path[:26]}...{file_path[-26:]}'?"
+                question = (
+                    "Allow agent to write to file "
+                    f"'{file_path[:26]}...{file_path[-26:]}'?"
+                )
 
-        option, reason = self.context.tool_registry.request_permission(question, options)
+        option, reason = self.context.tool_registry.request_permission(
+            question, options
+        )
 
         if option == TOOL_PERMISSION_ALWAYS:
             self.always_allow = True
