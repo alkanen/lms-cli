@@ -472,9 +472,25 @@ def run_rich_shell(
             # Handle immediate prompt or get user input
             if prompt:
                 if prompt.startswith("@"):
-                    with open(prompt[1:]) as f:
-                        content = f.read()
-                    attachments.append(prompt[1:])
+                    file_path = prompt[1:]
+                    try:
+                        with open(file_path, encoding="utf-8") as f:
+                            content = f.read()
+                    except (OSError, UnicodeError) as e:
+                        console.print(
+                            RichUI.render_error(
+                                "File error",
+                                f"Could not read file '{file_path}': {e}",
+                                suggestion=(
+                                    "Check that the file exists, is readable and is "
+                                    "valid UTF-8."
+                                ),
+                            )
+                        )
+                        prompt = None  # Clear after first use
+                        continue
+
+                    attachments.append(file_path)
                 else:
                     content = prompt
                 prompt = None  # Clear after first use
