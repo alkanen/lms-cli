@@ -1,4 +1,3 @@
-from typing import Optional
 import uuid
 
 from lms_cli.core.context import CLIContext
@@ -59,7 +58,7 @@ class generate_uuid(Tool):
         # If setting exists and is truthy, make a permission request
         option, reason = self.context.tool_registry.request_permission(
             f"Generate UUID from '{name}'?",
-            [f"Always allow UUID generation for '{name}'"]
+            [f"Always allow UUID generation for '{name}'"],
         )
 
         if option == TOOL_PERMISSION_ALWAYS:

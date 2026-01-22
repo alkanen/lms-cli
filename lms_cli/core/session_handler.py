@@ -175,7 +175,8 @@ class SessionHandler:
         List all available sessions in the session directory.
 
         Args:
-            sessions_dir: Optional custom directory for storing sessions. Defaults to SESSIONS_DIR.
+            sessions_dir: Optional custom directory for storing sessions. Defaults to
+                          SESSIONS_DIR.
 
         Returns:
             A list of session IDs (filenames without extension).
@@ -187,7 +188,8 @@ class SessionHandler:
         sessions = set()
         for file in session_dir.iterdir():
             if file.is_file() and file.suffix == ".jsonl":
-                # Extract the session ID from the filename (e.g., "session_id_complete.jsonl" -> "session_id")
+                # Extract the session ID from the filename (e.g.,
+                # "session_id_complete.jsonl" -> "session_id")
                 session_id = file.stem.rsplit("_", 1)[0]
                 sessions.add(session_id)
 
@@ -198,14 +200,17 @@ class SessionHandler:
         cls, session_id: str, sessions_dir: Optional[str] = None
     ) -> Optional["SessionHandler"]:
         """
-        Restore a session by loading its complete and recent histories into a new SessionHandler instance.
+        Restore a session by loading its complete and recent histories into a new
+        SessionHandler instance.
 
         Args:
             session_id: The ID of the session to restore.
-            sessions_dir: Optional custom directory for storing sessions. Defaults to SESSIONS_DIR.
+            sessions_dir: Optional custom directory for storing sessions. Defaults to
+                          SESSIONS_DIR.
 
         Returns:
-            A SessionHandler object with the restored history, or None if the session does not exist.
+            A SessionHandler object with the restored history, or None if the session
+            does not exist.
         """
         # Check if the session exists
         available_sessions = cls.list_available_sessions(sessions_dir)

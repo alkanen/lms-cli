@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional, Set, Tuple
 
 from lms_cli.core.context import CLIContext
-from lms_cli.core.tool_registry import Tool, ToolRegistry
+from lms_cli.core.tool_registry import Tool
 from lms_cli.core.tool_registry import (
     TOOL_PERMISSION_YES,
     TOOL_PERMISSION_ALWAYS,
@@ -108,9 +108,14 @@ class read_file(Tool):
         if len(file_path) < 60:
             question = f"Allow agent to read file '{file_path}'{lines}?"
         else:
-            question = f"Allow agent to read file '{file_path[:26]}...{file_path[-26:]}'{lines}?"
+            question = (
+                "Allow agent to read file "
+                f"'{file_path[:26]}...{file_path[-26:]}'{lines}?"
+            )
 
-        option, reason = self.context.tool_registry.request_permission(question, options)
+        option, reason = self.context.tool_registry.request_permission(
+            question, options
+        )
 
         if option == TOOL_PERMISSION_ALWAYS:
             self.always_allow = True
@@ -142,8 +147,8 @@ class read_file(Tool):
     ) -> str:
         try:
             return self.context.workspace.read_file(file_path, start_line, end_line)
-        except:
-            return f"Unable to read from file '{file_path}'"
+        except Exception as e:
+            return f"Unable to read from file '{file_path}': {e}"
 
     def _in_allowed_folders(self, file_path: str) -> bool:
         """Returns true if the file_path is within the working directory"""

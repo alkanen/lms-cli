@@ -1,14 +1,7 @@
-from pathlib import Path
 from typing import Optional, Set, Tuple
 
 from lms_cli.core.context import CLIContext
 from lms_cli.core.tool_registry import Tool
-from lms_cli.core.tool_registry import (
-    TOOL_PERMISSION_YES,
-    TOOL_PERMISSION_ALWAYS,
-    TOOL_PERMISSION_NO,
-    TOOL_PERMISSION_USER_SUGGESTION,
-)
 
 
 class file_search(Tool):
