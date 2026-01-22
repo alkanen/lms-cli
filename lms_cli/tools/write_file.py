@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Set, Tuple
+from typing import Set, Optional, Tuple
 
 from lms_cli.core.context import CLIContext
 from lms_cli.core.tool_registry import Tool
@@ -22,7 +22,8 @@ class write_file(Tool):
             permission_required=permission_required,
             name="write_file",
             description=(
-                "Write contents to a file in the workspace, can append or overwrite"
+                "Write contents to a file in the workspace, can replace part of file if "
+                "line numbers are provided, otherwise replaces all content"
             ),
         )
         self.allowed_files: Set[str] = set()
@@ -47,10 +48,21 @@ class write_file(Tool):
                             "required": True,
                             "description": "The content to write to the file",
                         },
-                        "append": {
-                            "type": "boolean",
+                        "start_line": {
+                            "type": "integer",
                             "required": False,
-                            "description": "True to append, False to overwrite file",
+                            "description": (
+                                "Optional first line to replace, counts from 1, "
+                                "defaults to 1"
+                            ),
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "required": False,
+                            "description": (
+                                "Optional last line to replace, counts from 1, "
+                                "defaults to last line of file"
+                            ),
                         },
                     },
                 },
@@ -61,7 +73,8 @@ class write_file(Tool):
         self,
         file_path: str,
         content: str,
-        append: bool = False,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
     ) -> Tuple[bool, str]:
         if file_path in self.allowed_files:
             return True, ""
@@ -95,33 +108,32 @@ class write_file(Tool):
         options.extend(
             [f"Always allow in '{folder}/'" for folder in progressive_paths[:-1]]
         )
-        options.append(f"Allows allow on '{progressive_paths[-1]}'")
+        options.append(f"Always allow on '{progressive_paths[-1]}'")
 
+        print_file_path = (
+            file_path if len(file_path) < 60
+            else f"{file_path[:26]}...{file_path[-26:]}"
+        )
         if Path(file_path).exists():
-            if append:
-                if len(file_path) < 60:
-                    question = f"Allow agent to append to file '{file_path}'?"
-                else:
-                    question = (
-                        "Allow agent to append to file "
-                        f"'{file_path[:26]}...{file_path[-26:]}'?"
-                    )
-            else:
-                if len(file_path) < 60:
-                    question = f"Allow agent to overwrite file '{file_path}'?"
-                else:
-                    question = (
-                        "Allow agent to overwrite file "
-                        f"'{file_path[:26]}...{file_path[-26:]}'?"
-                    )
-        else:
-            if len(file_path) < 60:
-                question = f"Allow agent to write to file '{file_path}'?"
+            if start_line is None and end_line is None:
+                question = f"Allow agent to overwrite file '{print_file_path}'?"
+            elif start_line and end_line is None:
+                question = (
+                    f"Allow agent to overwrite from line {start_line} "
+                    f"of file '{print_file_path}'?"
+                )
+            elif start_line is None and end_line:
+                question = (
+                    f"Allow agent to overwrite up to line {end_line} "
+                    f"of file '{print_file_path}'?"
+                )
             else:
                 question = (
-                    "Allow agent to write to file "
-                    f"'{file_path[:26]}...{file_path[-26:]}'?"
+                    f"Allow agent to modify lines {start_line}-{end_line} in file "
+                    f"'{print_file_path}'?"
                 )
+        else:
+            question = f"Allow agent to write to file '{print_file_path}'?"
 
         option, reason = self.context.tool_registry.request_permission(
             question, options
@@ -153,10 +165,13 @@ class write_file(Tool):
         self,
         file_path: str,
         content: str,
-        append: bool = False,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
     ) -> str:
         try:
-            return self.context.workspace.write_file(file_path, content, append)
+            return self.context.workspace.write_file(
+                file_path, content, start_line, end_line
+            )
         except Exception as e:
             return f"Unable to write to file '{file_path}': {e}"
 

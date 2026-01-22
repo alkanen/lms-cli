@@ -123,6 +123,10 @@ class ToolRegistry:
 
             module_name = filename[:-3]  # Remove extension
 
+            if script.stem not in settings:
+                print(f"Skipping tool {module_name}, not listed in tools_settings")
+                continue
+
             try:
                 # Import the module dynamically
                 spec = importlib.util.spec_from_file_location(module_name, script)
