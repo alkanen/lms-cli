@@ -65,6 +65,8 @@ agent:
       - Prefer dependency injection
       - Promote testability
       - Follow the code standard in the example files you are provided, if any
+    - File interactions:
+      - When writing to files, try to do small changes to exact lines intead of overwriting the entire file if possible
     - Focus on the last message in a request and merely use the earlier messages for context, not something to respond to
     - The current task is to implement an OpenAI API compatible AI CLI tool
 
