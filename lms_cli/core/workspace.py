@@ -100,13 +100,20 @@ class Workspace:
             existing_lines = []
 
         # Convert start_line and end_line to 0-based index
+        # -1 means "end of file" for both parameters
         if start_line is not None:
-            start_index = max(0, start_line - 1)
+            if start_line == -1:
+                start_index = len(existing_lines)  # Append at end of file
+            else:
+                start_index = max(0, start_line - 1)
         else:
             start_index = 0  # Overwrite everything
 
         if end_line is not None:
-            end_index = min(end_line, len(existing_lines))
+            if end_line == -1:
+                end_index = len(existing_lines)  # Nothing to preserve after
+            else:
+                end_index = min(end_line, len(existing_lines))
         else:
             end_index = len(existing_lines)  # Go to the end of the file
 
@@ -117,6 +124,7 @@ class Workspace:
 
         # Replace or insert content
         new_lines = existing_lines[:start_index] + content_lines
+        # Append the rest of the original content after end_index
         if end_index < len(existing_lines):
             new_lines.extend(existing_lines[end_index:])
 
@@ -137,7 +145,8 @@ class Workspace:
         file_path: Path,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
-    ) -> str:
+        chunk_lines: Optional[int] = None,
+    ) -> str | dict:
         """Read content from a file"""
         full_path = (self.root_path / file_path).resolve()
 
@@ -147,7 +156,9 @@ class Workspace:
         if not full_path.exists():
             return f"Error: File '{file_path}' does not exist in workspace"
 
-        content_lines = full_path.read_text().splitlines()
+        content_lines = full_path.read_text().splitlines(keepends=False)
+        if not content_lines:
+            return f"Error: File '{file_path}' is empty"
 
         if start_line is None:
             start_line = 0
@@ -159,11 +170,46 @@ class Workspace:
         else:
             end_line = min(end_line, len(content_lines))
 
-        return "\n".join(content_lines[start_line:end_line])
+        if start_line >= end_line:
+            return f"Error: start line must be less than end line"
+
+        if chunk_lines is None or chunk_lines < 1:
+            return {
+                "file_path": str(file_path),
+                "chunks": [
+                    {
+                        "line_start": start_line + 1,
+                        "line_end": end_line,
+                        "chunk": "\n".join(content_lines[start_line:end_line]) + "\n",
+                    },
+                ],
+            }
+        else:
+            chunks = []
+
+            for i in range(start_line, end_line, chunk_lines):
+                chunk_end = min(i + chunk_lines, end_line)
+                chunks.append(
+                    {
+                        "line_start": i + 1,
+                        "line_end": chunk_end,
+                        "chunk": "\n".join(content_lines[i:chunk_end]),
+                    }
+                )
+            # Add final newline only to the very last chunk
+            if chunks:
+                chunks[-1]["chunk"] += "\n"
+
+            return {"file_path": str(file_path), "chunks": chunks}
 
     def get_file_context(self, file_path: Path, max_lines: int = 50) -> str:
         """Get context around a specific line in a file"""
-        content = self.read_file(file_path)
+        chunks = self.read_file(file_path)
+        if isinstance(chunks, str):
+            raise ValueError(f"Failed to read file context: {chunks}")
+
+        content = chunks["chunks"][0]["chunk"]
+
         lines = content.split("\n")
 
         # Get last <max_lines> lines

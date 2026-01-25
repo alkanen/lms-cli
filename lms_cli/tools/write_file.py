@@ -22,8 +22,11 @@ class write_file(Tool):
             permission_required=permission_required,
             name="write_file",
             description=(
-                "Write contents to a file in the workspace, can replace part of file if "
-                "line numbers are provided, otherwise replaces all content"
+                "Write contents to a file in the workspace. Seeks to the line "
+                "indicated by start_line, inserts new contents at that line position "
+                "and then seeks to the line indicated by end_line and copies the "
+                "original file contents from that line until the end.  Use -1 to "
+                "indicate the end of the file."
             ),
         )
         self.allowed_files: Set[str] = set()
@@ -50,18 +53,16 @@ class write_file(Tool):
                         },
                         "start_line": {
                             "type": "integer",
-                            "required": False,
+                            "required": True,
                             "description": (
-                                "Optional first line to replace, counts from 1, "
-                                "defaults to 1"
+                                "Line number where to insert content, counts from 1. Use -1 for end of file"
                             ),
                         },
                         "end_line": {
                             "type": "integer",
-                            "required": False,
+                            "required": True,
                             "description": (
-                                "Optional last line to replace, counts from 1, "
-                                "defaults to last line of file"
+                                "Line number from where to continue with original content, counts from 1. Use -1 for end of file"
                             ),
                         },
                     },
@@ -111,7 +112,8 @@ class write_file(Tool):
         options.append(f"Always allow on '{progressive_paths[-1]}'")
 
         print_file_path = (
-            file_path if len(file_path) < 60
+            file_path
+            if len(file_path) < 60
             else f"{file_path[:26]}...{file_path[-26:]}"
         )
         if Path(file_path).exists():

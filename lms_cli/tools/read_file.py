@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
@@ -22,7 +23,10 @@ class read_file(Tool):
             context=context,
             permission_required=permission_required,
             name="read_file",
-            description="Read contents from a file in the workspace",
+            description=(
+                "Read contents from a file in the workspace. Returns structured JSON "
+                "with line numbers and chunked content, including trailing newline."
+            ),
         )
         self.allowed_files: Set[str] = set()
         self.allowed_folders: Set[str] = set()
@@ -146,9 +150,15 @@ class read_file(Tool):
         end_line: Optional[int] = None,
     ) -> str:
         try:
-            return self.context.workspace.read_file(file_path, start_line, end_line)
+            content = self.context.workspace.read_file(
+                file_path, start_line, end_line, chunk_lines=10
+            )
+            if isinstance(content, str):
+                return content
+            else:
+                return f"Success, file contents: {json.dumps(content)}"
         except Exception as e:
-            return f"Unable to read from file '{file_path}': {e}"
+            return f"Error: Unable to read from file '{file_path}': {e}"
 
     def _in_allowed_folders(self, file_path: str) -> bool:
         """Returns true if the file_path is within the working directory"""
