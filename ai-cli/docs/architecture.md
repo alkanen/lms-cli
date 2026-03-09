@@ -229,7 +229,7 @@ class LLMClient(ABC):
 
     @abstractmethod
     def get_model_metadata(self) -> dict:
-        """Returns at minimum: {'context_window': int, 'max_tokens': int}"""
+        """Returns at minimum: {'context_window': int, 'max_response_tokens': int}"""
 
     @abstractmethod
     def count_tokens(self, messages: list[dict]) -> int: ...
@@ -237,7 +237,7 @@ class LLMClient(ABC):
 
 class OpenAIClient(LLMClient):
     def __init__(self, config: dict): ...
-    # config provides: base_url, api_key, model, context_window, max_tokens
+    # config provides: base_url, api_key, model, context_window, max_response_tokens
 
 
 class LMStudioClient(LLMClient):

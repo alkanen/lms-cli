@@ -3,3 +3,4 @@ websockets
 rich
 pyyaml
 prompt_toolkit
+python-dotenv
