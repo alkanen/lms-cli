@@ -2,24 +2,31 @@
 
 ## Module Structure
 
+The package root is `ai-cli/ai_cli/`. The tree below shows the target layout;
+files not yet implemented are marked *(planned)*.
+
 ```
 ai-cli/
-├── core/
-│   ├── config_manager.py     # Layered YAML config loading
-│   ├── workspace.py          # Workspace root resolution, file ops, ignore rules
-│   ├── tool_registry.py      # Three-tier tool discovery, loading, settings
-│   ├── permission_manager.py # In-memory permission state
-│   ├── llm_client.py         # Abstract LLMClient + OpenAI/LMStudio implementations
-│   ├── mcp_manager.py        # MCP server connections, tool exposure
-│   └── session_manager.py    # Session create/resume/compact/persist
-├── tools/                    # Bundled tools (read_file, write_file, bash, etc.)
-├── cli/
-│   ├── repl.py               # Main REPL loop, input handling, slash commands
-│   ├── completer.py          # Tab completion + @ file picker
-│   └── display.py            # Rich output, summary/verbose modes
-└── utils/
-    ├── ignore_filter.py      # .gitignore-style pattern matching
-    └── logging_utils.py      # JSONL structured logging
+├── ai_cli/                       # Python package root
+│   ├── __main__.py               # Entry point (python -m ai_cli)
+│   ├── core/
+│   │   ├── config_manager.py     # Layered YAML config loading
+│   │   ├── workspace.py          # Workspace root resolution, file ops, ignore rules
+│   │   ├── permission_manager.py # In-memory permission state
+│   │   ├── tool_registry.py      # Three-tier tool discovery, loading, settings *(planned)*
+│   │   ├── llm_client.py         # Abstract LLMClient + OpenAI/LMStudio implementations *(planned)*
+│   │   ├── mcp_manager.py        # MCP server connections, tool exposure *(planned)*
+│   │   └── session_manager.py    # Session create/resume/compact/persist *(planned)*
+│   ├── tools/                    # Bundled tools *(planned)*
+│   │   └── tool_manager.py       # Context-saving tool gatekeeper *(planned)*
+│   ├── cli/                      # *(planned)*
+│   │   ├── repl.py               # Main REPL loop, input handling, slash commands *(planned)*
+│   │   ├── completer.py          # Tab completion + @ file picker *(planned)*
+│   │   └── display.py            # Rich output, summary/verbose modes *(planned)*
+│   └── utils/
+│       ├── ignore_filter.py      # .gitignore-style pattern matching
+│       └── logging_utils.py      # JSONL structured logging *(planned)*
+└── tests/
 ```
 
 ---
@@ -201,9 +208,99 @@ class ToolRegistry:
     def disable(self, name: str) -> None:
         """Disable tool and persist change to project config.yaml."""
 
+    def enable_session(self, name: str) -> None:
+        """Enable tool for this session only — no config write."""
+
+    def disable_session(self, name: str) -> None:
+        """Disable tool for this session only — no config write."""
+
+    def enable_transient(self, name: str) -> dict | None:
+        """
+        Return the named tool's OpenAI-format schema for one-call injection
+        without changing its enabled state.  Returns None if unknown.
+        Used by tool_manager to inject a tool into a single API call only.
+        """
+
     def set_permission_required(self, name: str, value: bool) -> None:
         """Toggle permission_required and persist to project config.yaml."""
 ```
+
+---
+
+### ToolManager (bundled tool)
+
+`tool_manager` is a bundled `Tool` subclass that acts as a gatekeeper for the
+active tool list, keeping the LLM's context lean.
+
+**Startup behaviour**: `ToolRegistry` respects each tool's own declared defaults
+(and any config overrides), as documented in `project_plan.md`. In the bundled
+distribution, most tools declare themselves disabled by default so that only
+`tool_manager` and a small set (e.g. `read_file`) are enabled at launch. This is
+a convention of the provided tools, not a separate "globally disabled unless
+whitelisted" rule enforced by `ToolRegistry.load()`.
+
+**LLM-facing schema** (two actions):
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "tool_manager",
+    "description": "Lists available tools and enables one or more on demand for the next API call.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "enable"],
+          "description": "'list' returns all available tools with one-line descriptions; 'enable' injects one or more tool schemas into the next API call."
+        },
+        "tool_names": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Names of the tools to enable when action is 'enable'. Multiple tools can be requested at once."
+        }
+      },
+      "required": ["action"]
+    }
+  }
+}
+```
+
+`tool_names` is required when `action="enable"`. This is enforced at runtime in
+`tool_manager.execute()` rather than in the JSON schema, because `oneOf` is not
+reliably supported across OpenAI-compatible backends.
+
+**`list` response** (`data` field): array of `{name, description, enabled}` objects
+— enough for the LLM to choose what to enable without the full schemas.
+
+**`enable` response**: calls `ToolRegistry.enable_transient(tool_name)` once per
+entry in `tool_names` and aggregates the returned schemas into the result `data`
+(e.g. `{"inject_tools": [<schema>, ...]}`). Unknown tool names (where
+`enable_transient` returns `None`) are silently skipped for injection and reported
+back in a `warnings.unknown_tools` list so the LLM can correct its request
+(e.g. `{"inject_tools": [...], "warnings": {"unknown_tools": ["bad_name"]}}`).
+The REPL detects the `inject_tools` key and appends all returned schemas to the
+*immediately following* LLM API call only. No state change is made — the tools are
+not added to the enabled list. If any requested tool is already in the enabled set,
+the REPL deduplicates tool schemas before constructing the `tools` parameter so the
+same definition is never sent twice.
+
+**Three enable modes** (in increasing permanence):
+
+| Mode | How | Scope |
+|---|---|---|
+| Transient | `tool_manager` enable | One API call only, no state change |
+| Session | `/tools enable <name> --session` | Current session, reset on exit/resume |
+| Persistent | `/tools enable <name>` | Written to `.ai-cli/config.yaml`, survives sessions |
+
+**Precedence when modes conflict** — higher-precedence modes always win:
+`transient > session > persistent`. Examples:
+- A tool disabled in `.ai-cli/config.yaml` but session-enabled via `--session` is treated as enabled for that session.
+- A tool already session-enabled that is also transiently requested is included once (deduplicated by the REPL).
+
+The LLM never needs to disable tools it requested transiently — the REPL enforces
+the single-call scope automatically.
 
 ---
 
@@ -350,6 +447,12 @@ class REPL:
         """
         Append user message, stream response, detect tool calls,
         execute via tool_registry, feed results back, continue streaming.
+
+        Special case — transient tool injection: when a tool_manager result
+        contains an ``inject_tools`` key, the schemas listed there are appended
+        to the tools parameter of the *immediately following* API call only.
+        Schemas are deduplicated against the already-enabled set before sending
+        so the same definition is never passed twice.
         """
 
     def _check_compaction(self) -> None:
