@@ -36,7 +36,7 @@ _INIT_TEMPLATES: dict[str, str] = {
         # base_url: https://api.openai.com/v1
         # api_key_env: OPENAI_API_KEY   # name of the env-var holding the key
         # context_window: 128000
-        # max_tokens: 4096
+        # max_response_tokens: 4096
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).

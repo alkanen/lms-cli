@@ -140,7 +140,7 @@ This document outlines the technical requirements for the AI CLI tool project. I
   - Example:
     ```json
     {
-      "max_tokens": 60000,
+      "max_response_tokens": 60000,
       "context_window": 60000
     }
     ```
