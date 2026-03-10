@@ -1,0 +1,161 @@
+"""
+Tool base class.
+
+Every bundled, user, and project tool must subclass ``Tool`` and implement
+``definition()`` and ``execute()``.  The base class handles permission
+checking via the injected ``PermissionManager`` and provides sensible
+defaults for the optional hook methods.
+
+Canonical tool result shapes (returned by ``execute()``):
+
+  Success:  {"status": "success", "data": {...}}
+  Error:    {"status": "error", "error": "<code>", "message": "<text>",
+             "code": <int>, "details": {...}}  # "details" is optional
+
+Helper methods ``_ok`` and ``_err`` produce these shapes so subclasses
+don't have to construct them by hand.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ai_cli.core.permission_manager import PermissionManager
+    from ai_cli.core.workspace import Workspace
+
+
+class Tool(ABC):
+    """
+    Abstract base class for all ai-cli tools.
+
+    Parameters
+    ----------
+    workspace:
+        The active project workspace.  Tools use this for all file I/O so
+        that path-escape and ignore-rule enforcement are applied centrally.
+    permission_manager:
+        The session-scoped permission manager.  ``request_permission()``
+        delegates to it; subclasses should not call it directly.
+    permission_required:
+        Whether this tool must ask the user before executing.  This is the
+        tool's own declared default and may be overridden via project
+        configuration.
+    name:
+        Canonical tool name used in schemas, config, and slash commands.
+    description:
+        One-line human-readable description shown by ``/tools list`` and
+        the ``tool_manager`` list action.
+    """
+
+    def __init__(
+        self,
+        workspace: Workspace,
+        permission_manager: PermissionManager,
+        permission_required: bool,
+        name: str,
+        description: str,
+    ) -> None:
+        self._workspace = workspace
+        self._permission_manager = permission_manager
+        self.permission_required = permission_required
+        self.name = name
+        self.description = description
+
+    # ------------------------------------------------------------------
+    # Methods subclasses MUST implement
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def definition(self) -> dict:
+        """
+        Return the OpenAI function-calling schema for this tool.
+
+        The returned dict must follow the ``{"type": "function", "function":
+        {...}}`` wrapper format documented in docs/technical_requirements.md.
+        """
+
+    @abstractmethod
+    def execute(self, **kwargs: Any) -> dict:
+        """
+        Run the tool and return a canonical result dict.
+
+        Subclasses should use ``_ok()`` and ``_err()`` to build the return
+        value rather than constructing the dict manually.
+        """
+
+    # ------------------------------------------------------------------
+    # Methods subclasses MAY override
+    # ------------------------------------------------------------------
+
+    def extra_permission_options(self, **kwargs: Any) -> list[str]:
+        """
+        Return tool-specific permission options to present alongside the
+        four universal ones (yes / no / always / custom).
+
+        Example: ``["always_in_this_folder"]``
+
+        The default implementation returns an empty list.
+        """
+        return []
+
+    # ------------------------------------------------------------------
+    # Permission helper (not normally overridden)
+    # ------------------------------------------------------------------
+
+    def request_permission(self, action: str, **kwargs: Any) -> tuple[bool, str]:
+        """
+        Ask the user for permission to perform *action*.
+
+        If ``permission_required`` is False the call is a no-op and
+        ``(True, "")`` is returned immediately.
+
+        Parameters
+        ----------
+        action:
+            Human-readable description of the specific action being
+            requested (e.g. ``"Read /etc/hosts"``).
+        **kwargs:
+            Forwarded to ``extra_permission_options()`` so tools can
+            tailor their extra choices based on the current arguments.
+
+        Returns
+        -------
+        tuple[bool, str]
+            ``(allowed, reason_or_choice)`` — see ``PermissionManager.request()``
+            for the full description of the second element.
+        """
+        if not self.permission_required:
+            return True, ""
+
+        extra = self.extra_permission_options(**kwargs)
+        return self._permission_manager.request(
+            tool_name=self.name,
+            question=f"[{self.name}] {action}",
+            extra_options=extra or None,
+        )
+
+    # ------------------------------------------------------------------
+    # Result helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ok(data: dict | None = None) -> dict:
+        """Return a canonical success result."""
+        return {"status": "success", "data": data or {}}
+
+    @staticmethod
+    def _err(
+        error: str, message: str, code: int = 400, details: dict | None = None
+    ) -> dict:
+        """Return a canonical error result."""
+        result: dict = {
+            "status": "error",
+            "error": error,
+            "message": message,
+            "code": code,
+        }
+        if details is not None:
+            result["details"] = details
+        return result
