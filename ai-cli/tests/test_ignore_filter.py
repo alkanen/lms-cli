@@ -1,7 +1,9 @@
 """Tests for ai_cli.utils.ignore_filter.IgnoreFilter."""
 
-import pytest
 from pathlib import Path
+
+import pytest
+
 from ai_cli.utils.ignore_filter import IgnoreFilter
 
 
@@ -17,6 +19,7 @@ def make_filter(root: Path, *patterns: str) -> IgnoreFilter:
 # ---------------------------------------------------------------------------
 # Basic matching
 # ---------------------------------------------------------------------------
+
 
 def test_blank_and_comment_lines_ignored(root):
     # Blank lines and '#'-at-column-1 comments must not appear in raw_patterns.
@@ -55,6 +58,7 @@ def test_simple_glob_no_match(root):
 # Anchored patterns (leading slash)
 # ---------------------------------------------------------------------------
 
+
 def test_anchored_matches_top_level_only(root):
     f = make_filter(root, "/build")
     (root / "build").mkdir()
@@ -66,6 +70,7 @@ def test_anchored_matches_top_level_only(root):
 # ---------------------------------------------------------------------------
 # Directory-only patterns (trailing slash)
 # ---------------------------------------------------------------------------
+
 
 def test_dir_only_pattern_ignores_dir_not_file(root):
     f = make_filter(root, "__pycache__/")
@@ -91,6 +96,7 @@ def test_dir_only_pattern_ignores_contents(root):
 # Multi-segment patterns
 # ---------------------------------------------------------------------------
 
+
 def test_multi_segment_pattern(root):
     f = make_filter(root, "docs/build")
     (root / "docs" / "build").mkdir(parents=True)
@@ -113,6 +119,7 @@ def test_multi_segment_does_not_match_wrong_parent(root):
 # ---------------------------------------------------------------------------
 # Double-star patterns
 # ---------------------------------------------------------------------------
+
 
 def test_double_star_matches_zero_components(root):
     f = make_filter(root, "**/foo.txt")
@@ -139,6 +146,7 @@ def test_double_star_in_middle(root):
 # ---------------------------------------------------------------------------
 # Negation
 # ---------------------------------------------------------------------------
+
 
 def test_negation_re_includes(root):
     f = make_filter(root, "*.log", "!important.log")
@@ -176,6 +184,7 @@ def test_earlier_dir_pattern_overridden_by_later_negation(root):
 # Paths outside root
 # ---------------------------------------------------------------------------
 
+
 def test_path_outside_root_not_ignored(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
@@ -188,6 +197,7 @@ def test_path_outside_root_not_ignored(tmp_path):
 # ---------------------------------------------------------------------------
 # from_file constructor
 # ---------------------------------------------------------------------------
+
 
 def test_from_file_missing_file_returns_empty(root):
     f = IgnoreFilter.from_file(root, root / ".ignore")

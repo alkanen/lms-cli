@@ -93,10 +93,9 @@ class Workspace:
         # rules (including negations) can override global ones via "last
         # match wins".  Using one shared root also ensures global patterns
         # are evaluated against workspace-relative paths, not `~/.ai-cli/`.
-        combined = (
-            IgnoreFilter.read_patterns(_GLOBAL_DIR / ".ignore")
-            + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
-        )
+        combined = IgnoreFilter.read_patterns(
+            _GLOBAL_DIR / ".ignore"
+        ) + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
         self._ignore_filter = IgnoreFilter(self._root, combined)
 
     # ------------------------------------------------------------------
@@ -133,10 +132,13 @@ class Workspace:
         candidate = start
         while True:
             dot = candidate / _DOT_AI_CLI
-            if dot.is_dir() and candidate.resolve() != _GLOBAL_DIR.parent:
+            if (
+                dot.is_dir()
+                and candidate.resolve() != _GLOBAL_DIR.parent
                 # Extra guard: never return home dir as root via ~/.ai-cli
-                if dot.resolve() != _GLOBAL_DIR.resolve():
-                    return candidate
+                and dot.resolve() != _GLOBAL_DIR.resolve()
+            ):
+                return candidate
             parent = candidate.parent
             if parent == candidate:
                 # Reached filesystem root.
@@ -194,7 +196,7 @@ class Workspace:
         except ValueError:
             raise WorkspaceError(
                 f"Path '{path}' is outside the workspace root '{self._root}'."
-            )
+            ) from None
 
     # ------------------------------------------------------------------
     # File operations
@@ -346,7 +348,7 @@ class Workspace:
             )
         if end_line is not None:
             append_pos = file_len + 1
-            is_explicit_append = (start_line == append_pos and end_line == append_pos)
+            is_explicit_append = start_line == append_pos and end_line == append_pos
             if not is_explicit_append and end_line > file_len:
                 raise WorkspaceError(
                     f"end_line ({end_line}) is past end of file ({file_len} line(s))."

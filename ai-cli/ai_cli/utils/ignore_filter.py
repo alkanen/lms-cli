@@ -177,12 +177,12 @@ class IgnoreFilter:
         return raw
 
     @classmethod
-    def from_file(cls, root: Path, ignore_file: Path) -> "IgnoreFilter":
+    def from_file(cls, root: Path, ignore_file: Path) -> IgnoreFilter:
         """Load patterns from *ignore_file*; return an empty filter if missing."""
         return cls(root, cls.read_patterns(ignore_file))
 
     @classmethod
-    def empty(cls, root: Path) -> "IgnoreFilter":
+    def empty(cls, root: Path) -> IgnoreFilter:
         return cls(root, [])
 
     def is_ignored(self, path: Path) -> bool:

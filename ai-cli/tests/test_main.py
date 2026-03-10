@@ -1,8 +1,9 @@
 """Tests for ai_cli.__main__ entry point."""
 
 import sys
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
 
@@ -11,11 +12,14 @@ def run_main(argv: list[str]) -> None:
     """Import and run main() with the given argv."""
     with patch.object(sys, "argv", ["ai-cli"] + argv):
         from ai_cli.__main__ import main
+
         main()
 
 
 @pytest.fixture(autouse=True)
-def isolate_global_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_global_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fake_global = tmp_path_factory.mktemp("fake_global")
     monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", fake_global)
 
@@ -23,6 +27,7 @@ def isolate_global_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
 # ---------------------------------------------------------------------------
 # --init
 # ---------------------------------------------------------------------------
+
 
 class TestInit:
     def test_init_creates_scaffold(self, tmp_path):
@@ -59,6 +64,7 @@ class TestInit:
 # ---------------------------------------------------------------------------
 # No subcommand
 # ---------------------------------------------------------------------------
+
 
 class TestNoSubcommand:
     def test_exits_nonzero_without_init(self, tmp_path):

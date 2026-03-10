@@ -17,7 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from ai_cli.core.workspace import Workspace, WorkspaceError, _DOT_AI_CLI
+from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,9 +65,11 @@ def _cmd_init(path: Path) -> None:
     dot = path / _DOT_AI_CLI
     if dot.exists():
         try:
-            answer = input(
-                f"'{dot}' already exists. Add any missing scaffold files? [Y/n] "
-            ).strip().lower()
+            answer = (
+                input(f"'{dot}' already exists. Add any missing scaffold files? [Y/n] ")
+                .strip()
+                .lower()
+            )
         except EOFError:
             answer = ""  # non-interactive: default to yes (proceed)
         if answer not in ("", "y", "yes"):
