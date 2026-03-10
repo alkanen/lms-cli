@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -84,18 +85,16 @@ class ConfigManager:
         global_cfg = _load_yaml(_GLOBAL_DIR / "config.yaml")
         project_cfg: dict = {}
         if project_root is not None:
-            project_cfg = _load_yaml(
-                project_root / _DOT_AI_CLI / "config.yaml"
-            )
+            project_cfg = _load_yaml(project_root / _DOT_AI_CLI / "config.yaml")
 
         # Merge layers: global → project → CLI overrides.
-        self._config: dict = _deep_merge(
+        self._config: dict[str, Any] = _deep_merge(
             _deep_merge(global_cfg, project_cfg),
             cli_overrides,
         )
         self._project_root = project_root
 
-    def get(self, key: str, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         """Layered lookup: cli_overrides > project config > global config > default."""
         return self._config.get(key, default)
 
@@ -137,6 +136,15 @@ class ConfigManager:
     def get_backend(self) -> str:
         """Return the configured backend name ('openai' or 'lmstudio').
 
-        Defaults to 'openai' if not explicitly set.
+        Defaults to 'openai' if not set or set to null.
+        Raises ``ConfigError`` if the value is present but not a string.
         """
-        return self._config.get("backend", "openai")
+        value = self._config.get("backend")
+        if value is None:
+            return "openai"
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"'backend' must be a string (e.g. 'openai' or 'lmstudio'), "
+                f"got {type(value).__name__!r}."
+            )
+        return value

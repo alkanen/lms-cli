@@ -1,14 +1,22 @@
 """Tests for ai_cli.core.workspace.Workspace."""
 
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from ai_cli.core.workspace import Workspace, WorkspaceError, _DOT_AI_CLI, _INIT_TEMPLATES
+import pytest
+
+from ai_cli.core.workspace import (
+    _DOT_AI_CLI,
+    _INIT_TEMPLATES,
+    Workspace,
+    WorkspaceError,
+)
 
 
 @pytest.fixture(autouse=True)
-def isolate_global_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_global_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Redirect _GLOBAL_DIR to an empty, isolated tmp dir so real ~/.ai-cli/.ignore is never read."""
     fake_global = tmp_path_factory.mktemp("fake_global_ai_cli")
     monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", fake_global)
@@ -30,6 +38,7 @@ def workspace(project: Path) -> Workspace:
 # ---------------------------------------------------------------------------
 # find_root
 # ---------------------------------------------------------------------------
+
 
 class TestFindRoot:
     def test_finds_direct_parent(self, tmp_path):
@@ -60,6 +69,7 @@ class TestFindRoot:
 # initialise
 # ---------------------------------------------------------------------------
 
+
 class TestInitialise:
     def test_creates_scaffold(self, tmp_path):
         Workspace.initialise(tmp_path)
@@ -81,6 +91,7 @@ class TestInitialise:
 # resolve / path-escape protection
 # ---------------------------------------------------------------------------
 
+
 class TestResolve:
     def test_resolve_simple(self, workspace, project):
         p = workspace.resolve("src/foo.py")
@@ -94,6 +105,7 @@ class TestResolve:
 # ---------------------------------------------------------------------------
 # file_exists
 # ---------------------------------------------------------------------------
+
 
 class TestFileExists:
     def test_existing_file(self, workspace, project):
@@ -117,6 +129,7 @@ class TestFileExists:
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
+
 
 class TestReadFile:
     def test_read_full(self, workspace, project):
@@ -171,6 +184,7 @@ class TestReadFile:
 # ---------------------------------------------------------------------------
 # write_file
 # ---------------------------------------------------------------------------
+
 
 class TestWriteFile:
     def test_write_new_file(self, workspace, project):
@@ -248,6 +262,7 @@ class TestWriteFile:
 # ---------------------------------------------------------------------------
 # is_ignored
 # ---------------------------------------------------------------------------
+
 
 class TestIsIgnored:
     def test_ignores_via_project_ignore(self, project):
