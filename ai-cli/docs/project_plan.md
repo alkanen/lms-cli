@@ -24,7 +24,20 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
    - Tools can access the entire filesystem but must request permission for every action where `permission_required` is `True` for that tool.
    - Universal permission options: "Yes" (once), "No" (reject), "Always" (always allow for this tool), or custom rejection with a user-provided suggestion sent back to the LLM. Tools may offer additional variants (e.g., "Always in this folder").
 
-3. **MCP (Model Context Protocol) Support**
+3. **Tool Manager Tool**
+   - A bundled tool (`tool_manager`) that acts as a gatekeeper for the tool list, reducing context usage and preventing information overload for the LLM.
+   - At startup, most tools are disabled. This is a convention of the bundled tools — each declares its own default enabled state in code, and `ToolRegistry` respects those defaults (and any config overrides). It is not a global "disabled unless whitelisted" rule enforced by `ToolRegistry` itself. In the bundled distribution, only `tool_manager` and a small set of essentials (e.g., `read_file`) declare themselves enabled by default.
+   - The LLM interacts with `tool_manager` via two actions:
+     - `list` — returns each available tool's name, a one-line description, and whether it is currently enabled, so the LLM can make informed enable requests without seeing full schemas.
+     - `enable` — requests one or more tools for a single API call by passing a `tool_names` array. The REPL injects those tools' schemas into the immediately following LLM call only; the tools are not added to the permanent or session-level tool list. No state change is made to `ToolRegistry`.
+   - This is implemented via `ToolRegistry.enable_transient(name)`, called once per entry in `tool_names`, returning each schema for injection without modifying enabled state.
+   - The LLM workflow is: call `list` → call `enable` with a `tool_names` array of all needed tools → the REPL automatically appends the schemas to the next API call → the LLM uses the tools → all injected tools disappear on the subsequent call. No cleanup required from the LLM.
+   - **Three distinct enable modes** (in increasing permanence):
+     - **Transient** (`tool_manager` enable): injected for one API call only, no state change.
+     - **Session** (`/tools enable <name> --session`): in-memory for the current session, reset on exit/resume.
+     - **Persistent** (`/tools enable <name>`): written to the project-level `.ai-cli/config.yaml`, survives across sessions.
+
+4. **MCP (Model Context Protocol) Support**
    - Integrate Anthropic's Model Context Protocol for connecting the LLM to external tool servers.
    - MCP servers expose tools via stdio or SSE transports, discovered and invoked by the CLI.
    - Potential use cases:
@@ -32,12 +45,12 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
      - Context switching (e.g., toggling between different MCP server configurations).
      - External integration (e.g., APIs, databases) via dedicated MCP server processes.
 
-4. **Structured Output**
+5. **Structured Output**
    - Tools export schemas for LLM compatibility.
    - Tool responses MUST be JSON objects conforming to the canonical tool response schema defined in `docs/technical_requirements.md` (success: `{status, data}`; error: `{status, error, message, code}`). Plain-text output is represented as a string field inside `data`.
    - Enforce structured data formats (e.g., JSON, YAML) for fields within `data` where applicable.
 
-5. **Configuration Flexibility**
+6. **Configuration Flexibility**
    - Decouple configuration from the project root directory.
    - Configuration stored in YAML files (`config.yaml`) at global and project level.
    - CLI overrides for critical parameters (e.g., config file paths, server addresses, working directories).
@@ -53,7 +66,7 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
        3. CLI flag overrides (highest priority).
        - If no model configuration is found at any level, the CLI exits with a clear error message guiding the user to set one up.
 
-6. **Improved Permission Handling**
+7. **Improved Permission Handling**
    - Permissions are held in-memory only, scoped to the current process lifetime.
    - All permissions reset on exit or session resume — no persistence to disk.
    - Universal permission options (available for every tool action):
@@ -63,13 +76,13 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
      - **Custom rejection**: Reject with a user-provided message/suggestion sent back to the LLM.
    - Tools may propose additional permission variants beyond the universal set (e.g., `read_file` and `write_file` offer "Always in this folder"). These tool-specific options are presented alongside the universal ones but are not guaranteed to be available for every tool.
 
-7. **Error Handling and Logging**
+8. **Error Handling and Logging**
    - Comprehensive error handling for tool execution.
    - Structured logging with severity levels using Python's `logging` module.
    - JSONL format for error logs (one entry per line) to facilitate structured data handling while remaining human-readable.
    - Session-specific folders in the user's home directory (`~/.ai-cli/`) to store metadata, session history, and error logs in JSONL format.
 
-8. **Testing and Maintainability**
+9. **Testing and Maintainability**
    - Unit test-friendly design with clear interfaces.
    - Dependency injection for easier mocking in tests.
 
@@ -79,29 +92,38 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
 3. **MCP Requirements** — MCP = Anthropic's Model Context Protocol (stdio/SSE transports).
 
 ## Project Structure
+
+Files not yet implemented are marked *(planned)*.
+
 ```
 ai-cli/
-├── core/                       # Core functionality
-│   ├── config_manager.py       # Layered YAML config loading
-│   ├── workspace.py            # Workspace root resolution, file ops, ignore rules
-│   ├── tool_registry.py        # Three-tier tool discovery, loading, settings
-│   ├── permission_manager.py   # In-memory permission state
-│   ├── llm_client.py           # Abstract LLMClient + OpenAI/LMStudio implementations
-│   ├── mcp_manager.py          # MCP server connections, tool exposure
-│   └── session_manager.py      # Session create/resume/compact/persist
-├── tools/                      # Bundled tools (read_file, write_file, bash, etc.)
-├── cli/                        # CLI interface and user-facing components
-│   ├── repl.py                 # Main REPL loop, input handling, slash commands
-│   ├── completer.py            # Tab completion + @ file picker
-│   └── display.py              # Rich output, summary/verbose modes
-├── utils/                      # Utility functions and helpers
-│   ├── ignore_filter.py        # .gitignore-style pattern matching
-│   └── logging_utils.py        # JSONL structured logging
-├── tests/                      # Unit and integration tests
-│   ├── test_tool_registry.py   # Tool registry tests
-│   └── ...                     # Additional test files
-└── docs/                       # Documentation
-    └── project_plan.md         # This file
+├── ai_cli/                         # Python package root
+│   ├── __main__.py                 # Entry point (python -m ai_cli)
+│   ├── core/                       # Core functionality
+│   │   ├── config_manager.py       # Layered YAML config loading
+│   │   ├── workspace.py            # Workspace root resolution, file ops, ignore rules
+│   │   ├── permission_manager.py   # In-memory permission state
+│   │   ├── tool_registry.py        # Three-tier tool discovery, loading, settings *(planned)*
+│   │   ├── llm_client.py           # Abstract LLMClient + OpenAI/LMStudio implementations *(planned)*
+│   │   ├── mcp_manager.py          # MCP server connections, tool exposure *(planned)*
+│   │   └── session_manager.py      # Session create/resume/compact/persist *(planned)*
+│   ├── tools/                      # Bundled tools *(planned)*
+│   │   └── tool_manager.py         # Context-saving tool gatekeeper *(planned)*
+│   ├── cli/                        # CLI interface and user-facing components *(planned)*
+│   │   ├── repl.py                 # Main REPL loop, input handling, slash commands *(planned)*
+│   │   ├── completer.py            # Tab completion + @ file picker *(planned)*
+│   │   └── display.py              # Rich output, summary/verbose modes *(planned)*
+│   └── utils/                      # Utility functions and helpers
+│       ├── ignore_filter.py        # .gitignore-style pattern matching
+│       └── logging_utils.py        # JSONL structured logging *(planned)*
+├── tests/                          # Unit and integration tests
+│   ├── test_workspace.py
+│   ├── test_ignore_filter.py
+│   ├── test_config_manager.py
+│   ├── test_permission_manager.py
+│   └── ...                         # Additional test files
+└── docs/                           # Documentation
+    └── project_plan.md             # This file
 ```
 
 ## Implementation Plan
@@ -191,9 +213,11 @@ ai-cli/
      - `/tools` — alias for `/tools list`.
        - `/tools list` — list all loaded tools with their source tier (bundled/global/project) and current enabled/permission status.
        - `/tools info <name>` — show full details for a specific tool: description, parameters, and current settings.
-       - `/tools enable <name>` / `/tools disable <name>` — toggle a tool's enabled state.
+       - `/tools enable <name> [--session]` / `/tools disable <name> [--session]` — toggle a tool's enabled state.
+         - Without `--session`: change is written to project-level `.ai-cli/config.yaml` and persists across sessions.
+         - With `--session`: change is in-memory only for the current session, reset on exit or resume. No config write.
        - `/tools allow <name>` / `/tools disallow <name>` — toggle `permission_required` for a tool.
-       - Changes made via `/tools` are written to the project-level `.ai-cli/config.yaml`. If the tool is not yet listed there, it is added with only the changed key; all other settings remain at their defaults.
+       - Persistent changes (without `--session`) are written to the project-level `.ai-cli/config.yaml`. If the tool is not yet listed there, it is added with only the changed key; all other settings remain at their defaults.
      - `/compact [instructions]` — manually trigger session compaction. Optional instructions guide the LLM on what to emphasise in the summary.
      - `/session name "<name>"` — assign a human-readable name to the current session, stored in `metadata.yaml`.
 
