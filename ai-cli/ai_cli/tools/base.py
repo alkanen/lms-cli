@@ -100,6 +100,17 @@ class Tool(ABC):
         """
         return []
 
+    def reset_session_state(self) -> None:  # noqa: B027
+        """
+        Clear all session-scoped state held by this tool.
+
+        Called by the registry on session resume so that any in-memory grants
+        or caches accumulated during the previous session do not carry over.
+        Tools with session-scoped state (e.g. permission allow-lists) must
+        override this method and clear that state.  The default is a no-op.
+        """
+        ...
+
     def on_permission_granted(self, choice: str, **kwargs: Any) -> None:  # noqa: B027
         """
         Called by the registry after the user grants permission via a named

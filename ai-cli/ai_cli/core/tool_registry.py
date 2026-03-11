@@ -443,8 +443,15 @@ class ToolRegistry:
             self._session_overrides[name] = False
 
     def reset_session_overrides(self) -> None:
-        """Clear all session-level overrides. Called on session resume."""
+        """Clear all session-level overrides and tool session state. Called on session resume."""
         self._session_overrides.clear()
+        for tool in self._tools.values():
+            try:
+                tool.reset_session_state()
+            except Exception:
+                logger.exception(
+                    "Error resetting session state for tool '%s'", tool.name
+                )
 
     # ------------------------------------------------------------------
     # Transient enable (one API call, no state change)
