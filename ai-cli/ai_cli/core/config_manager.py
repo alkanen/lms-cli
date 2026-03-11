@@ -87,6 +87,8 @@ class ConfigManager:
         if project_root is not None:
             project_cfg = _load_yaml(project_root / _DOT_AI_CLI / "config.yaml")
 
+        self._project_cfg = project_cfg
+
         # Merge layers: global → project → CLI overrides.
         self._config: dict[str, Any] = _deep_merge(
             _deep_merge(global_cfg, project_cfg),
@@ -97,6 +99,10 @@ class ConfigManager:
     def get(self, key: str, default: Any = None) -> Any:
         """Layered lookup: cli_overrides > project config > global config > default."""
         return self._config.get(key, default)
+
+    def get_project(self, key: str, default: Any = None) -> Any:
+        """Look up *key* in the project config layer only (ignores global and CLI)."""
+        return self._project_cfg.get(key, default)
 
     def get_model_config(self) -> dict:
         """Return the effective model/backend configuration.

@@ -154,21 +154,20 @@ ai-cli/
      3. **Project tools**: `<project>/.ai-cli/tools/` — available only within that project.
    - Tools discovered later in the load order can override earlier ones by name. The user is warned at startup when an override occurs, but it is allowed.
    - Add metadata validation for tools at load time.
-   - Per-tool settings are defined in `config.yaml` under a `tools` section. If a tool is not mentioned, or a key is absent, the tool's own declared defaults apply. `permission_required` is declared by each tool in its `__init__` (e.g., `read_file` defaults to `False`, `write_file` to `True`). The config is a project-level override of those defaults. Example:
+   - Per-tool settings are read from a `tools` mapping keyed by tool name in both `~/.ai-cli/config.yaml` (global) and `<project>/.ai-cli/config.yaml` (project), merged in that order (global → project → CLI flags). If a tool is not mentioned, or a key is absent, the tool's own declared defaults apply. Each tool declares `NAME`, `DESCRIPTION`, and `PERMISSION_REQUIRED` as class attributes (e.g., `read_file` sets `PERMISSION_REQUIRED = False`, `write_file` sets it to `True`). **Trust distinction**: global config is treated as trusted (the user's own file); project config is untrusted (a cloned repo could contain it). Lowering `permission_required` from `true` to `false` is therefore allowed unconditionally from global config, but requires an explicit `user_confirmed: true` marker in the project config entry (written automatically by the `/tools allow` REPL command). Example:
      ```yaml
      tools:
-       - name: write_file
+       write_file:
          permission_required: true
-       - name: bash
+       bash:
          permission_required: true
          disabled: false
-       - name: file_search
+       file_search:
          disabled: true
-       - name: read_file
-         permission_required: false
+       read_file:
          allow_outside_workspace: true
      ```
-   - Tools may define their own additional settings keys (e.g., `allow_outside_workspace`). The tool registry passes the full settings dict to the tool at initialisation.
+   - Currently the registry applies only `permission_required` and `disabled` from the config. Other keys (e.g., `allow_outside_workspace`) are reserved for future extension; the `Tool` base class would need to accept per-tool settings before they can be applied.
    - **Security**: Project-level `config.yaml` is treated as untrusted. Settings that weaken security — such as disabling `permission_required` or enabling `allow_outside_workspace` — must trigger an explicit user confirmation prompt at startup before taking effect. They cannot silently override the safe baseline.
 
 4. **MCP Support**
