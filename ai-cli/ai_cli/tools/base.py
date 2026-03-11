@@ -100,6 +100,22 @@ class Tool(ABC):
         """
         return []
 
+    def on_permission_granted(self, choice: str, **kwargs: Any) -> None:  # noqa: B027
+        """
+        Called by the registry after the user grants permission via a named
+        extra option from ``extra_permission_options()``.
+
+        *choice* is the non-empty string the user selected.  Universal
+        choices such as a plain "yes" or "always" do not produce a named
+        choice string; in those cases ``PermissionManager.request()`` returns
+        an empty string and this hook is **not called at all**.
+
+        Tools can override this to react to the chosen extra option, for
+        example to remember a folder-scoped "always allow" decision.  The
+        default implementation is a no-op.
+        """
+        ...
+
     # ------------------------------------------------------------------
     # Permission helper (not normally overridden)
     # ------------------------------------------------------------------
