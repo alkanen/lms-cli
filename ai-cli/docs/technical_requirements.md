@@ -10,62 +10,77 @@ This document outlines the technical requirements for the AI CLI tool project. I
   - Tools must export schemas in the OpenAI function-calling format via a `definition()` method.
   - The name, description, and parameters are defined by each tool individually.
   - Each parameter includes `type` and `description`. Required parameters are listed in a top-level `required` array on the `parameters` object, per the OpenAI function-calling / JSON Schema specification.
-  - Example schema (illustrative only — actual parameters vary per tool):
+  - Example schema (from the implemented `read_file` tool):
     ```json
     {
       "type": "function",
       "function": {
-        "name": "file_read",
-        "description": "Reads the contents of a file.",
+        "name": "read_file",
+        "description": "Read a file (or line range) from the workspace. Returns start_line, end_line, lines_returned, and total_lines (1-based, inclusive). For an empty file, start_line and end_line are both 0.",
         "parameters": {
           "type": "object",
           "properties": {
-            "file_path": {
+            "path": {
               "type": "string",
-              "description": "A relative path to the file"
+              "description": "Path to the file, relative to the workspace root (e.g. './src/main.py')."
             },
             "start_line": {
               "type": "integer",
-              "description": "Optional first line to read, starts from 1"
+              "description": "1-based first line to read (inclusive). Omit to start from the beginning of the file."
+            },
+            "end_line": {
+              "type": "integer",
+              "description": "1-based last line to read (inclusive). Omit to read to the end of the file."
             }
           },
-          "required": ["file_path"]
+          "required": ["path"]
         }
       }
     }
     ```
 
+- **Implemented tools** (as of current state):
+  - `read_file` — `path` (required), `start_line`, `end_line` (optional, 1-based inclusive)
+  - `write_file` — `path`, `content` (required), `start_line`, `end_line` (optional, must be provided together)
+
 - **LLM Tool Calls**:
   - The LLM should call tools using function calls or API endpoints.
-  - Tools must validate inputs against their schemas before execution.
+  - The OpenAI API enforces the JSON Schema before the call reaches the tool, so structurally invalid calls (missing required args, wrong types) are rejected at the API boundary and never reach `execute()`. Tools therefore only need to validate semantic constraints (e.g. `start_line > total_lines`), which they return as canonical 4xx error dicts.
 
 ---
 
 ## Serialization Formats
 - **Tool Inputs/Outputs**:
   - Use JSON for tool inputs and outputs.
-  - Tool input example:
+  - Tool input example (`read_file` with an optional line range):
     ```json
     {
-      "file_path": "/path/to/file.txt"
+      "path": "./src/main.py",
+      "start_line": 10,
+      "end_line": 30
     }
     ```
-  - Tool output example (success):
+  - Tool output example (success, `read_file`):
     ```json
     {
       "status": "success",
       "data": {
-        "content": "File content here..."
+        "content": "def main():\n    ...\n",
+        "path": "./src/main.py",
+        "start_line": 10,
+        "end_line": 30,
+        "lines_returned": 21,
+        "total_lines": 120
       }
     }
     ```
-  - Tool output example (error):
+  - Tool output example (error, `read_file` on a missing or ignored file):
     ```json
     {
       "status": "error",
-      "error": "file_not_found",
-      "message": "The requested file does not exist.",
-      "code": 404
+      "error": "read_error",
+      "message": "File not found: './src/missing.py'",
+      "code": 400
     }
     ```
 
@@ -211,6 +226,18 @@ This document outlines the technical requirements for the AI CLI tool project. I
 ---
 
 ## Additional Considerations
+
+- **Tool class attributes**:
+  - `NAME: str` — canonical name used in schemas, config, and slash commands.
+  - `DESCRIPTION: str` — one-line description shown in `tool_manager list` and the LLM schema.
+  - `PERMISSION_REQUIRED: bool` — tool's own default; overridable via config.
+  - `DISABLED_BY_DEFAULT: bool` (optional, default `False`) — set `True` to start the tool disabled in the registry. Config and session overrides can still enable it. This is how most bundled tools will opt out of the default tool list until the user or LLM enables them.
+
+- **Tool session state**:
+  - Tools with session-scoped state (e.g. per-path permission allow-lists) implement `reset_session_state()`.
+  - `ToolRegistry.reset_session_overrides()` calls this hook on every tool when a session is resumed, clearing tool-level session state (e.g. per-path allow-lists). Each call is guarded individually — a bug in one tool's hook does not prevent other tools from being reset.
+  - `PermissionManager` "always" grants are **not** cleared by `reset_session_overrides()`. They must be reset separately by calling `PermissionManager.reset()`. The startup sequence is responsible for calling both.
+
 - **Ignore File**:
   - `.ai-cli/.ignore` uses `.gitignore` syntax (glob patterns, negation with `!`, comments with `#`).
   - Paths matching the ignore rules are excluded from LLM context and tool access.

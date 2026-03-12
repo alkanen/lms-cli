@@ -93,42 +93,52 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
 
 ## Project Structure
 
-Files not yet implemented are marked *(planned)*.
+Legend: ✅ implemented and tested · 🔲 planned
 
 ```
 ai-cli/
 ├── ai_cli/                         # Python package root
-│   ├── __main__.py                 # Entry point (python -m ai_cli)
+│   ├── __main__.py                 # ✅ Entry point — --init support only for now
 │   ├── core/                       # Core functionality
-│   │   ├── config_manager.py       # Layered YAML config loading
-│   │   ├── workspace.py            # Workspace root resolution, file ops, ignore rules
-│   │   ├── permission_manager.py   # In-memory permission state
-│   │   ├── tool_registry.py        # Three-tier tool discovery, loading, settings *(planned)*
-│   │   ├── llm_client.py           # Abstract LLMClient + OpenAI/LMStudio implementations *(planned)*
-│   │   ├── mcp_manager.py          # MCP server connections, tool exposure *(planned)*
-│   │   └── session_manager.py      # Session create/resume/compact/persist *(planned)*
-│   ├── tools/                      # Bundled tools *(planned)*
-│   │   └── tool_manager.py         # Context-saving tool gatekeeper *(planned)*
-│   ├── cli/                        # CLI interface and user-facing components *(planned)*
-│   │   ├── repl.py                 # Main REPL loop, input handling, slash commands *(planned)*
-│   │   ├── completer.py            # Tab completion + @ file picker *(planned)*
-│   │   └── display.py              # Rich output, summary/verbose modes *(planned)*
+│   │   ├── config_manager.py       # ✅ Layered YAML config loading
+│   │   ├── workspace.py            # ✅ Workspace root resolution, file ops, ignore rules
+│   │   ├── permission_manager.py   # ✅ In-memory permission state
+│   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, settings
+│   │   ├── llm_client.py           # 🔲 Abstract LLMClient + OpenAI/LMStudio implementations
+│   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
+│   │   └── session_manager.py      # 🔲 Session create/resume/compact/persist
+│   ├── tools/                      # Bundled tools
+│   │   ├── base.py                 # ✅ Tool abstract base class
+│   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
+│   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
+│   │   └── tool_manager.py         # 🔲 Context-saving tool gatekeeper (deferred until after REPL)
+│   ├── cli/                        # CLI interface and user-facing components
+│   │   ├── repl.py                 # 🔲 Main REPL loop, input handling, slash commands
+│   │   ├── completer.py            # 🔲 Tab completion + @ file picker
+│   │   └── display.py              # 🔲 Rich output, summary/verbose modes
 │   └── utils/                      # Utility functions and helpers
-│       ├── ignore_filter.py        # .gitignore-style pattern matching
-│       └── logging_utils.py        # JSONL structured logging *(planned)*
-├── tests/                          # Unit and integration tests
+│       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
+│       └── logging_utils.py        # 🔲 JSONL structured logging
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
 │   ├── test_permission_manager.py
-│   └── ...                         # Additional test files
+│   ├── test_tool_registry.py
+│   ├── test_tool_base.py
+│   ├── test_read_file.py
+│   ├── test_write_file.py
+│   └── test_main.py
 └── docs/                           # Documentation
     └── project_plan.md             # This file
 ```
 
 ## Implementation Plan
+
+Legend: ✅ done · 🔲 planned · → next
+
 ### Phase 1: Core Infrastructure
-1. **Workspace Handling**
+1. **Workspace Handling** ✅
    - Implement a `Workspace` class to manage relative paths and resource resolution.
    - Support for `.ai-cli/` directory in the project root for configuration.
    - The `.ai-cli/` directory structure (created by `--init`):
@@ -142,19 +152,19 @@ ai-cli/
      ```
    - `~/.ai-cli/` (global user folder) mirrors the same structure including a `tools/` subfolder for globally available user tools.
 
-2. **Configuration Management**
-   - Create a `ConfigManager` class to load layered configurations from YAML files.
-   - Implement fallback mechanisms for missing configurations.
-   - Support CLI overrides for critical parameters (e.g., config file paths, server addresses).
+2. **Configuration Management** ✅
+   - `ConfigManager` loads layered config (global → project → CLI overrides).
+   - `get_project(key)` exposes the project-only layer for security checks in `ToolRegistry`.
+   - `get_model_config()` resolves `api_key_env` to the actual key from the environment.
 
-3. **Tool Registry Enhancements**
+3. **Tool Registry Enhancements** ✅
    - Redesign the `ToolRegistry` to support dynamic tool discovery from three tiers, loaded in order:
      1. **Bundled tools**: Packaged with `ai-cli` itself (e.g., file read/write, basic shell). Always available.
      2. **Global user tools**: `~/.ai-cli/tools/` — available in all projects for that user.
      3. **Project tools**: `<project>/.ai-cli/tools/` — available only within that project.
    - Tools discovered later in the load order can override earlier ones by name. The user is warned at startup when an override occurs, but it is allowed.
    - Add metadata validation for tools at load time.
-   - Per-tool settings are read from a `tools` mapping keyed by tool name in both `~/.ai-cli/config.yaml` (global) and `<project>/.ai-cli/config.yaml` (project), merged in that order (global → project → CLI flags). If a tool is not mentioned, or a key is absent, the tool's own declared defaults apply. Each tool declares `NAME`, `DESCRIPTION`, and `PERMISSION_REQUIRED` as class attributes (e.g., `read_file` sets `PERMISSION_REQUIRED = False`, `write_file` sets it to `True`). **Trust distinction**: global config is treated as trusted (the user's own file); project config is untrusted (a cloned repo could contain it). Lowering `permission_required` from `true` to `false` is therefore allowed unconditionally from global config, but requires an explicit `user_confirmed: true` marker in the project config entry (written automatically by the `/tools allow` REPL command). Example:
+   - Per-tool settings are read from a `tools` mapping keyed by tool name in both `~/.ai-cli/config.yaml` (global) and `<project>/.ai-cli/config.yaml` (project), merged in that order (global → project → CLI flags). If a tool is not mentioned, or a key is absent, the tool's own declared defaults apply. Each tool declares `NAME`, `DESCRIPTION`, and `PERMISSION_REQUIRED` as class attributes (e.g., `read_file` sets `PERMISSION_REQUIRED = False`, `write_file` sets it to `True`). **Trust distinction**: global config is treated as trusted (the user's own file); project config is untrusted (a cloned repo could contain it). Lowering `permission_required` from `true` to `false` is therefore allowed unconditionally from global config, but requires an explicit `user_confirmed: true` marker in the project config entry (written by `ToolRegistry.set_permission_required()`; the `/tools allow` REPL command that calls it is 🔲 planned). Example:
      ```yaml
      tools:
        write_file:
@@ -168,32 +178,41 @@ ai-cli/
          allow_outside_workspace: true
      ```
    - Currently the registry applies only `permission_required` and `disabled` from the config. Other keys (e.g., `allow_outside_workspace`) are reserved for future extension; the `Tool` base class would need to accept per-tool settings before they can be applied.
-   - **Security**: Project-level `config.yaml` is treated as untrusted. Settings that weaken security — such as disabling `permission_required` or enabling `allow_outside_workspace` — must trigger an explicit user confirmation prompt at startup before taking effect. They cannot silently override the safe baseline.
+   - **Security**: Project-level `config.yaml` is treated as untrusted. For `permission_required`, `ToolRegistry._apply_config()` ignores any attempt to lower it unless the entry carries `user_confirmed: true` (written by `ToolRegistry.set_permission_required()`; the 🔲 planned `/tools allow` REPL command will call this), and logs a warning otherwise. A startup confirmation prompt for untrusted settings is 🔲 planned for when the REPL exists, but is not yet implemented. Other security-weakening keys such as `allow_outside_workspace` are reserved for future extension and are currently ignored.
 
-4. **MCP Support**
+4. **MCP Support** 🔲
    - Implement a `MCPManager` class to discover, connect to, and communicate with MCP servers.
    - Support stdio and SSE transports as defined by the Model Context Protocol.
    - Expose MCP server tools through the same tool registry as built-in tools.
 
 ### Phase 2: Tooling and Execution
-1. **Tool Execution Improvements**
-   - Enforce structured output (e.g., JSON) for all tools where applicable.
-   - Add schema validation for tool responses.
-   - Implement retry logic for transient failures.
-   - Tools with `permission_required: True` must request permission for every action, with granular options (Yes/No/Always/Custom rejection or tool-specific suggestions).
+1. **Tool Execution Improvements** ✅
+   - Canonical `{"status": "success"/"error", ...}` response shape standardised via `_ok()`/`_err()` helpers and followed by built-in tools by convention — nothing enforces that third-party tools use them.
+   - `ToolRegistry.execute()` handles unknown tool, disabled tool, permission denied, and execution errors — all return canonical error dicts.
+   - `allow_transient=True` parameter lets the REPL execute transiently-injected tools that aren't in the persistent enabled set.
 
-2. **Permission System**
-   - Introduce a `PermissionManager` to handle tool permissions in-memory for the current process only.
-   - Permissions are never written to disk. When the CLI exits or a session is resumed, all permissions reset and must be granted anew.
-   - This ensures the tool never silently retains permissions across changed circumstances.
+2. **Permission System** ✅
+   - `PermissionManager` handles in-memory grants (yes/no/always/custom rejection).
+   - `always` grants are stored per tool name. They persist unless `PermissionManager.reset()` is explicitly called — the session manager must call both `PermissionManager.reset()` and `ToolRegistry.reset_session_overrides()` on session resume to clear all session-scoped state.
+   - File tools (`read_file`, `write_file`) additionally manage session-scoped file/dir allow-lists at the tool level via `extra_permission_options()` / `on_permission_granted()` / `reset_session_state()`, which are cleared by `ToolRegistry.reset_session_overrides()`.
 
-3. **Error Handling**
-   - Standardize error formats (e.g., JSON with `error`, `message`, `code`).
-   - Add logging integration using Python's `logging` module.
-   - Session-specific folders in `~/.ai-cli/` to store metadata, session history, and error logs in JSONL format.
+3. **Bundled Tools** ✅ (partial)
+   - `read_file` — workspace-scoped, no permission by default, session allow-list, line-range support.
+   - `write_file` — workspace-scoped, permission required by default, session allow-list, full and partial writes.
+   - `tool_manager` — 🔲 **deferred until after the REPL is implemented.** The tool can be implemented and tested independently, but it's only useful once there's a working conversation loop.
 
-### Phase 3: CLI and User Experience
-1. **CLI Interface**
+4. **Error Handling** (partial)
+   - Structured error dicts returned by all tool calls. ✅
+   - JSONL logging (`logging_utils.py`) 🔲
+   - Session-specific log folders in `~/.ai-cli/` 🔲
+
+### Phase 3: CLI and User Experience 🔲
+1. **LLMClient** → **next priority**
+   - Abstract base class + `OpenAIClient` (OpenAI-compatible REST, streamed) + `LMStudioClient` (WebSocket).
+   - `create_llm_client(config_manager)` factory function.
+   - Must be complete before the REPL can be built.
+
+2. **CLI Interface**
    - Redesign the CLI interface to be more intuitive and user-friendly.
    - Support for interactive mode with:
      - Tab completion for commands, tools, slash commands, and file paths.
