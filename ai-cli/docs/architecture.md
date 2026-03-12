@@ -1,32 +1,38 @@
 # Architecture: ai-cli
 
-## Module Structure
+## Implementation Status
 
-The package root is `ai-cli/ai_cli/`. The tree below shows the target layout;
-files not yet implemented are marked *(planned)*.
+Legend: ✅ implemented and tested · 🔲 planned
+
+---
+
+## Module Structure
 
 ```
 ai-cli/
 ├── ai_cli/                       # Python package root
-│   ├── __main__.py               # Entry point (python -m ai_cli)
+│   ├── __main__.py               # ✅ Entry point (python -m ai_cli) — --init support only
 │   ├── core/
-│   │   ├── config_manager.py     # Layered YAML config loading
-│   │   ├── workspace.py          # Workspace root resolution, file ops, ignore rules
-│   │   ├── permission_manager.py # In-memory permission state
-│   │   ├── tool_registry.py      # Three-tier tool discovery, loading, settings *(planned)*
-│   │   ├── llm_client.py         # Abstract LLMClient + OpenAI/LMStudio implementations *(planned)*
-│   │   ├── mcp_manager.py        # MCP server connections, tool exposure *(planned)*
-│   │   └── session_manager.py    # Session create/resume/compact/persist *(planned)*
-│   ├── tools/                    # Bundled tools *(planned)*
-│   │   └── tool_manager.py       # Context-saving tool gatekeeper *(planned)*
-│   ├── cli/                      # *(planned)*
-│   │   ├── repl.py               # Main REPL loop, input handling, slash commands *(planned)*
-│   │   ├── completer.py          # Tab completion + @ file picker *(planned)*
-│   │   └── display.py            # Rich output, summary/verbose modes *(planned)*
+│   │   ├── config_manager.py     # ✅ Layered YAML config loading
+│   │   ├── workspace.py          # ✅ Workspace root resolution, file ops, ignore rules
+│   │   ├── permission_manager.py # ✅ In-memory permission state
+│   │   ├── tool_registry.py      # ✅ Three-tier tool discovery, loading, settings
+│   │   ├── llm_client.py         # 🔲 Abstract LLMClient + OpenAI/LMStudio implementations
+│   │   ├── mcp_manager.py        # 🔲 MCP server connections, tool exposure
+│   │   └── session_manager.py    # 🔲 Session create/resume/compact/persist
+│   ├── tools/
+│   │   ├── base.py               # ✅ Tool abstract base class
+│   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
+│   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
+│   │   └── tool_manager.py       # 🔲 Context-saving tool gatekeeper (deferred until after REPL)
+│   ├── cli/                      # 🔲
+│   │   ├── repl.py               # 🔲 Main REPL loop, input handling, slash commands
+│   │   ├── completer.py          # 🔲 Tab completion + @ file picker
+│   │   └── display.py            # 🔲 Rich output, summary/verbose modes
 │   └── utils/
-│       ├── ignore_filter.py      # .gitignore-style pattern matching
-│       └── logging_utils.py      # JSONL structured logging *(planned)*
-└── tests/
+│       ├── ignore_filter.py      # ✅ .gitignore-style pattern matching
+│       └── logging_utils.py      # 🔲 JSONL structured logging
+└── tests/                        # ✅ mirrors ai_cli/ structure
 ```
 
 ---
@@ -51,30 +57,35 @@ mcp_manager → tool_registry
 
 ## Class Interfaces
 
-### ConfigManager
+### ConfigManager ✅
 
 ```python
 class ConfigManager:
     def __init__(self, project_root: Path | None, cli_overrides: dict): ...
 
     def get(self, key: str, default=None) -> Any:
-        """Layered lookup: cli_overrides > project config > global config > default"""
+        """Layered lookup: cli_overrides > project config > global config > default."""
+
+    def get_project(self, key: str, default=None) -> Any:
+        """Project config layer only — used to detect untrusted project-level settings."""
 
     def get_backend(self) -> str:
-        """Returns 'openai' or 'lmstudio'"""
+        """Returns 'openai' or 'lmstudio'. Defaults to 'openai'."""
 
     def get_model_config(self) -> dict:
-        """Returns merged model/backend config. Raises ConfigError if none found."""
-
-    def get_tools_config(self) -> list[dict]:
-        """Returns merged tools list from global + project config."""
+        """Returns merged model/backend config. Raises ConfigError if none found.
+        Resolves api_key_env to the actual key from the environment."""
 ```
 
 Raises `ConfigError` with a helpful message if required config (model/backend) is missing at all levels.
 
+**Note**: the `tools` config section is a dict keyed by tool name (not a list). Access via
+`config.get("tools", {})` for the merged view and `config.get_project("tools", {})` for
+the project-only layer (used by `ToolRegistry._apply_config()` for security checks).
+
 ---
 
-### Workspace
+### Workspace ✅
 
 ```python
 class Workspace:
@@ -92,24 +103,39 @@ class Workspace:
         """Check path against global + project .ignore rules."""
 
     def resolve(self, relative: str) -> Path:
-        """Resolve a relative path against workspace root."""
+        """Resolve a relative path against workspace root. Raises WorkspaceError if it escapes."""
 
-    def file_exists(self, relative: str) -> bool: ...
+    def file_exists(self, relative: str) -> bool:
+        """Returns False for ignored paths (no info leakage)."""
 
-    def read_file(self, relative: str, start_line=None, end_line=None) -> str: ...
+    def read_file(self, relative: str, start_line=None, end_line=None) -> str:
+        """1-based inclusive line range. Raises WorkspaceError on any failure."""
 
     def write_file(self, relative: str, content: str,
-                   start_line=None, end_line=None) -> str: ...
+                   start_line=None, end_line=None) -> str:
+        """Full write (no line args): creates file + parent dirs.
+        Partial write (both line args): file must exist.
+          - Replacement: 1 ≤ start_line ≤ end_line ≤ total_lines
+          - Append-at-EOF: start_line == end_line == total_lines + 1
+        Returns a human-readable summary string."""
 ```
 
 Owns the ignore filter internally — callers use `is_ignored()`. Used by `ToolRegistry` and the `@` file picker.
 
 ---
 
-### Tool (base class)
+### Tool (base class) ✅
 
 ```python
-class Tool:
+class Tool(ABC):
+    # Required class attributes — validated at registration time:
+    NAME: str
+    DESCRIPTION: str
+    PERMISSION_REQUIRED: bool
+
+    # Optional class attribute:
+    DISABLED_BY_DEFAULT: bool  # default False — set True to start disabled
+
     def __init__(
         self,
         workspace: Workspace,
@@ -119,29 +145,65 @@ class Tool:
         description: str,
     ): ...
 
+    # --- Must implement ---
+
+    @abstractmethod
     def definition(self) -> dict:
-        """Return OpenAI function-calling schema. Must be implemented by subclass."""
-        raise NotImplementedError
+        """Return OpenAI function-calling schema: {"type": "function", "function": {...}}"""
+
+    @abstractmethod
+    def execute(self, **kwargs) -> dict:
+        """Run the tool. Use _ok()/_err() to build the return value."""
+
+    # --- May override ---
 
     def extra_permission_options(self, **kwargs) -> list[str]:
-        """Tool-specific permission options beyond the universal set. Default: []"""
+        """
+        Tool-specific permission options beyond the universal set.
+        Returns opaque label strings — PermissionManager passes them through
+        unchanged and the tool interprets them in on_permission_granted().
+        By convention, file tools use 'file:./path/to/file.txt' or 'dir:./path/to/dir/'.
+        Default: []
+        """
         return []
 
-    def request_permission(self, **kwargs) -> tuple[bool, str]:
-        """Check permission_manager, prompt if needed. Returns (allowed, reason)."""
+    def on_permission_granted(self, choice: str, **kwargs) -> None:
+        """
+        Called by the registry when the user grants permission via a named
+        extra option from extra_permission_options(). Not called for universal
+        choices (yes/always) which return an empty choice string.
+        Default: no-op.
+        """
 
-    def execute(self, **kwargs) -> dict:
+    def reset_session_state(self) -> None:
         """
-        Run the tool and return the canonical tool result as a JSON-serializable
-        dict (e.g., {"status": "success", "data": {...}}). Must be implemented
-        by subclass.
+        Clear all session-scoped in-memory state (e.g. per-path allow-lists).
+        Called by ToolRegistry.reset_session_overrides() on session resume.
+        Default: no-op.
         """
-        raise NotImplementedError
+
+    def request_permission(self, action: str, **kwargs) -> tuple[bool, str]:
+        """
+        Check permission. If permission_required is False, returns (True, '') immediately.
+        Otherwise checks PermissionManager (and any tool-level allow-lists in subclasses),
+        then prompts the user. Returns (allowed, choice_or_reason).
+        Not normally overridden — but file tools override it to check their own allow-lists.
+        """
+
+    # --- Result helpers ---
+
+    @staticmethod
+    def _ok(data: dict | None = None) -> dict:
+        """Return {"status": "success", "data": data or {}} — None is normalised to {}."""
+
+    @staticmethod
+    def _err(error: str, message: str, code: int = 400, details: dict | None = None) -> dict:
+        """Return {"status": "error", "error": error, "message": message, "code": code}"""
 ```
 
 ---
 
-### PermissionManager
+### PermissionManager ✅
 
 ```python
 PERM_YES = "yes"
@@ -161,7 +223,10 @@ class PermissionManager:
     ) -> tuple[bool, str]:
         """
         Check if tool has 'always' grant. If not, prompt the user.
-        Returns (allowed, reason_or_suggestion).
+        Returns (allowed, detail).
+        For 'yes'/'always' (including an existing always-grant bypass), detail is "".
+        If a tool-specific extra option is chosen, detail is that option string.
+        For a 'custom' rejection, detail is the user's message.
         """
 
     def grant_always(self, tool_name: str) -> None:
@@ -175,7 +240,7 @@ class PermissionManager:
 
 ---
 
-### ToolRegistry
+### ToolRegistry ✅
 
 ```python
 class ToolRegistry:
@@ -188,25 +253,35 @@ class ToolRegistry:
 
     def load(self) -> None:
         """
-        Load tools in order: bundled → global (~/.ai-cli/tools/) → project (.ai-cli/tools/).
-        Warn on name collisions. Apply per-tool settings from config.
+        Load tools in order: bundled (via importlib.import_module) →
+        global (~/.ai-cli/tools/) → project (.ai-cli/tools/) (latter two via
+        spec_from_file_location). Warn on name collisions. Apply per-tool
+        settings from config via _apply_config().
         """
+
+    def register(self, tool_cls: type[Tool], tier: str = "programmatic") -> None:
+        """Programmatically register a Tool subclass without file discovery."""
 
     def get(self, name: str) -> Tool | None: ...
 
     def all_enabled(self) -> list[Tool]: ...
 
     def definitions(self) -> list[dict]:
-        """Return OpenAI-format schemas for all enabled tools."""
+        """Return OpenAI-format schemas for all currently enabled tools."""
 
-    def execute(self, name: str, kwargs: dict) -> dict:
-        """Look up tool, request permission, then execute. Returns the tool's canonical result dict."""
+    def execute(self, name: str, kwargs: dict, *, allow_transient: bool = False) -> dict:
+        """
+        Look up tool, request permission (skipped if not permission_required),
+        call on_permission_granted if a named extra option was chosen, then execute.
+        Returns a canonical result dict. allow_transient=True skips the enabled check,
+        for use after enable_transient().
+        """
 
     def enable(self, name: str) -> None:
-        """Enable tool and persist change to project config.yaml."""
+        """Enable tool, clear any session override, persist to project config.yaml."""
 
     def disable(self, name: str) -> None:
-        """Disable tool and persist change to project config.yaml."""
+        """Disable tool, clear any session override, persist to project config.yaml."""
 
     def enable_session(self, name: str) -> None:
         """Enable tool for this session only — no config write."""
@@ -214,97 +289,74 @@ class ToolRegistry:
     def disable_session(self, name: str) -> None:
         """Disable tool for this session only — no config write."""
 
+    def reset_session_overrides(self) -> None:
+        """
+        Clear all session-level overrides and call reset_session_state() on
+        every tool (guarded — one tool failing does not prevent others from
+        being reset). Called on session resume.
+        """
+
     def enable_transient(self, name: str) -> dict | None:
         """
         Return the named tool's OpenAI-format schema for one-call injection
-        without changing its enabled state.  Returns None if unknown.
+        without changing its enabled state. Returns None if unknown.
         Used by tool_manager to inject a tool into a single API call only.
         """
 
     def set_permission_required(self, name: str, value: bool) -> None:
-        """Toggle permission_required and persist to project config.yaml."""
+        """
+        Toggle permission_required and persist to project config.yaml.
+        When value=False, also writes user_confirmed=True so the lowering
+        survives reloads without being blocked as an untrusted project config entry.
+        """
 ```
+
+**Config trust model**: `_apply_config()` applies the merged (global+project) tools dict, but
+lowering `permission_required` from True to False is only allowed when:
+- The setting comes from global config only (not present in project layer), OR
+- The project layer entry has `user_confirmed: true` (written by `set_permission_required()`).
+
+**Enabled state**: two layers in descending priority:
+1. Session override (`_session_overrides`) — cleared on `reset_session_overrides()`
+2. Persistent enabled state (`_enabled`) — initialised from `DISABLED_BY_DEFAULT` at registration time, then overridden by config via `_apply_config()`
+
+At runtime `_is_enabled()` checks session overrides first, then falls back to `_enabled`. There is no separate third layer — the `DISABLED_BY_DEFAULT` attribute only affects the initial value of `_enabled` at load time.
+
+`enable()`/`disable()` clear any session override for the tool before updating persistent state.
 
 ---
 
-### ToolManager (bundled tool)
+### Bundled Tools ✅ (partial)
 
-`tool_manager` is a bundled `Tool` subclass that acts as a gatekeeper for the
-active tool list, keeping the LLM's context lean.
+#### `read_file`
+- `PERMISSION_REQUIRED = False`, enabled by default
+- Parameters: `path` (required), `start_line` (optional, 1-based), `end_line` (optional, 1-based)
+- Response data: `{content, path, start_line, end_line, lines_returned, total_lines}`
+  - For an empty file: `start_line=0, end_line=0, lines_returned=0, total_lines=0`
+- Overrides `request_permission()` to check a session-scoped allow-list before prompting
+- `extra_permission_options()` generates `file:./…` and `dir:./…/` options for each path level up to workspace root
+- `on_permission_granted()` adds the resolved path/dir to `_session_allowed_files` / `_session_allowed_dirs`
+- `reset_session_state()` clears both allow-lists
 
-**Startup behaviour**: `ToolRegistry` respects each tool's own declared defaults
-(and any config overrides), as documented in `project_plan.md`. In the bundled
-distribution, most tools declare themselves disabled by default so that only
-`tool_manager` and a small set (e.g. `read_file`) are enabled at launch. This is
-a convention of the provided tools, not a separate "globally disabled unless
-whitelisted" rule enforced by `ToolRegistry.load()`.
-
-**LLM-facing schema** (two actions):
-
-```json
-{
-  "type": "function",
-  "function": {
-    "name": "tool_manager",
-    "description": "Lists available tools and enables one or more on demand for the next API call.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "action": {
-          "type": "string",
-          "enum": ["list", "enable"],
-          "description": "'list' returns all available tools with one-line descriptions; 'enable' injects one or more tool schemas into the next API call."
-        },
-        "tool_names": {
-          "type": "array",
-          "items": {"type": "string"},
-          "description": "Names of the tools to enable when action is 'enable'. Multiple tools can be requested at once."
-        }
-      },
-      "required": ["action"]
-    }
-  }
-}
-```
-
-`tool_names` is required when `action="enable"`. This is enforced at runtime in
-`tool_manager.execute()` rather than in the JSON schema, because `oneOf` is not
-reliably supported across OpenAI-compatible backends.
-
-**`list` response** (`data` field): array of `{name, description, enabled}` objects
-— enough for the LLM to choose what to enable without the full schemas.
-
-**`enable` response**: calls `ToolRegistry.enable_transient(tool_name)` once per
-entry in `tool_names` and aggregates the returned schemas into the result `data`
-(e.g. `{"inject_tools": [<schema>, ...]}`). Unknown tool names (where
-`enable_transient` returns `None`) are silently skipped for injection and reported
-back in a `warnings.unknown_tools` list so the LLM can correct its request
-(e.g. `{"inject_tools": [...], "warnings": {"unknown_tools": ["bad_name"]}}`).
-The REPL detects the `inject_tools` key and appends all returned schemas to the
-*immediately following* LLM API call only. No state change is made — the tools are
-not added to the enabled list. If any requested tool is already in the enabled set,
-the REPL deduplicates tool schemas before constructing the `tools` parameter so the
-same definition is never sent twice.
-
-**Three enable modes** (in increasing permanence):
-
-| Mode | How | Scope |
-|---|---|---|
-| Transient | `tool_manager` enable | One API call only, no state change |
-| Session | `/tools enable <name> --session` | Current session, reset on exit/resume |
-| Persistent | `/tools enable <name>` | Written to `.ai-cli/config.yaml`, survives sessions |
-
-**Precedence when modes conflict** — higher-precedence modes always win:
-`transient > session > persistent`. Examples:
-- A tool disabled in `.ai-cli/config.yaml` but session-enabled via `--session` is treated as enabled for that session.
-- A tool already session-enabled that is also transiently requested is included once (deduplicated by the REPL).
-
-The LLM never needs to disable tools it requested transiently — the REPL enforces
-the single-call scope automatically.
+#### `write_file`
+- `PERMISSION_REQUIRED = True`, enabled by default
+- Parameters: `path` (required), `content` (required), `start_line` + `end_line` (both optional, must be provided together)
+- Full write (no line args): creates file and any missing parent directories
+- Partial write (file must exist): two modes:
+  - Replacement: `1 ≤ start_line ≤ end_line ≤ total_lines` — replaces those lines
+  - Append-at-EOF: `start_line == end_line == total_lines + 1` — appends after the last line
+- Response data: `{path, summary, lines_written}`
+- Same session-scoped allow-list pattern as `read_file`
 
 ---
 
-### LLMClient
+### ToolManager (bundled tool) 🔲
+
+Deferred until after the REPL is implemented. See `project_plan.md` for design.
+
+---
+
+### LLMClient 🔲
 
 ```python
 # Chunk variants yielded by LLMClient.send():
@@ -350,7 +402,7 @@ def create_llm_client(config_manager: ConfigManager) -> LLMClient:
 
 ---
 
-### SessionManager / Session
+### SessionManager / Session 🔲
 
 ```python
 class SessionManager:
@@ -395,7 +447,7 @@ class Session:
 
 ---
 
-### SessionMeta
+### SessionMeta 🔲
 
 ```python
 @dataclass
@@ -421,7 +473,7 @@ Session folder layout:
 
 ---
 
-### REPL
+### REPL 🔲
 
 ```python
 class REPL:
@@ -461,7 +513,7 @@ class REPL:
 
 ---
 
-### Display
+### Display 🔲
 
 ```python
 class Display:
@@ -497,7 +549,7 @@ class Display:
 
 ---
 
-### MCPManager
+### MCPManager 🔲
 
 ```python
 class MCPManager:
@@ -534,7 +586,7 @@ MCP tools are wrapped in a thin `MCPTool(Tool)` subclass that forwards `execute(
 
 ---
 
-### Completer
+### Completer 🔲
 
 ```python
 class Completer:
@@ -571,7 +623,9 @@ Built on `prompt_toolkit`. Detects `@` / `@!` by inspecting the current word in 
 
 ---
 
-## Entry Point and Startup Sequence
+## Entry Point and Startup Sequence 🔲
+
+Currently `__main__.py` only handles `--init`. The full startup sequence below is planned:
 
 ```python
 # __main__.py
