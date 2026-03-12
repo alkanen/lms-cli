@@ -338,6 +338,26 @@ class TestSessionEnable:
         reg.reset_session_overrides()
         assert not reg._is_enabled("disabled_tool")
 
+    def test_reset_continues_if_one_tool_raises(self, tmp_path):
+        # A bug in one tool's reset hook must not prevent others from being reset.
+        class BrokenResetTool(_EchoTool):
+            NAME = "broken_reset"
+
+            def reset_session_state(self) -> None:
+                raise RuntimeError("oops")
+
+        reg = make_registry(tmp_path, tool_classes=[_EchoTool, BrokenResetTool])
+        reset_called: list[str] = []
+        original = reg.get("echo").reset_session_state
+
+        def tracked_reset() -> None:
+            reset_called.append("echo")
+            original()
+
+        reg.get("echo").reset_session_state = tracked_reset  # type: ignore[method-assign]
+        reg.reset_session_overrides()  # must not raise
+        assert "echo" in reset_called
+
     def test_session_does_not_write_config(self, tmp_path):
         reg = make_registry(tmp_path)
         reg.disable_session("echo")
