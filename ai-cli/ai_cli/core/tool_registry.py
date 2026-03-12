@@ -1,9 +1,10 @@
 """
 ToolRegistry — three-tier tool discovery, loading, and dispatch.
 
-Tools are loaded in order: bundled → global (~/.ai-cli/tools/) → project
-(.ai-cli/tools/).  Later tiers can override earlier ones by name; the user
-is warned at startup when this happens.
+Tools are loaded in order: bundled → global (get_global_dir()/tools/,
+``~/.ai-cli/tools/`` by default) → project (.ai-cli/tools/).  Later tiers
+can override earlier ones by name; the user is warned at startup when this
+happens.
 
 Tool subclasses must define three class-level attributes so the registry
 can instantiate them without knowing their internals:
@@ -21,7 +22,7 @@ without file discovery.
 
 Note: bundled tools (``ai_cli/tools/``) are loaded via
 ``importlib.import_module`` as part of the ``ai_cli`` package, so they can
-use intra-package relative imports freely.  Global (``~/.ai-cli/tools/``)
+use intra-package relative imports freely.  Global (``get_global_dir()/tools/``)
 and project (``.ai-cli/tools/``) tool files are loaded via
 ``importlib.util.spec_from_file_location`` with a synthetic module name and
 are therefore *not* part of any package.  Relative imports and sibling-module
@@ -58,7 +59,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from ai_cli.core.workspace import _DOT_AI_CLI, _GLOBAL_DIR
+from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
 from ai_cli.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -139,7 +140,7 @@ class ToolRegistry:
         bundled_dir = Path(__file__).parent.parent / "tools"
         self._load_bundled(bundled_dir)
 
-        global_tools = _GLOBAL_DIR / "tools"
+        global_tools = get_global_dir() / "tools"
         if global_tools.is_dir():
             self._load_from_directory(global_tools, tier="global")
 

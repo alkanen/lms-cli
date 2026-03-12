@@ -1,15 +1,19 @@
 """Tests for ai_cli.core.workspace.Workspace."""
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+import ai_cli.core.workspace as _ws_module
 from ai_cli.core.workspace import (
     _DOT_AI_CLI,
+    _GLOBAL_INIT_TEMPLATES,
     _INIT_TEMPLATES,
     Workspace,
     WorkspaceError,
+    get_global_dir as _real_get_global_dir,
 )
 
 
@@ -17,9 +21,9 @@ from ai_cli.core.workspace import (
 def isolate_global_dir(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Redirect _GLOBAL_DIR to an empty, isolated tmp dir so real ~/.ai-cli/.ignore is never read."""
+    """Redirect get_global_dir to an empty, isolated tmp dir so real ~/.ai-cli/.ignore is never read."""
     fake_global = tmp_path_factory.mktemp("fake_global_ai_cli")
-    monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", fake_global)
+    monkeypatch.setattr("ai_cli.core.workspace.get_global_dir", lambda: fake_global)
 
 
 @pytest.fixture()
@@ -57,7 +61,9 @@ class TestFindRoot:
 
     def test_skips_global_dir(self, tmp_path, monkeypatch):
         # Pretend home is tmp_path so ~/.ai-cli is tmp_path/.ai-cli
-        monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", tmp_path / _DOT_AI_CLI)
+        monkeypatch.setattr(
+            "ai_cli.core.workspace.get_global_dir", lambda: tmp_path / _DOT_AI_CLI
+        )
         (tmp_path / _DOT_AI_CLI).mkdir(exist_ok=True)
         # A sub-project with its own .ai-cli should still be found
         sub = tmp_path / "project"
@@ -85,6 +91,53 @@ class TestInitialise:
         config.write_text("custom: true\n")
         Workspace.initialise(tmp_path)  # second call
         assert config.read_text() == "custom: true\n"
+
+    def test_config_yaml_has_project_wording(self, tmp_path):
+        Workspace.initialise(tmp_path)
+        content = (tmp_path / _DOT_AI_CLI / "config.yaml").read_text()
+        assert "project" in content.lower()
+
+    def test_system_prompt_mentions_project_override(self, tmp_path):
+        Workspace.initialise(tmp_path)
+        content = (tmp_path / _DOT_AI_CLI / "system_prompt.md").read_text()
+        assert "project" in content.lower()
+
+
+class TestInitialiseGlobal:
+    def test_creates_scaffold_directly_in_global_dir(self, tmp_path):
+        global_dir = tmp_path / "global"
+        Workspace.initialise_global(global_dir)
+        assert global_dir.is_dir()
+        assert (global_dir / "tools").is_dir()
+        for filename in _GLOBAL_INIT_TEMPLATES:
+            assert (global_dir / filename).is_file(), f"{filename} missing"
+
+    def test_does_not_create_nested_dot_ai_cli(self, tmp_path):
+        global_dir = tmp_path / "global"
+        Workspace.initialise_global(global_dir)
+        assert not (global_dir / _DOT_AI_CLI).exists()
+
+    def test_does_not_overwrite_existing_files(self, tmp_path):
+        global_dir = tmp_path / "global"
+        Workspace.initialise_global(global_dir)
+        config = global_dir / "config.yaml"
+        config.write_text("custom: true\n")
+        Workspace.initialise_global(global_dir)  # second call
+        assert config.read_text() == "custom: true\n"
+
+    def test_config_yaml_has_user_wording(self, tmp_path):
+        global_dir = tmp_path / "global"
+        Workspace.initialise_global(global_dir)
+        content = (global_dir / "config.yaml").read_text()
+        assert "user" in content.lower()
+        # Header must not claim this is a "project configuration"
+        assert "project configuration" not in content.lower()
+
+    def test_system_prompt_is_global_default(self, tmp_path):
+        global_dir = tmp_path / "global"
+        Workspace.initialise_global(global_dir)
+        content = (global_dir / "system_prompt.md").read_text()
+        assert "default" in content.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +337,7 @@ class TestIsIgnored:
         fake_global = tmp_path / "global_ai_cli"
         fake_global.mkdir()
         (fake_global / ".ignore").write_text("*.log\n")
-        monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", fake_global)
+        monkeypatch.setattr("ai_cli.core.workspace.get_global_dir", lambda: fake_global)
         # Project re-includes important.log
         (project / _DOT_AI_CLI / ".ignore").write_text("!important.log\n")
         config = MagicMock()
@@ -293,3 +346,38 @@ class TestIsIgnored:
         (project / "important.log").touch()
         assert ws.is_ignored(project / "debug.log")
         assert not ws.is_ignored(project / "important.log")
+
+
+class TestGetGlobalDir:
+    """Tests for the real get_global_dir() function.
+
+    Each test restores the real implementation (overriding the autouse fixture's
+    patch) so env-var behaviour can be exercised directly.
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_real(self, monkeypatch, isolate_global_dir):  # noqa: ARG002
+        """Restore real get_global_dir() after isolate_global_dir has run."""
+        monkeypatch.setattr(
+            "ai_cli.core.workspace.get_global_dir", _real_get_global_dir
+        )
+
+    def test_returns_default_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("AI_CLI_GLOBAL_DIR", raising=False)
+        expected = Path(os.path.abspath(Path.home() / _DOT_AI_CLI))
+        assert _ws_module.get_global_dir() == expected
+
+    def test_env_var_overrides_default(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AI_CLI_GLOBAL_DIR", str(tmp_path))
+        assert _ws_module.get_global_dir() == Path(os.path.abspath(tmp_path))
+
+    def test_env_var_expands_tilde(self, monkeypatch):
+        monkeypatch.setenv("AI_CLI_GLOBAL_DIR", "~/my-ai-cli")
+        result = _ws_module.get_global_dir()
+        assert not str(result).startswith("~")
+        assert result.is_absolute()
+
+    def test_empty_env_var_raises(self, monkeypatch):
+        monkeypatch.setenv("AI_CLI_GLOBAL_DIR", "   ")
+        with pytest.raises(ValueError, match="empty"):
+            _ws_module.get_global_dir()

@@ -3,7 +3,7 @@ ConfigManager — layered YAML configuration loader.
 
 Resolution order (later levels override earlier ones):
 
-1. Global user config:   ~/.ai-cli/config.yaml
+1. Global user config:   get_global_dir()/config.yaml  (``~/.ai-cli/`` by default)
 2. Project config:       <project>/.ai-cli/config.yaml   (if project_root given)
 3. CLI overrides:        passed as a dict at construction time
 
@@ -22,7 +22,7 @@ from typing import Any
 
 import yaml
 
-from ai_cli.core.workspace import _DOT_AI_CLI, _GLOBAL_DIR
+from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
 
 
 class ConfigError(Exception):
@@ -82,7 +82,7 @@ class ConfigManager:
         project_root: Path | None,
         cli_overrides: dict,
     ) -> None:
-        global_cfg = _load_yaml(_GLOBAL_DIR / "config.yaml")
+        global_cfg = _load_yaml(get_global_dir() / "config.yaml")
         project_cfg: dict = {}
         if project_root is not None:
             project_cfg = _load_yaml(project_root / _DOT_AI_CLI / "config.yaml")
