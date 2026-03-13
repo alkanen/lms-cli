@@ -19,7 +19,7 @@ def _isolated_global_dir(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_global = tmp_path_factory.mktemp("fake_global_ai_cli")
-    monkeypatch.setattr("ai_cli.core.workspace._GLOBAL_DIR", fake_global)
+    monkeypatch.setattr("ai_cli.core.workspace.get_global_dir", lambda: fake_global)
 
 
 # ---------------------------------------------------------------------------

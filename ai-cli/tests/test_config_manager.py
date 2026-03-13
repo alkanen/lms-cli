@@ -12,9 +12,11 @@ from ai_cli.core.workspace import _DOT_AI_CLI
 def isolate_global_dir(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Redirect _GLOBAL_DIR to an empty tmp dir so real ~/.ai-cli/config.yaml is never read."""
+    """Redirect get_global_dir to an empty tmp dir so real ~/.ai-cli/config.yaml is never read."""
     fake_global = tmp_path_factory.mktemp("fake_global")
-    monkeypatch.setattr("ai_cli.core.config_manager._GLOBAL_DIR", fake_global)
+    monkeypatch.setattr(
+        "ai_cli.core.config_manager.get_global_dir", lambda: fake_global
+    )
 
 
 @pytest.fixture()
@@ -23,7 +25,9 @@ def global_dir(
 ) -> Path:
     """A writable fake global dir, already patched into ConfigManager."""
     fake_global = tmp_path_factory.mktemp("global_ai_cli")
-    monkeypatch.setattr("ai_cli.core.config_manager._GLOBAL_DIR", fake_global)
+    monkeypatch.setattr(
+        "ai_cli.core.config_manager.get_global_dir", lambda: fake_global
+    )
     return fake_global
 
 

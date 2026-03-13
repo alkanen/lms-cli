@@ -1,6 +1,7 @@
 openai
-websockets
-rich
 pyyaml
 prompt_toolkit
 python-dotenv
+rich
+tiktoken
+websockets

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError
+from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +51,20 @@ def main() -> None:
     args = parse_args()
     start = Path(args.workspace).resolve() if args.workspace else Path.cwd()
 
-    _load_dotenv(start)
+    try:
+        _load_dotenv(start)
+        global_dir = get_global_dir()
+    except ValueError as exc:
+        print("Error: invalid AI_CLI_GLOBAL_DIR environment variable.", file=sys.stderr)
+        print(f"Details: {exc}", file=sys.stderr)
+        print(
+            "Please unset AI_CLI_GLOBAL_DIR or set it to a valid, non-empty path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not _ensure_global_dir(global_dir):
+        sys.exit(0)
 
     if args.init:
         _cmd_init(start)
@@ -59,6 +72,59 @@ def main() -> None:
 
     print("ai-cli: REPL not yet implemented.", file=sys.stderr)
     sys.exit(1)
+
+
+def _ensure_global_dir(global_dir: Path) -> bool:
+    """
+    Check that *global_dir* exists and is a directory.
+
+    - If it is a directory: return True immediately.
+    - If it exists but is not a directory (file or broken symlink): print an
+      error and exit.
+    - If it does not exist: prompt the user to create it.
+
+    Returns True to continue startup, False to abort cleanly.
+    """
+    if global_dir.is_dir():
+        return True
+
+    if global_dir.exists() or global_dir.is_symlink():
+        print(
+            f"Error: global config path exists but is not a directory: {global_dir}",
+            file=sys.stderr,
+        )
+        print(
+            "Please remove or rename this path, or set AI_CLI_GLOBAL_DIR to a "
+            "different directory.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        f"Global config directory not found: {global_dir}\n"
+        "ai-cli stores your personal settings (model config, global tools, ignore rules)\n"
+        "in this directory.\n"
+        "\n"
+        "Tip: set the AI_CLI_GLOBAL_DIR environment variable to use a different location.\n"
+    )
+    try:
+        answer = input("Create it now? [Y/n] ").strip().lower()
+    except EOFError:
+        answer = ""  # non-interactive: default to yes
+
+    if answer not in ("", "y", "yes"):
+        print("Aborted. Set AI_CLI_GLOBAL_DIR or create the directory manually.")
+        return False
+
+    try:
+        Workspace.initialise_global(global_dir)
+    except (WorkspaceError, OSError) as exc:
+        print(f"Error creating global config directory: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Created global config directory: {global_dir}")
+    print("Edit the config.yaml there to configure your default backend and model.")
+    return True
 
 
 def _cmd_init(path: Path) -> None:

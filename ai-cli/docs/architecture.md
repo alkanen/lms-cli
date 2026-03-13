@@ -356,14 +356,24 @@ Deferred until after the REPL is implemented. See `project_plan.md` for design.
 
 ---
 
-### LLMClient 🔲
+### LLMClient ✅ (OpenAI-compatible REST only)
+
+**Known limitation**: when using a local server (e.g. LM Studio) that needs to
+load the requested model on first request, `send()` may hang indefinitely until
+the model finishes loading. A configurable request timeout on `OpenAIClient` is
+🔲 planned.
+
+
 
 ```python
 # Chunk variants yielded by LLMClient.send():
 #   {"type": "text",      "delta": str}          — streamed text token
 #   {"type": "tool_call", "name": str,
 #    "call_id": str,      "arguments": dict}      — complete tool invocation
-#   {"type": "done",      "stop_reason": str}     — stream finished
+#   {"type": "done",      "stop_reason": str,
+#    "usage": {"prompt_tokens": int,              — always present; zeros if server
+#              "completion_tokens": int,             omits usage data
+#              "total_tokens": int}}              — stream finished
 
 class LLMClient(ABC):
     @abstractmethod
@@ -373,8 +383,9 @@ class LLMClient(ABC):
         tools: list[dict],
         stream: bool = True,
     ) -> Iterator[dict]: ...
-    # Yields Chunk dicts (see types above). The REPL routes "tool_call" chunks
-    # to ToolRegistry.execute() and streams "text" chunks to Display.
+    # Yields the same Chunk types regardless of stream=True/False.
+    # stream=True (default): text deltas arrive immediately, tool calls assembled from deltas.
+    # stream=False: entire response awaited first, same Chunk sequence produced.
 
     @abstractmethod
     def get_model_metadata(self) -> dict:

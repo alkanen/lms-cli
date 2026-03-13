@@ -2,9 +2,11 @@
 Workspace — project root resolution and file operations.
 
 The workspace root is the nearest ancestor directory that contains a
-`.ai-cli/` subdirectory.  The home directory is skipped even if it
-contains `.ai-cli/`, because `~/.ai-cli/` is reserved for global user
-settings and must never be treated as a project root.
+`.ai-cli/` subdirectory.  Any directory whose `.ai-cli/` subdirectory
+resolves to the global config directory (as returned by
+``get_global_dir()``) is excluded as a project root.  For the default
+setup this means the user's home directory is never returned as a project
+root, because ``~/.ai-cli/`` is reserved for global user settings.
 
 All file operations are expressed in terms of paths relative to the
 workspace root.  Tools that need to operate outside the workspace must
@@ -14,6 +16,7 @@ relevant OS primitives directly.
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 
@@ -22,8 +25,30 @@ from ai_cli.utils.ignore_filter import IgnoreFilter
 # Sentinel directory name used for both global and project config.
 _DOT_AI_CLI = ".ai-cli"
 
-# Reserved global config directory — never treated as a project root.
-_GLOBAL_DIR = Path.home() / _DOT_AI_CLI
+
+def get_global_dir() -> Path:
+    """
+    Return the global config directory as an absolute ``Path``.
+
+    Defaults to ``~/.ai-cli/``.  Override at runtime by setting the
+    ``AI_CLI_GLOBAL_DIR`` environment variable **before** (or via) ``.env``.
+
+    Raises ``ValueError`` if ``AI_CLI_GLOBAL_DIR`` is set to an empty string.
+    Relative paths and ``~`` are expanded and made absolute, but symlinks are
+    *not* resolved so that callers can detect broken symlinks at the configured
+    location (e.g. to report a useful error rather than silently creating a new
+    directory at the resolved target).
+    """
+    env_val = os.getenv("AI_CLI_GLOBAL_DIR")
+    if env_val is not None:
+        if not env_val.strip():
+            raise ValueError(
+                "AI_CLI_GLOBAL_DIR is set but empty. "
+                "Provide a non-empty path or unset the variable to use the default (~/.ai-cli)."
+            )
+        return Path(os.path.abspath(Path(env_val).expanduser()))
+    return Path(os.path.abspath(Path.home() / _DOT_AI_CLI))
+
 
 # Template contents written by --init.
 _INIT_TEMPLATES: dict[str, str] = {
@@ -40,7 +65,7 @@ _INIT_TEMPLATES: dict[str, str] = {
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
-             Overrides the built-in default when present. -->
+             Overrides the global default system prompt when present. -->
     """),
     ".ignore": textwrap.dedent("""\
         # Files and directories the LLM and tools should not read or modify.
@@ -51,6 +76,26 @@ _INIT_TEMPLATES: dict[str, str] = {
         .env
         .env.*
     """),
+}
+
+_GLOBAL_INIT_TEMPLATES: dict[str, str] = {
+    "config.yaml": textwrap.dedent("""\
+        # ai-cli user configuration overrides
+        # Values here apply to all projects unless overridden by a project-level config.
+        # See docs/project_plan.md for available keys.
+        #
+        # backend: openai          # or: lmstudio
+        # model: gpt-4o
+        # base_url: https://api.openai.com/v1
+        # api_key_env: OPENAI_API_KEY   # name of the env-var holding the key
+        # context_window: 128000
+        # max_response_tokens: 4096
+    """),
+    "system_prompt.md": textwrap.dedent("""\
+        <!-- Default system prompt — applied to all projects unless a
+             project-level system_prompt.md is present. -->
+    """),
+    ".ignore": _INIT_TEMPLATES[".ignore"],
 }
 
 
@@ -94,7 +139,7 @@ class Workspace:
         # match wins".  Using one shared root also ensures global patterns
         # are evaluated against workspace-relative paths, not `~/.ai-cli/`.
         combined = IgnoreFilter.read_patterns(
-            _GLOBAL_DIR / ".ignore"
+            get_global_dir() / ".ignore"
         ) + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
         self._ignore_filter = IgnoreFilter(self._root, combined)
 
@@ -122,22 +167,27 @@ class Workspace:
         Walk up from *start*, returning the first directory that contains
         a `.ai-cli/` subdirectory.
 
-        `~/.ai-cli/` is skipped because it is the reserved global config
-        directory, not a project root.
+        A candidate is skipped if its `.ai-cli/` subdirectory resolves to
+        the global config directory returned by ``get_global_dir()``.  This
+        prevents the directory *containing* the global config directory (e.g.
+        the user's home directory) from being treated as a project root.
 
         Returns ``None`` if no project root is found before reaching the
         filesystem root.
+
+        Raises
+        ------
+        ValueError
+            If ``get_global_dir()`` raises — e.g. when ``AI_CLI_GLOBAL_DIR``
+            is set to an empty or whitespace-only string.
         """
         start = start.resolve()
+        global_dir = get_global_dir().resolve()
         candidate = start
         while True:
             dot = candidate / _DOT_AI_CLI
-            if (
-                dot.is_dir()
-                and candidate.resolve() != _GLOBAL_DIR.parent
-                # Extra guard: never return home dir as root via ~/.ai-cli
-                and dot.resolve() != _GLOBAL_DIR.resolve()
-            ):
+            # Never treat the global config directory itself as a project root.
+            if dot.is_dir() and dot.resolve() != global_dir:
                 return candidate
             parent = candidate.parent
             if parent == candidate:
@@ -155,10 +205,34 @@ class Workspace:
         files and does not delete unrecognised content.
         """
         dot = path.resolve() / _DOT_AI_CLI
+        Workspace._write_scaffold(dot)
+
+    @staticmethod
+    def initialise_global(global_dir: Path) -> None:
+        """
+        Create the global config directory scaffold at *global_dir* itself.
+
+        Unlike ``initialise()``, which creates a ``.ai-cli/`` subdirectory
+        under the given path, this method writes template files directly into
+        *global_dir* — because the global directory (e.g. ``~/.ai-cli/``) is
+        already the config directory, not its parent.
+
+        Does not overwrite existing files.
+        """
+        Workspace._write_scaffold(global_dir.resolve(), _GLOBAL_INIT_TEMPLATES)
+
+    @staticmethod
+    def _write_scaffold(
+        dot: Path,
+        templates: dict[str, str] | None = None,
+    ) -> None:
+        """Create template files and subdirectories inside *dot*."""
+        if templates is None:
+            templates = _INIT_TEMPLATES
         dot.mkdir(parents=True, exist_ok=True)
         (dot / "tools").mkdir(exist_ok=True)
 
-        for filename, content in _INIT_TEMPLATES.items():
+        for filename, content in templates.items():
             target = dot / filename
             if not target.exists():
                 target.write_text(content, encoding="utf-8")
