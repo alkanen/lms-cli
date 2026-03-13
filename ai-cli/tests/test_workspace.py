@@ -13,6 +13,8 @@ from ai_cli.core.workspace import (
     _INIT_TEMPLATES,
     Workspace,
     WorkspaceError,
+)
+from ai_cli.core.workspace import (
     get_global_dir as _real_get_global_dir,
 )
 

@@ -17,9 +17,9 @@ ai-cli/
 │   │   ├── workspace.py          # ✅ Workspace root resolution, file ops, ignore rules
 │   │   ├── permission_manager.py # ✅ In-memory permission state
 │   │   ├── tool_registry.py      # ✅ Three-tier tool discovery, loading, settings
-│   │   ├── llm_client.py         # 🔲 Abstract LLMClient + OpenAI/LMStudio implementations
+│   │   ├── llm_client.py         # ✅ Abstract LLMClient + OpenAI-compatible implementation
 │   │   ├── mcp_manager.py        # 🔲 MCP server connections, tool exposure
-│   │   └── session_manager.py    # 🔲 Session create/resume/compact/persist
+│   │   └── session_manager.py    # ✅ Session create/resume/compact/persist
 │   ├── tools/
 │   │   ├── base.py               # ✅ Tool abstract base class
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
@@ -413,7 +413,7 @@ def create_llm_client(config_manager: ConfigManager) -> LLMClient:
 
 ---
 
-### SessionManager / Session 🔲
+### SessionManager / Session ✅
 
 ```python
 class SessionManager:
@@ -435,7 +435,12 @@ class SessionManager:
 
 
 class Session:
-    def __init__(self, session_id: str, session_dir: Path): ...
+    def __init__(
+        self,
+        session_id: str,
+        session_dir: Path,
+        llm_client: LLMClient,
+    ): ...
 
     def add_message(self, role: str, content: str) -> None:
         """Append to both history_full.jsonl and history_current.jsonl."""
@@ -453,12 +458,12 @@ class Session:
         """Returns (used_tokens, context_window)."""
 
     def should_compact(self) -> bool:
-        """True if used_tokens > context_window * 0.9."""
+        """True if (used_tokens + overhead) > context_window * 0.9."""
 ```
 
 ---
 
-### SessionMeta 🔲
+### SessionMeta ✅
 
 ```python
 @dataclass

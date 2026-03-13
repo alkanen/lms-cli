@@ -23,6 +23,7 @@ class _FakeRateLimitError(Exception):
 class _FakeAPIConnectionError(Exception):
     pass
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
