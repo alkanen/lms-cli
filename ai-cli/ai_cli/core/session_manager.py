@@ -111,6 +111,8 @@ class Session:
         self._meta_path = self._dir / "metadata.yaml"
         self._full_path = self._dir / "history_full.jsonl"
         self._current_path = self._dir / "history_current.jsonl"
+        # Last API-reported prompt token count; None until the first turn.
+        self._last_prompt_tokens: int | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -132,7 +134,11 @@ class Session:
 
     def add_message(self, role: str, content: str) -> None:
         """
-        Append *role*/*content* to both history files and update metadata.
+        Append a simple *role*/*content* message to both history files.
+
+        For assistant messages that include tool calls, or for tool result
+        messages that require ``tool_call_id``, use :meth:`add_raw_message`
+        instead.
 
         ``history_full.jsonl`` records every message with a UTC timestamp.
         ``history_current.jsonl`` stores only the messages the LLM will see
@@ -147,10 +153,55 @@ class Session:
             raise SessionError(
                 f"Invalid role {role!r}; must be one of {sorted(_VALID_ROLES)}"
             )
+        self._append_message({"role": role, "content": content})
+
+    def add_raw_message(self, message: dict) -> None:
+        """
+        Append an arbitrary OpenAI-format message dict to both history files.
+
+        Use this for:
+
+        * Assistant messages that contain tool calls::
+
+            {
+                "role": "assistant",
+                "content": "text or None",
+                "tool_calls": [
+                    {"id": "call_id", "type": "function",
+                     "function": {"name": "...", "arguments": "..."}}
+                ],
+            }
+
+        * Tool result messages::
+
+            {"role": "tool", "tool_call_id": "call_id", "content": "result"}
+
+        The ``role`` field must be present and a valid role string.
+        """
+        if not isinstance(message, dict):
+            raise SessionError(
+                f"add_raw_message() requires a dict; got {type(message).__name__!r}"
+            )
+        role = message.get("role")
+        if not isinstance(role, str) or role not in _VALID_ROLES:
+            raise SessionError(
+                f"Invalid or missing role in message; must be one of {sorted(_VALID_ROLES)}"
+            )
+        self._append_message(message)
+
+    def _append_message(self, message: dict) -> None:
+        """Write *message* to both history files and update metadata."""
+        role: str = message["role"]
+        content = message.get("content") or ""
 
         now = datetime.now(timezone.utc).isoformat()
-        current_entry = json.dumps({"role": role, "content": content})
-        full_entry = json.dumps({"role": role, "content": content, "timestamp": now})
+        try:
+            current_entry = json.dumps(message)
+            full_entry = json.dumps({**message, "timestamp": now})
+        except (TypeError, ValueError) as exc:
+            raise SessionError(
+                f"Message is not JSON-serialisable for session {self._id}: {exc}"
+            ) from exc
 
         current_size = (
             self._current_path.stat().st_size if self._current_path.exists() else 0
@@ -169,7 +220,9 @@ class Session:
             ) from exc
 
         try:
-            self._update_meta_after_message(role, content)
+            self._update_meta_after_message(
+                role, content if isinstance(content, str) else ""
+            )
         except SessionError:
             # History writes succeeded but metadata failed — roll back history so
             # the two history files and metadata stay in sync.
@@ -179,8 +232,18 @@ class Session:
     def get_messages(self) -> list[dict]:
         """Return messages from ``history_current.jsonl`` as a list of dicts.
 
-        Lines that are not valid JSON or that lack string ``role``/``content``
-        fields are skipped with a warning rather than raising.
+        Each returned dict contains at minimum ``role``.  Depending on the
+        message type, additional fields are passed through:
+
+        * Plain messages: ``{"role": ..., "content": ...}``
+        * Assistant tool-call messages: ``{"role": "assistant", "content": ...,
+          "tool_calls": [...]}`` — ``content`` may be ``None``.
+        * Tool result messages: ``{"role": "tool", "tool_call_id": ...,
+          "content": ...}``
+
+        Lines that are not valid JSON, have an invalid/missing ``role``, or
+        carry neither ``content`` nor ``tool_calls`` are skipped with a
+        warning rather than raising.
 
         Raises
         ------
@@ -215,18 +278,31 @@ class Session:
                             type(entry).__name__,
                         )
                         continue
-                    if not isinstance(entry.get("role"), str) or not isinstance(
-                        entry.get("content"), str
-                    ):
+                    role = entry.get("role")
+                    if not isinstance(role, str) or role not in _VALID_ROLES:
                         logger.warning(
-                            "Skipping line %d in %s: missing or non-string role/content",
+                            "Skipping line %d in %s: missing or invalid role",
                             lineno,
                             self._current_path,
                         )
                         continue
-                    messages.append(
-                        {"role": entry["role"], "content": entry["content"]}
-                    )
+                    # Build the message for the LLM, passing through protocol fields.
+                    # Tool-call messages may omit content or carry tool_calls/tool_call_id.
+                    msg: dict = {"role": role}
+                    if "content" in entry:
+                        msg["content"] = entry["content"]
+                    if "tool_calls" in entry:
+                        msg["tool_calls"] = entry["tool_calls"]
+                    if "tool_call_id" in entry:
+                        msg["tool_call_id"] = entry["tool_call_id"]
+                    if "content" not in msg and "tool_calls" not in msg:
+                        logger.warning(
+                            "Skipping line %d in %s: no content or tool_calls field",
+                            lineno,
+                            self._current_path,
+                        )
+                        continue
+                    messages.append(msg)
         except (OSError, UnicodeDecodeError) as exc:
             raise SessionError(
                 f"Could not read history file {self._current_path}: {exc}"
@@ -337,22 +413,68 @@ class Session:
         """Return a copy of the session's metadata as a plain dict."""
         return self._read_meta()
 
+    def clear(self) -> None:
+        """
+        Delete ``history_current.jsonl`` and reset message metadata.
+
+        ``history_full.jsonl`` is left intact for archival purposes.
+        """
+        try:
+            if self._current_path.exists():
+                self._current_path.unlink()
+        except OSError as exc:
+            raise SessionError(
+                f"Could not clear history for session {self._id}: {exc}"
+            ) from exc
+        meta = self._read_meta()
+        meta["message_count"] = 0
+        meta["first_user_message"] = ""
+        meta["last_message_role"] = ""
+        meta["last_message_preview"] = ""
+        self._write_meta(meta)
+        self._last_prompt_tokens = None
+
     def set_name(self, name: str) -> None:
         """Persist *name* to ``metadata.yaml``."""
         meta = self._read_meta()
         meta["name"] = name
         self._write_meta(meta)
 
+    def record_usage(self, prompt_tokens: int) -> None:
+        """Store the API-reported prompt token count for the most recent turn.
+
+        Call this with the ``prompt_tokens`` value from the ``done`` chunk
+        returned by :meth:`LLMClient.send`.  Subsequent calls to
+        :meth:`token_usage` will return this value as ground truth instead of
+        falling back to the local token estimator.
+
+        Raises
+        ------
+        SessionError
+            If *prompt_tokens* is not a non-negative integer.
+        """
+        if not isinstance(prompt_tokens, int) or prompt_tokens < 0:
+            raise SessionError(
+                f"prompt_tokens must be a non-negative integer; got {prompt_tokens!r}"
+            )
+        self._last_prompt_tokens = prompt_tokens
+
     def token_usage(self) -> tuple[int, int]:
         """
         Return ``(used_tokens, context_window)``.
 
-        *used_tokens* is estimated via the LLM client's token counter.
-        *context_window* comes from the LLM client's model metadata.
+        If the API has reported token usage via :meth:`record_usage`, that
+        value is used as ground truth.  Otherwise the LLM client's local token
+        estimator is used as a best-effort fallback (note: the estimator does
+        not account for tool-call payloads and may undercount).
+
+        *context_window* always comes from the LLM client's model metadata.
         """
+        context_window: int = self._llm.get_model_metadata()["context_window"]
+        if self._last_prompt_tokens is not None:
+            return self._last_prompt_tokens, context_window
         messages = self.get_messages()
         used = self._llm.count_tokens(messages)
-        context_window: int = self._llm.get_model_metadata()["context_window"]
         return used, context_window
 
     def should_compact(self) -> bool:

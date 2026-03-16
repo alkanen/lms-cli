@@ -483,6 +483,36 @@ class TestSessionTokens:
         session = _make_session(tmp_path, llm)
         assert session.should_compact() is True
 
+    def test_record_usage_overrides_estimator(self, tmp_path):
+        # Estimator says 500; API says 7000 → token_usage returns API value.
+        llm = _make_llm(count_tokens=500, context_window=8000)
+        session = _make_session(tmp_path, llm)
+        session.record_usage(7000)
+        used, window = session.token_usage()
+        assert used == 7000
+        assert window == 8000
+        # count_tokens should not have been called.
+        llm.count_tokens.assert_not_called()
+
+    def test_record_usage_zero_is_stored(self, tmp_path):
+        # Zero is a valid API-reported value and must override the estimator.
+        llm = _make_llm(count_tokens=500, context_window=8000)
+        session = _make_session(tmp_path, llm)
+        session.record_usage(0)
+        used, _ = session.token_usage()
+        assert used == 0
+        llm.count_tokens.assert_not_called()
+
+    def test_clear_resets_token_cache(self, tmp_path):
+        # After clear(), token_usage should fall back to the estimator again.
+        llm = _make_llm(count_tokens=100, context_window=8000)
+        session = _make_session(tmp_path, llm)
+        session.record_usage(7000)
+        session.clear()
+        used, _ = session.token_usage()
+        assert used == 100  # estimator called, not cached value
+        llm.count_tokens.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Session — compact

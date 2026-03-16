@@ -5,8 +5,7 @@ Run with:  python -m ai_cli [options]
 
 Currently implemented:
   --init [--workspace PATH]   Scaffold a .ai-cli/ project directory.
-
-Everything else prints "not yet implemented" and exits.
+  (no flags)                  Start the interactive REPL.
 """
 
 from __future__ import annotations
@@ -17,6 +16,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ai_cli.cli.display import create_display
+from ai_cli.cli.repl import REPL
+from ai_cli.core.config_manager import ConfigError, ConfigManager
+from ai_cli.core.llm_client import LLMError, create_llm_client
+from ai_cli.core.permission_manager import PermissionManager
+from ai_cli.core.session_manager import SessionError, SessionManager
+from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
 
 
@@ -70,8 +76,43 @@ def main() -> None:
         _cmd_init(start)
         return
 
-    print("ai-cli: REPL not yet implemented.", file=sys.stderr)
-    sys.exit(1)
+    _cmd_repl(start, global_dir)
+
+
+def _cmd_repl(start: Path, global_dir: Path) -> None:
+    """Bootstrap all core objects and start the interactive REPL."""
+    root = Workspace.find_root(start)
+    if root is None:
+        print(
+            f"No .ai-cli/ project found in '{start}' or any parent directory.\n"
+            "Run 'ai-cli --init' to create one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        config = ConfigManager(root, {})
+        workspace = Workspace(root, config)
+        llm_client = create_llm_client(config)
+    except (ConfigError, WorkspaceError, LLMError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions_dir = global_dir / "sessions"
+    display = create_display(config)
+    permission_manager = PermissionManager(prompt_fn=display.show_permission_prompt)
+    tool_registry = ToolRegistry(workspace, config, permission_manager)
+    tool_registry.load()
+
+    try:
+        session_manager = SessionManager(workspace, llm_client, sessions_dir)
+        session = session_manager.new()
+    except SessionError as exc:
+        print(f"Error creating session: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    repl = REPL(session, tool_registry, llm_client, display, workspace)
+    repl.run()
 
 
 def _ensure_global_dir(global_dir: Path) -> bool:

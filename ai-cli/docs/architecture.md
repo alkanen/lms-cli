@@ -25,10 +25,10 @@ ai-cli/
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
 │   │   └── tool_manager.py       # 🔲 Context-saving tool gatekeeper (deferred until after REPL)
-│   ├── cli/                      # 🔲
-│   │   ├── repl.py               # 🔲 Main REPL loop, input handling, slash commands
+│   ├── cli/                      # ✅ (partial)
+│   │   ├── repl.py               # ✅ Main REPL loop, input handling, slash commands
 │   │   ├── completer.py          # 🔲 Tab completion + @ file picker
-│   │   └── display.py            # 🔲 Rich output, summary/verbose modes
+│   │   └── display.py            # ✅ Display ABC + PlainDisplay; RichDisplay 🔲
 │   └── utils/
 │       ├── ignore_filter.py      # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py      # 🔲 JSONL structured logging
@@ -451,6 +451,12 @@ class Session:
     def compact(self, instructions: str = "") -> None:
         """Request summary from LLM, rewrite history_current.jsonl."""
 
+    def clear(self) -> None:
+        """Delete history_current.jsonl and reset message metadata. Preserves history_full.jsonl."""
+
+    def get_meta(self) -> dict:
+        """Return a copy of the session's metadata as a plain dict."""
+
     def set_name(self, name: str) -> None:
         """Write name to metadata.yaml."""
 
@@ -489,7 +495,7 @@ Session folder layout:
 
 ---
 
-### REPL 🔲
+### REPL ✅
 
 ```python
 class REPL:
@@ -499,28 +505,34 @@ class REPL:
         tool_registry: ToolRegistry,
         llm_client: LLMClient,
         display: Display,
-        permission_manager: PermissionManager,
+        workspace: Workspace,
     ): ...
 
-    def run(self) -> None:
-        """Main loop: read input → route → render."""
+    def run(self, *, _prompt_session: PromptSession | None = None) -> None:
+        """
+        Main loop: read input → route → render.
+        _prompt_session is injectable for testing (avoids real terminal/filesystem).
+        Uses PromptSession with FileHistory at ~/.ai-cli/history by default.
+        """
 
     def _handle_input(self, raw: str) -> None:
         """Route to _handle_slash_command or _send_to_llm."""
 
     def _handle_slash_command(self, command: str) -> None:
-        """Dispatch /help, /exit, /clear, /tools, /compact, /session."""
+        """Dispatch /help, /exit, /clear, /verbose, /markdown, /tools, /compact, /session."""
+
+    def _preprocess_at_references(self, text: str) -> str:
+        """
+        Replace @path and @!path tokens with file content wrapped in [file: path]...[/file].
+        @path respects ignore rules; @!path bypasses them.
+        On any error the token is left in place and an error is shown.
+        """
 
     def _send_to_llm(self, user_input: str) -> None:
         """
         Append user message, stream response, detect tool calls,
         execute via tool_registry, feed results back, continue streaming.
-
-        Special case — transient tool injection: when a tool_manager result
-        contains an ``inject_tools`` key, the schemas listed there are appended
-        to the tools parameter of the *immediately following* API call only.
-        Schemas are deduplicated against the already-enabled set before sending
-        so the same definition is never passed twice.
+        Tool call depth capped at _MAX_TOOL_ROUNDS = 10.
         """
 
     def _check_compaction(self) -> None:
@@ -529,38 +541,72 @@ class REPL:
 
 ---
 
-### Display 🔲
+### Display ✅ (PlainDisplay only; RichDisplay 🔲)
 
 ```python
-class Display:
-    def __init__(self, verbose: bool = False): ...
+class Display(ABC):
+    """
+    Mode flags (concrete on the ABC, not abstract):
+      verbose: bool                — show full tool args/results
+      markdown_enabled: bool       — render Markdown in LLM output
+      toggle_verbose() -> None
+      toggle_markdown() -> None
+    """
 
-    def toggle_verbose(self) -> None: ...
+    # Streaming — called once per LLM response
+    @abstractmethod
+    def begin_assistant_turn(self) -> None: ...
+    @abstractmethod
+    def stream_text(self, delta: str) -> None: ...
+    @abstractmethod
+    def end_assistant_turn(self) -> None: ...
 
-    def show_assistant_message(self, text: str) -> None:
-        """Always shown in full regardless of mode."""
-
+    # Tool activity
+    @abstractmethod
     def show_tool_call(self, name: str, args: dict) -> None:
-        """Summary mode: one line. Verbose: full args."""
-
-    def show_tool_result(self, name: str, result: str) -> None:
+        """Summary mode: one line. Verbose: full JSON args."""
+    @abstractmethod
+    def show_tool_result(self, name: str, result: dict) -> None:
         """Summary mode: hidden. Verbose: full output."""
 
-    def show_status(self, message: str) -> None:
-        """Informational messages (compaction notices, warnings, etc.)."""
+    # Informational
+    @abstractmethod
+    def show_status(self, message: str) -> None: ...
+    @abstractmethod
+    def show_error(self, message: str) -> None:
+        """Writes to sys.stderr."""
 
-    def show_error(self, message: str) -> None: ...
+    # Slash-command output
+    @abstractmethod
+    def show_help(self, commands: list[tuple[str, str]]) -> None: ...
+    @abstractmethod
+    def show_tool_list(self, tools: list[Tool]) -> None: ...
+    @abstractmethod
+    def show_session_info(self, session: Session) -> None:
+        """Calls session.get_meta() — not _read_meta()."""
 
+    # Interactive prompts
+    @abstractmethod
     def show_permission_prompt(
         self,
         question: str,
-        universal_options: list[str],
         extra_options: list[str],
     ) -> tuple[str, str]:
-        """Render permission prompt, return (choice, user_text)."""
-
+        """
+        Render permission prompt, return (choice, user_text).
+        Universal options: yes/no/always/custom (with message).
+        EOFError / KeyboardInterrupt → ("no", "").
+        """
+    @abstractmethod
     def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
-        """Render interactive resume picker, return chosen session."""
+        """Render interactive resume picker, return chosen session or None."""
+
+
+def create_display(config: ConfigManager, *, verbose: bool = False) -> Display:
+    """
+    Factory: reads display_backend and display_markdown from config.
+    'plain' → PlainDisplay. Unknown/unimplemented backends warn and fall back to PlainDisplay.
+    """
 ```
 
 ---
@@ -677,8 +723,8 @@ def main():
     session = resolve_session(args, session_manager, workspace)
 
     # 5. Start REPL
-    display = Display()
-    repl = REPL(session, tool_registry, llm_client, display, permission_manager)
+    display = create_display(config)
+    repl = REPL(session, tool_registry, llm_client, display, workspace)
     repl.run()
 
     # 6. Cleanup
