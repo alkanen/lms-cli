@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
 
 
@@ -25,6 +26,9 @@ def isolate_global_dir(
     fake_global = tmp_path_factory.mktemp("fake_global")
     monkeypatch.setattr("ai_cli.core.workspace.get_global_dir", lambda: fake_global)
     monkeypatch.setattr("ai_cli.__main__.get_global_dir", lambda: fake_global)
+    # Prevent the REPL from actually starting in tests that only care about
+    # startup/init logic.  Tests that specifically exercise _cmd_repl override this.
+    monkeypatch.setattr("ai_cli.__main__._cmd_repl", lambda *_: sys.exit(1))
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,15 @@ class TestNoSubcommand:
         with pytest.raises(SystemExit) as exc_info:
             run_main([])
         assert exc_info.value.code != 0
+
+    def test_no_workspace_exits_nonzero(self, tmp_path, capsys):
+        """_cmd_repl exits nonzero when no .ai-cli/ project is found."""
+        # Call the real _cmd_repl (imported at module level, before autouse patching).
+        # tmp_path has no .ai-cli/ so find_root returns None.
+        with pytest.raises(SystemExit) as exc_info:
+            _real_cmd_repl(tmp_path, tmp_path)
+        assert exc_info.value.code != 0
+        assert ".ai-cli" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

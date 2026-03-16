@@ -114,20 +114,43 @@ def _send_to_llm(self, user_input: str) -> None:
                 ...  # capture usage if needed
         self._display.end_assistant_turn()
 
-        # Record the assistant's reply (text + any tool calls)
+        # Record the assistant's reply using OpenAI tool-calling protocol.
+        # When tool calls are present the assistant message MUST include the
+        # tool_calls array so the LLM can associate each result with its request.
         full_text = "".join(text_parts)
-        if full_text:
+        if tool_calls:
+            self._session.add_raw_message({
+                "role": "assistant",
+                "content": full_text or None,
+                "tool_calls": [
+                    {
+                        "id": call["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": json.dumps(call["arguments"]),
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
+        elif full_text:
             self._session.add_message("assistant", full_text)
 
         if not tool_calls:
             break  # no tools called — exchange complete
 
-        # Execute each tool and feed results back
+        # Execute each tool and feed results back.
+        # Tool result messages must carry tool_call_id to match the assistant's request.
         for call in tool_calls:
             self._display.show_tool_call(call["name"], call["arguments"])
             result = self._tool_registry.execute(call["name"], call["arguments"])
             self._display.show_tool_result(call["name"], result)
-            self._session.add_message("tool", json.dumps(result))
+            self._session.add_raw_message({
+                "role": "tool",
+                "tool_call_id": call["call_id"],
+                "content": json.dumps(result),
+            })
 
         # Loop: LLM sees tool results and continues
 

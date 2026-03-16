@@ -85,6 +85,47 @@ if it fails, consistent with how other malformed entries are handled.
 
 ---
 
+## VULN-004 — `get_messages()` passes through unvalidated field values for tool-call messages
+
+**Component:** `ai_cli/core/session_manager.py` — `Session.get_messages()`
+
+**Severity:** Low (requires a manually edited or externally corrupted history file)
+
+**Status:** Deferred
+
+### Description
+
+`get_messages()` validates that `role` is a known value, and that each message
+contains at least one of `content` or `tool_calls`.  However, it does not
+validate the *types* of those fields per role:
+
+- A `tool` message with a non-string `content` is passed through unchecked.
+- An `assistant` tool-call message with a malformed `tool_calls` value (e.g.
+  a string instead of a list) is passed through unchecked.
+
+An invalid message shape sent to the OpenAI API will fail the entire turn with
+an opaque 400 error rather than being skipped with a warning, contrary to what
+the docstring promises for malformed lines.
+
+### Conditions required
+
+- The history file must contain an entry with a structurally invalid field
+  value (e.g. `tool_calls` as a string, `content` as a number).
+- This requires either manual editing of the file or an external writer.
+- Normal usage through `add_message()` and `add_raw_message()` prevents this
+  as the REPL only writes well-typed dicts.
+
+### Proposed mitigation
+
+In `get_messages()`, add per-role structural validation:
+- For `role == "tool"`: require `isinstance(content, str)` and
+  `isinstance(tool_call_id, str)`.
+- For `role == "assistant"` with `tool_calls` present: require
+  `isinstance(tool_calls, list)`.
+- Skip lines that fail validation with a `logger.warning`.
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`
