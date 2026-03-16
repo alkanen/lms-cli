@@ -211,3 +211,62 @@ def test_from_file_loads_patterns(root):
     f = IgnoreFilter.from_file(root, ignore)
     (root / "module.pyc").touch()
     assert f.is_ignored(root / "module.pyc")
+
+
+# ---------------------------------------------------------------------------
+# Escape sequences (\# and \!)
+# ---------------------------------------------------------------------------
+
+
+def test_escaped_hash_is_literal_pattern_not_comment(root):
+    # A line starting with \# should be treated as a pattern matching '#foo',
+    # not skipped as a comment.
+    f = IgnoreFilter(root, [r"\#notes.txt"])
+    target = root / "#notes.txt"
+    target.touch()
+    assert f.is_ignored(target)
+
+
+def test_unescaped_hash_is_still_comment(root):
+    # If "# notes.txt" were kept as a pattern it would match a file literally
+    # named "# notes.txt".  The file must NOT be ignored — confirming the line
+    # was discarded as a comment rather than compiled as a pattern.
+    f = IgnoreFilter(root, ["# notes.txt"])
+    target = root / "# notes.txt"
+    target.touch()
+    assert not f.is_ignored(target)
+
+
+def test_escaped_exclamation_is_literal_pattern_not_negation(root):
+    # A line starting with \! should match files named '!important.txt' literally,
+    # not be treated as a negation rule.  No other pattern ignores the file, so
+    # the assertion fails if \! is accidentally interpreted as negation (which
+    # would leave no positive match and the file would not be ignored).
+    f = IgnoreFilter(root, [r"\!important.txt"])
+    target = root / "!important.txt"
+    target.touch()
+    assert f.is_ignored(target)
+
+
+def test_escaped_exclamation_via_read_patterns(root, tmp_path):
+    # read_patterns preserves the raw backslash; _Pattern strips it on use.
+    ignore = tmp_path / ".ignore"
+    ignore.write_text(r"\!keep.txt" + "\n")
+    patterns = IgnoreFilter.read_patterns(ignore)
+    assert patterns == [r"\!keep.txt"]
+    f = IgnoreFilter(root, patterns)
+    target = root / "!keep.txt"
+    target.touch()
+    assert f.is_ignored(target)
+
+
+def test_escaped_hash_via_read_patterns(root, tmp_path):
+    # read_patterns preserves the raw backslash; _Pattern strips it on use.
+    ignore = tmp_path / ".ignore"
+    ignore.write_text(r"\#config" + "\n")
+    patterns = IgnoreFilter.read_patterns(ignore)
+    assert patterns == [r"\#config"]
+    f = IgnoreFilter(root, patterns)
+    target = root / "#config"
+    target.touch()
+    assert f.is_ignored(target)

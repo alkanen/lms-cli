@@ -1,10 +1,13 @@
-"""
+r"""
 .gitignore-style ignore filter.
 
 Patterns follow .gitignore semantics:
   - Blank lines and lines whose first character is '#' are ignored (comments
     must start at column 1; a line with leading spaces followed by '#' is
     treated as a pattern, matching .gitignore whitespace rules).
+  - A leading backslash escapes the special meaning of the next character:
+    ``\#`` is a literal pattern starting with ``#`` (not a comment).
+    ``\!`` is a literal pattern starting with ``!`` (not a negation).
   - Trailing whitespace is stripped; leading whitespace is preserved as part
     of the pattern.
   - A leading '/' anchors the pattern to the root passed at construction time.
@@ -74,9 +77,14 @@ class _Pattern:
         self.raw = raw
         pattern = raw
 
-        self.negated = pattern.startswith("!")
-        if self.negated:
+        # A leading '\' escapes the special meaning of '#' and '!'.
+        if pattern.startswith("\\#") or pattern.startswith("\\!"):
             pattern = pattern[1:]
+            self.negated = False
+        else:
+            self.negated = pattern.startswith("!")
+            if self.negated:
+                pattern = pattern[1:]
 
         # A leading slash anchors the pattern to the root.
         self.anchored = pattern.startswith("/")
@@ -140,7 +148,9 @@ class IgnoreFilter:
             # Blank lines are skipped.
             if not line:
                 continue
-            # Comments must start with '#' at column 1 (not after leading spaces).
+            # Comments must start with '#' at column 1.  A leading r'\#' or r'\!'
+            # escapes the special character; those lines begin with '\', not '#',
+            # so they are never caught by this check.
             if line.startswith("#"):
                 continue
             self._raw_patterns.append(line)
@@ -171,7 +181,11 @@ class IgnoreFilter:
         raw: list[str] = []
         for line in text.splitlines():
             line = line.rstrip(" \t\r\n")
-            if not line or line.startswith("#"):
+            if not line:
+                continue
+            # A line beginning with '#' at column 1 is a comment.  An escaped
+            # r'\#' begins with '\', not '#', so it passes through unaffected.
+            if line.startswith("#"):
                 continue
             raw.append(line)
         return raw

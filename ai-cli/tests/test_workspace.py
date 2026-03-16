@@ -349,6 +349,31 @@ class TestIsIgnored:
         assert ws.is_ignored(project / "debug.log")
         assert not ws.is_ignored(project / "important.log")
 
+    def test_gitignore_patterns_respected(self, project):
+        (project / ".gitignore").write_text("*.log\n")
+        config = MagicMock()
+        ws = Workspace(project, config)
+        (project / "debug.log").touch()
+        assert ws.is_ignored(project / "debug.log")
+
+    def test_project_ignore_overrides_gitignore(self, project):
+        # .ai-cli/.ignore (loaded last) can re-include files excluded by .gitignore.
+        (project / ".gitignore").write_text("*.log\n")
+        (project / _DOT_AI_CLI / ".ignore").write_text("!important.log\n")
+        config = MagicMock()
+        ws = Workspace(project, config)
+        (project / "debug.log").touch()
+        (project / "important.log").touch()
+        assert ws.is_ignored(project / "debug.log")
+        assert not ws.is_ignored(project / "important.log")
+
+    def test_missing_gitignore_does_not_raise(self, project):
+        # No .gitignore present — workspace should initialise without error.
+        config = MagicMock()
+        ws = Workspace(project, config)
+        (project / "main.py").touch()
+        assert not ws.is_ignored(project / "main.py")
+
 
 class TestGetGlobalDir:
     """Tests for the real get_global_dir() function.

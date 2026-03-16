@@ -126,6 +126,57 @@ In `get_messages()`, add per-role structural validation:
 
 ---
 
+## VULN-005 — Absolute-pattern check is POSIX-only in `find_files`
+
+**Component:** `ai_cli/tools/find_files.py` — `FindFilesTool.execute()`
+
+**Severity:** Low (Windows-only; UX/input-validation issue, not a workspace escape)
+
+**Status:** Deferred — Windows support is currently low priority
+
+### Description
+
+The absolute-path guard in `execute()` rejects patterns that start with `"/"`:
+
+```python
+if pattern.startswith("/"):
+    return self._err("invalid_input", "Pattern must not be an absolute path.", 400)
+```
+
+On Windows, absolute paths can also begin with a drive letter (`C:\...`) or a
+UNC prefix (`\\server\share\...`). Such patterns would pass this check without
+returning a clear error to the caller.
+
+**Important:** This is a validation and UX consistency issue, not a
+workspace-escape vulnerability.  The filesystem walk is always rooted at
+`search_root`, which is derived from the `directory` argument via
+`Workspace.resolve()` — a function that enforces workspace containment.
+The `pattern` argument is only used as a match filter against relative paths
+and cannot influence where `os.walk` traverses.  A Windows-style absolute
+pattern would simply never match any relative path and would silently return
+zero results instead of a clear `invalid_input` error.
+
+### Conditions required
+
+- The application must be running on Windows.
+- A caller (or the LLM) must supply a drive-letter or UNC pattern.
+
+### Proposed mitigation
+
+Replace `pattern.startswith("/")` with an OS-aware check so Windows-style
+absolute patterns also produce a clear error:
+
+```python
+import os
+if os.path.isabs(pattern) or (len(pattern) >= 2 and pattern[1] == ":"):
+    return self._err("invalid_input", "Pattern must not be an absolute path.", 400)
+```
+
+Or use `pathlib.PurePosixPath` / `pathlib.PureWindowsPath` to detect absolute
+paths in a platform-independent way.
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`
@@ -152,6 +203,45 @@ invisible to the application but accumulate in the sessions directory over time.
 Wrap `_write_meta()` in a `try/except SessionError` block; on failure,
 best-effort `shutil.rmtree(session_dir)` the newly created directory before
 re-raising, so the sessions directory stays clean.
+
+---
+
+## VULN-006 — `IgnoreFilter` implements only a subset of full `.gitignore` syntax
+
+**Component:** `ai_cli/utils/ignore_filter.py` — `IgnoreFilter`
+
+**Severity:** Very Low (cosmetic mismatch; no security impact)
+
+**Status:** Deferred
+
+### Description
+
+`Workspace` now reads `.gitignore` in addition to `.ai-cli/.ignore`, but
+`IgnoreFilter` implements a simplified subset of the full `.gitignore`
+specification. Known gaps:
+
+- **Trailing-space escaping** — `.gitignore` allows a trailing space to be
+  included in a pattern by escaping it with `\ ` (backslash-space). Unescaped
+  trailing spaces are stripped; escaped ones are not handled and the backslash
+  is left in the pattern.
+- **Character ranges in brackets** — `fnmatch` handles `[a-z]` but its
+  behaviour for collating sequences may differ from Git's C-locale comparison.
+- **Re-include semantics for ancestor directories** — unlike Git, this
+  implementation *allows* negation to re-include a file even if its parent
+  directory was matched by an earlier ignore pattern. This is intentional and
+  documented, but means some `.gitignore` files will behave differently here.
+
+### Conditions required
+
+- A `.gitignore` file must use one of the unsupported constructs.
+- Effects are limited to incorrect include/exclude decisions for affected paths;
+  no data is corrupted and no security boundary is crossed.
+
+### Proposed mitigation
+
+Extend `IgnoreFilter` to cover the missing constructs as they are encountered
+in real `.gitignore` files, or replace the hand-rolled parser with a library
+that provides full `.gitignore` compatibility (e.g. `pathspec`).
 
 ---
 

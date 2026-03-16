@@ -133,14 +133,18 @@ class Workspace:
         self._root = root.resolve()
         self._config = config_manager
 
-        # Build a single IgnoreFilter rooted at the workspace with global
-        # patterns first and project patterns second, so that project-level
-        # rules (including negations) can override global ones via "last
-        # match wins".  Using one shared root also ensures global patterns
-        # are evaluated against workspace-relative paths, not `~/.ai-cli/`.
-        combined = IgnoreFilter.read_patterns(
-            get_global_dir() / ".ignore"
-        ) + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
+        # Build a single IgnoreFilter from three sources, evaluated in order
+        # so that later sources override earlier ones ("last match wins"):
+        #   1. global  ~/.ai-cli/.ignore
+        #   2. project root  .gitignore
+        #   3. project       .ai-cli/.ignore  (highest precedence)
+        # Using one shared root ensures all patterns are evaluated against
+        # workspace-relative paths, not `~/.ai-cli/`.
+        combined = (
+            IgnoreFilter.read_patterns(get_global_dir() / ".ignore")
+            + IgnoreFilter.read_patterns(self._root / ".gitignore")
+            + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
+        )
         self._ignore_filter = IgnoreFilter(self._root, combined)
 
     # ------------------------------------------------------------------
@@ -243,9 +247,14 @@ class Workspace:
 
     def is_ignored(self, path: Path) -> bool:
         """
-        Return ``True`` if *path* is excluded by the combined global + project
-        `.ignore` rules.  Project-level patterns take precedence over global
-        ones because they are evaluated last ("last match wins").
+        Return ``True`` if *path* is excluded by the combined ignore rules.
+
+        Sources evaluated in order (last match wins, so later sources
+        override earlier ones):
+
+        1. global ``~/.ai-cli/.ignore``
+        2. project root ``.gitignore``
+        3. project ``.ai-cli/.ignore``
         """
         return self._ignore_filter.is_ignored(path)
 
