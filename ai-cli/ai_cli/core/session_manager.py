@@ -333,6 +333,10 @@ class Session:
             len(summary),
         )
 
+    def get_meta(self) -> dict:
+        """Return a copy of the session's metadata as a plain dict."""
+        return self._read_meta()
+
     def set_name(self, name: str) -> None:
         """Persist *name* to ``metadata.yaml``."""
         meta = self._read_meta()

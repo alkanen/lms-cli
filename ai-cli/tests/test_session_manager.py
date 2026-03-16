@@ -392,6 +392,13 @@ class TestSessionMetadata:
         meta = session._read_meta()
         assert meta["first_user_message"] == "First"
 
+    def test_get_meta_returns_metadata_dict(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 7, "name": "test"})
+        meta = session.get_meta()
+        assert meta["message_count"] == 7
+        assert meta["name"] == "test"
+
     def test_set_name_persists(self, tmp_path):
         session = _make_session(tmp_path)
         session._write_meta({})
