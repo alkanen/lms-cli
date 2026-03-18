@@ -142,6 +142,8 @@ class TestReset:
 
 class TestExtraOptions:
     def test_extra_options_passed_to_prompt(self):
+        # prompt_fn receives only tool-specific extras, not the universal four
+        # (yes/no/always/custom) — the prompt implementation renders those itself.
         received_opts: list[list[str]] = []
 
         def prompt_fn(question: str, opts: list[str]) -> tuple[str, str]:
@@ -150,13 +152,7 @@ class TestExtraOptions:
 
         pm = PermissionManager(prompt_fn=prompt_fn)
         pm.request("read_file", "Read file?", extra_options=["always_in_folder"])
-        assert received_opts[0] == [
-            PERM_YES,
-            PERM_NO,
-            PERM_ALWAYS,
-            PERM_CUSTOM,
-            "always_in_folder",
-        ]
+        assert received_opts[0] == ["always_in_folder"]
 
     def test_extra_option_selected_allows_and_returns_choice(self):
         pm = PermissionManager(prompt_fn=lambda q, opts: ("always_in_folder", ""))
@@ -208,6 +204,8 @@ class TestExtraOptions:
         assert choice == "AlwaysInFolder"
 
     def test_no_extra_options_uses_universal_only(self):
+        # With no tool-specific extras, prompt_fn receives an empty list — the
+        # universal four are rendered by the prompt implementation, not passed here.
         received_opts: list[list[str]] = []
 
         def prompt_fn(question: str, opts: list[str]) -> tuple[str, str]:
@@ -216,4 +214,4 @@ class TestExtraOptions:
 
         pm = PermissionManager(prompt_fn=prompt_fn)
         pm.request("read_file", "Read file?")
-        assert received_opts[0] == [PERM_YES, PERM_NO, PERM_ALWAYS, PERM_CUSTOM]
+        assert received_opts[0] == []

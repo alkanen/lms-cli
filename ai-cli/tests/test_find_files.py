@@ -265,10 +265,13 @@ class TestIgnoreRules:
         assert "keep.py" in result["data"]["matches"]
         assert "skip.py" not in result["data"]["matches"]
 
-    def test_negation_re_includes_file_under_ignored_directory(self, tmp_path):
-        # IgnoreFilter supports negation: 'build/' ignores the dir but
-        # '!build/important.py' re-includes a specific file.  The tool must
-        # descend into the directory (not prune it) to find the re-included file.
+    def test_ignored_directory_is_pruned_during_walk(self, tmp_path):
+        # find_files prunes ignored directories for performance (env/, .git/,
+        # node_modules/ etc. can contain thousands of files).  Once a directory
+        # is pruned, no file inside it is ever returned — even if a negation
+        # rule would re-include it.  This matches standard Git walk behaviour;
+        # the IgnoreFilter negation semantic only applies when is_ignored() is
+        # called directly on a known path.
         _write(tmp_path / "build" / "generated.py")
         _write(tmp_path / "build" / "important.py")
         ignore = tmp_path / ".ai-cli" / ".ignore"
@@ -276,8 +279,8 @@ class TestIgnoreRules:
         ignore.write_text("build/\n!build/important.py\n", encoding="utf-8")
         tool = make_tool(tmp_path)
         result = tool.execute(pattern="**/*.py")
-        assert "build/important.py" in result["data"]["matches"]
-        assert "build/generated.py" not in result["data"]["matches"]
+        # The whole build/ directory is pruned; neither file is returned.
+        assert result["data"]["matches"] == []
 
 
 # ---------------------------------------------------------------------------

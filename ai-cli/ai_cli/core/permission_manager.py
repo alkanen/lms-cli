@@ -15,8 +15,10 @@ The four universal permission choices:
 
 Tools may offer additional variants (e.g. "Always in this folder") and
 pass them via the ``extra_options`` argument to
-:meth:`PermissionManager.request`.  These are forwarded to ``prompt_fn``
-and returned to the caller as-is; PermissionManager does not interpret them.
+:meth:`PermissionManager.request`.  Tool-specific extras are forwarded to
+``prompt_fn`` (the universal four are NOT forwarded — the prompt
+implementation renders them itself with fixed key bindings) and returned to
+the caller as-is; PermissionManager does not interpret them.
 
 The ``prompt_fn`` callable is provided by the REPL layer, keeping UI
 concerns (Rich formatting, keyboard input) out of this module.
@@ -32,7 +34,9 @@ PERM_ALWAYS = "always"
 PERM_CUSTOM = "custom"
 
 # Type alias for the injected prompt function.
-# prompt_fn(question, options) -> (choice, user_text)
+# prompt_fn(question, extra_options) -> (choice, user_text)
+# extra_options contains only tool-specific choices; the universal four
+# (yes/no/always/custom) are always rendered by the prompt implementation itself.
 PromptFn = Callable[[str, list[str]], tuple[str, str]]
 
 
@@ -89,16 +93,14 @@ class PermissionManager:
             return True, ""
 
         universal = {PERM_YES, PERM_NO, PERM_ALWAYS, PERM_CUSTOM}
-        options = [PERM_YES, PERM_NO, PERM_ALWAYS, PERM_CUSTOM]
-        if extra_options:
-            # Filter out any extra option whose lowercased form collides with a
-            # universal constant — those are handled by the dispatch logic and
-            # must not appear twice in the list shown to the user.
-            options.extend(
-                opt for opt in extra_options if opt.strip().lower() not in universal
-            )
 
-        choice, user_text = self._prompt_fn(question, options)
+        # The prompt implementation always renders the universal four (yes / no /
+        # always / custom) with their own key bindings.  Pass only the
+        # tool-specific extras so they do not appear twice.
+        extras_for_prompt = [
+            opt for opt in (extra_options or []) if opt.strip().lower() not in universal
+        ]
+        choice, user_text = self._prompt_fn(question, extras_for_prompt)
         choice = choice.strip().lower()
 
         # PERM_NO always denies, even if it appears in extra_options.

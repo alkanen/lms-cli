@@ -228,9 +228,8 @@ class FindFilesTool(Tool):
                         }
                     )
                 # Narrow the walk root only when the prefix is not ignored.
-                # If it is ignored, individual files inside it may still be
-                # re-included by a negation rule, so we must walk from
-                # search_root and let the per-file is_ignored() check decide.
+                # An ignored prefix would be pruned at the top of the os.walk
+                # loop anyway, so there is nothing to gain by narrowing into it.
                 if not self._workspace.is_ignored(candidate):
                     walk_root = candidate
                     # max_depth stays relative to search_root (not walk_root),
@@ -277,6 +276,17 @@ class FindFilesTool(Tool):
                 # the level where matching files must live.
                 if max_depth is not None and current_depth >= max_depth:
                     dirnames[:] = []
+                else:
+                    # Prune ignored directories so we never traverse env/,
+                    # .git/, __pycache__/, node_modules/, etc.  This means
+                    # files inside an ignored directory are never returned,
+                    # even if a negation rule would re-include them — matching
+                    # standard Git walk behaviour.
+                    dirnames[:] = [
+                        d
+                        for d in dirnames
+                        if not self._workspace.is_ignored(current_dir / d)
+                    ]
 
                 for filename in sorted(filenames):
                     filepath = current_dir / filename
