@@ -149,12 +149,11 @@ returning a clear error to the caller.
 
 **Important:** This is a validation and UX consistency issue, not a
 workspace-escape vulnerability.  The filesystem walk is always rooted at
-`search_root`, which is derived from the `directory` argument via
-`Workspace.resolve()` — a function that enforces workspace containment.
-The `pattern` argument is only used as a match filter against relative paths
-and cannot influence where `os.walk` traverses.  A Windows-style absolute
-pattern would simply never match any relative path and would silently return
-zero results instead of a clear `invalid_input` error.
+the workspace root (a resolved absolute path).  The `pattern` argument is
+only used as a match filter against relative paths and cannot influence where
+`os.walk` traverses.  A Windows-style absolute pattern would simply never
+match any relative path and would silently return zero results instead of a
+clear `invalid_input` error.
 
 ### Conditions required
 
@@ -174,6 +173,46 @@ if os.path.isabs(pattern) or (len(pattern) >= 2 and pattern[1] == ":"):
 
 Or use `pathlib.PurePosixPath` / `pathlib.PureWindowsPath` to detect absolute
 paths in a platform-independent way.
+
+---
+
+## VULN-007 — `find_files` literal-prefix narrowing follows symlinks outside the workspace
+
+**Component:** `ai_cli/tools/find_files.py` — `FindFilesTool.execute()`
+
+**Severity:** Low (requires a symlink to exist inside the workspace; read-only information
+disclosure, no write risk)
+
+**Status:** Deferred — symlinks inside the workspace are an explicit user action
+
+### Description
+
+When a glob pattern has a leading literal directory segment (e.g. `src/**/*.py`),
+`find_files` narrows the `os.walk` root to that subdirectory (`walk_root = candidate`)
+after confirming the directory exists (`candidate.is_dir()`).  If `candidate` is a
+symlink to a directory outside the workspace, `os.walk` will traverse the symlink
+target and return paths that resolve outside `workspace_root`.  The returned paths are
+reported as workspace-relative strings, so the caller may not realise they originate
+outside the workspace.
+
+The same issue applies to the non-narrowed walk path: any symlinked directory that
+survives the `is_ignored()` pruning step will be traversed by `os.walk`.
+
+### Conditions required
+
+- A symlink to an out-of-workspace directory must exist inside the workspace.
+- Creating such a symlink requires write access to the workspace — it is an explicit
+  user action, not something an untrusted party can trigger remotely.
+- The risk is read-only information disclosure (file paths enumerated); no files are
+  written or executed.
+
+### Proposed mitigation
+
+Before assigning `walk_root = candidate`, verify that `candidate.resolve()` is still
+contained within `workspace_root.resolve()` (e.g. via `Workspace.resolve()` or a
+simple `Path.is_relative_to()` check).  Alternatively, pass `followlinks=False` to
+`os.walk` (the default) and skip any `dirpath` whose resolved path escapes the
+workspace root.
 
 ---
 

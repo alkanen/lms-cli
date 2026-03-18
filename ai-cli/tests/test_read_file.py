@@ -76,8 +76,8 @@ class TestClassAttributes:
     def test_permission_required_false_by_default(self):
         assert ReadFileTool.PERMISSION_REQUIRED is False
 
-    def test_not_disabled_by_default(self):
-        assert not getattr(ReadFileTool, "DISABLED_BY_DEFAULT", False)
+    def test_disabled_by_default(self):
+        assert ReadFileTool.DISABLED_BY_DEFAULT is True
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,11 @@ class REPL:
         self._llm = llm_client
         self._display = display
         self._workspace = workspace
+        # Schemas injected by tool_manager.enable for the next API call only.
+        # Maps tool name → schema so we can both inject the schema into the
+        # tools list AND pass allow_transient=True when executing that tool.
+        # Populated during tool execution, consumed and cleared at the next send.
+        self._pending_transients: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -234,11 +239,32 @@ class REPL:
                 self._display.show_error(f"Could not read conversation history: {exc}")
                 return
 
+            # Consume transients injected by tool_manager.enable in the previous
+            # round, then clear so they don't persist beyond this round.
+            active_transients = dict(self._pending_transients)
+            self._pending_transients.clear()
+
             self._display.begin_assistant_turn()
             try:
+                # Build the tools list, de-duplicating by name so that a
+                # transient schema for an already-enabled tool doesn't appear
+                # twice (some LLM APIs reject duplicate tool names).
+                # Transient schemas take precedence over the enabled definitions.
+                # Use .get() defensively — malformed definitions are skipped.
+                tools_by_name: dict[str, dict] = {}
+                for defn in self._tool_registry.definitions():
+                    func = defn.get("function")
+                    fname = func.get("name") if isinstance(func, dict) else None
+                    if fname:
+                        tools_by_name[fname] = defn
+                    else:
+                        logger.warning(
+                            "Skipping tool schema with missing name: %r", defn
+                        )
+                tools_by_name.update(active_transients)
                 for chunk in self._llm.send(
                     messages,
-                    tools=self._tool_registry.definitions(),
+                    tools=list(tools_by_name.values()),
                 ):
                     if chunk["type"] == "text":
                         self._display.stream_text(chunk["delta"])
@@ -292,7 +318,40 @@ class REPL:
 
             for call in tool_calls:
                 self._display.show_tool_call(call["name"], call["arguments"])
-                result = self._tool_registry.execute(call["name"], call["arguments"])
+                # Transiently-enabled tools must bypass the registry's enabled
+                # check — they were injected into the LLM's tools list for this
+                # round specifically, so allow_transient=True lets them execute.
+                allow_transient = call["name"] in active_transients
+                result = self._tool_registry.execute(
+                    call["name"], call["arguments"], allow_transient=allow_transient
+                )
+                # Only tool_manager may inject transient schemas; any other tool
+                # returning this key is ignored.  Each schema is also validated
+                # against the registry so only known tools can be transiently
+                # enabled — arbitrary schemas cannot bypass the enable gate.
+                # Pop the key regardless so it never enters conversation history.
+                # Guard against malformed result shapes from user-defined tools.
+                data = result.get("data")
+                if not isinstance(data, dict):
+                    data = None
+                if call["name"] == "tool_manager" and result.get("status") == "success":
+                    schemas = (
+                        data.pop("transient_schemas", None)
+                        if data is not None
+                        else None
+                    )
+                    if isinstance(schemas, list):
+                        for schema in schemas:
+                            if not isinstance(schema, dict):
+                                continue
+                            func = schema.get("function")
+                            if not isinstance(func, dict):
+                                continue
+                            name = func.get("name")
+                            if name and self._tool_registry.get(name) is not None:
+                                self._pending_transients[name] = schema
+                elif data is not None:
+                    data.pop("transient_schemas", None)
                 self._display.show_tool_result(call["name"], result)
                 try:
                     self._session.add_raw_message(

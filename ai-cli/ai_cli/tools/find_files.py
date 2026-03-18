@@ -5,8 +5,10 @@ No permission required by default.  Respects workspace ignore rules (global
 ~/.ai-cli/.ignore, root .gitignore, and project .ai-cli/.ignore), so
 hidden/excluded files are never surfaced.
 
+Patterns are always relative to the workspace root.
+
 Glob pattern syntax:
-  *.py                        — match all .py files in the search directory
+  *.py                        — match all .py files in the workspace root
   **/*.py                     — match all .py files recursively
   src/**/*.json               — recursive under a specific sub-directory
   **/*.{png,jpg,jpeg,gif}     — brace expansion (multiple extensions at once)
@@ -19,8 +21,7 @@ from __future__ import annotations
 import os
 import re
 
-from ai_cli.core.workspace import WorkspaceError
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 _MAX_RESULTS = 500
 
@@ -102,47 +103,37 @@ class FindFilesTool(Tool):
     NAME = "find_files"
     DESCRIPTION = (
         "Find files in the workspace whose paths match a glob pattern. "
-        "Use '**/' to search recursively (e.g. '**/*.py' finds all Python files). "
+        "Patterns are relative to the workspace root: use '*.py' for root-level files, "
+        "'**/*.py' to search recursively, or 'src/**/*.py' to restrict to a subtree. "
         "Use '{a,b}' for multiple extensions (e.g. '**/*.{png,jpg}'). "
         "Results are sorted and limited to files; directories are excluded. "
         "Workspace ignore rules (.ignore and .gitignore files) are always respected."
     )
     PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = True
 
     # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
 
     def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": (
-                                "Glob pattern to match against file paths relative to "
-                                "'directory'. Use '**/*.ext' for recursive search. "
-                                "Examples: '*.py', '**/*.ts', 'src/**/*.json'."
-                            ),
-                        },
-                        "directory": {
-                            "type": "string",
-                            "description": (
-                                "Directory to search in, relative to the workspace root. "
-                                "Defaults to '.' (the workspace root). "
-                                "Example: 'src/components'."
-                            ),
-                        },
-                    },
-                    "required": ["pattern"],
-                },
-            },
-        }
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    name="pattern",
+                    description=(
+                        "Glob pattern relative to the workspace root. "
+                        "Use '**/*.ext' for recursive search; prefix with a "
+                        "directory to restrict the scope. "
+                        "Examples: '*.py', '**/*.ts', 'src/**/*.json', '**/docs/*'."
+                    ),
+                    argument_type="string",
+                    required=True,
+                ),
+            ],
+        ).schema()
 
     # ------------------------------------------------------------------
     # Execution
@@ -152,7 +143,6 @@ class FindFilesTool(Tool):
         self,
         *,
         pattern: str,
-        directory: str = ".",
     ) -> dict:
         if not pattern:
             return self._err("invalid_input", "'pattern' must not be empty.", 400)
@@ -174,20 +164,6 @@ class FindFilesTool(Tool):
         except re.error as exc:
             return self._err("invalid_input", f"Invalid glob pattern: {exc}", 400)
 
-        try:
-            search_root = self._workspace.resolve(directory)
-        except WorkspaceError as exc:
-            return self._err("invalid_path", str(exc), 400)
-
-        if not search_root.exists():
-            return self._err(
-                "not_found", f"Directory '{directory}' does not exist.", 404
-            )
-        if not search_root.is_dir():
-            return self._err(
-                "not_a_directory", f"'{directory}' is not a directory.", 400
-            )
-
         workspace_root = self._workspace.root
         matches: list[str] = []
         truncated = False
@@ -199,13 +175,13 @@ class FindFilesTool(Tool):
         recursive = "**" in pattern
         max_depth = None if recursive else pattern.count("/")
 
-        # For fixed-depth patterns, narrow the walk root by consuming any
-        # leading literal (non-glob) directory segments.  For example, the
-        # pattern "src/lib/*.py" can start walking directly from search_root/src/lib
-        # rather than from search_root, avoiding traversal of unrelated sibling
-        # directories like "tests/" or "docs/".
-        walk_root = search_root
-        if not recursive and "/" in pattern:
+        # Narrow the walk root by consuming any leading literal (non-glob)
+        # directory segments from the pattern.  This applies to both fixed-depth
+        # and recursive patterns: "src/lib/*.py" and "src/**/*.py" can both start
+        # walking from workspace_root/src/lib (or workspace_root/src) instead of
+        # workspace_root, skipping sibling trees like "tests/" or "docs/" entirely.
+        walk_root = workspace_root
+        if "/" in pattern:
             segments = pattern.split("/")
             # Collect leading segments that contain no glob characters.
             literal_dirs: list[str] = []
@@ -214,7 +190,7 @@ class FindFilesTool(Tool):
                     break
                 literal_dirs.append(seg)
             if literal_dirs:
-                candidate = search_root
+                candidate = workspace_root
                 for d in literal_dirs:
                     candidate = candidate / d
                 if not candidate.is_dir():
@@ -224,16 +200,17 @@ class FindFilesTool(Tool):
                             "matches": [],
                             "count": 0,
                             "pattern": pattern,
-                            "directory": directory,
                         }
                     )
-                # Narrow the walk root only when the prefix is not ignored.
-                # An ignored prefix would be pruned at the top of the os.walk
-                # loop anyway, so there is nothing to gain by narrowing into it.
-                if not self._workspace.is_ignored(candidate):
-                    walk_root = candidate
-                    # max_depth stays relative to search_root (not walk_root),
-                    # matching how current_depth is computed in os.walk below.
+                # Short-circuit if the literal prefix itself is ignored — the
+                # directory will be pruned during any os.walk anyway, so no
+                # files under it can ever match.
+                # candidate.is_dir() was already confirmed above, so is_dir=True.
+                if self._workspace.is_ignored(candidate, is_dir=True):
+                    return self._ok({"matches": [], "count": 0, "pattern": pattern})
+                walk_root = candidate
+                # max_depth stays relative to workspace_root (not walk_root),
+                # matching how current_depth is computed in os.walk below.
 
         if max_depth == 0:
             # Fast path: only the immediate contents of walk_root matter.
@@ -244,15 +221,15 @@ class FindFilesTool(Tool):
             for entry in entries:
                 if not entry.is_file():
                     continue
-                if self._workspace.is_ignored(entry):
+                if self._workspace.is_ignored(entry, is_dir=False):
                     continue
                 try:
-                    rel_ws = entry.relative_to(workspace_root)
-                    rel_search = entry.relative_to(search_root)
+                    rel = entry.relative_to(workspace_root)
                 except ValueError:
                     continue
-                if compiled.match(str(rel_search).replace("\\", "/")):
-                    matches.append(str(rel_ws).replace("\\", "/"))
+                rel_str = str(rel).replace("\\", "/")
+                if compiled.match(rel_str):
+                    matches.append(rel_str)
                     if len(matches) >= _MAX_RESULTS:
                         truncated = True
                         break
@@ -265,9 +242,9 @@ class FindFilesTool(Tool):
             for dirpath, dirnames, filenames in os.walk(
                 walk_root, topdown=True, onerror=_onerror
             ):
-                rel = os.path.relpath(dirpath, search_root)
-                current_depth = 0 if rel == "." else rel.count(os.sep) + 1
-                current_dir = workspace_root / os.path.relpath(dirpath, workspace_root)
+                rel_str = os.path.relpath(dirpath, workspace_root)
+                current_depth = 0 if rel_str == "." else rel_str.count(os.sep) + 1
+                current_dir = workspace_root / (rel_str if rel_str != "." else "")
 
                 # Sort for deterministic ordering.
                 dirnames[:] = sorted(dirnames)
@@ -282,24 +259,26 @@ class FindFilesTool(Tool):
                     # files inside an ignored directory are never returned,
                     # even if a negation rule would re-include them — matching
                     # standard Git walk behaviour.
+                    # Pass is_dir=True so is_ignored() can skip its stat() call.
                     dirnames[:] = [
                         d
                         for d in dirnames
-                        if not self._workspace.is_ignored(current_dir / d)
+                        if not self._workspace.is_ignored(current_dir / d, is_dir=True)
                     ]
 
                 for filename in sorted(filenames):
                     filepath = current_dir / filename
-                    if self._workspace.is_ignored(filepath):
+                    # Pass is_dir=False — os.walk only puts regular files (and
+                    # symlinks to files) in filenames, not directories.
+                    if self._workspace.is_ignored(filepath, is_dir=False):
                         continue
                     try:
                         rel_ws = filepath.relative_to(workspace_root)
-                        rel_search = filepath.relative_to(search_root)
                     except ValueError:
                         continue
-                    rel_search_str = str(rel_search).replace("\\", "/")
-                    if compiled.match(rel_search_str):
-                        matches.append(str(rel_ws).replace("\\", "/"))
+                    rel_str = str(rel_ws).replace("\\", "/")
+                    if compiled.match(rel_str):
+                        matches.append(rel_str)
                         if len(matches) >= _MAX_RESULTS:
                             truncated = True
                             break
@@ -314,7 +293,6 @@ class FindFilesTool(Tool):
             "matches": matches,
             "count": len(matches),
             "pattern": pattern,
-            "directory": directory,
         }
         if truncated:
             result["truncated"] = True

@@ -61,8 +61,8 @@ class TestClassAttributes:
     def test_permission_required_true_by_default(self):
         assert WriteFileTool.PERMISSION_REQUIRED is True
 
-    def test_not_disabled_by_default(self):
-        assert not getattr(WriteFileTool, "DISABLED_BY_DEFAULT", False)
+    def test_disabled_by_default(self):
+        assert WriteFileTool.DISABLED_BY_DEFAULT is True
 
 
 # ---------------------------------------------------------------------------

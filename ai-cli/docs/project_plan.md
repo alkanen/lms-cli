@@ -191,7 +191,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 1. **Tool Execution Improvements** ✅
    - Canonical `{"status": "success"/"error", ...}` response shape standardised via `_ok()`/`_err()` helpers and followed by built-in tools by convention — nothing enforces that third-party tools use them.
    - `ToolRegistry.execute()` handles unknown tool, disabled tool, permission denied, and execution errors — all return canonical error dicts.
-   - `allow_transient=True` parameter lets the REPL execute transiently-injected tools that aren't in the persistent enabled set.
+   - `allow_transient=True` parameter lets the REPL execute transiently-injected tools that aren't in the persistent enabled set. This intentionally bypasses the *disabled* gate (soft) but must never bypass the *disallowed* gate (hard) — see the two-level permission design under `/tools` subcommands below.
 
 2. **Permission System** ✅
    - `PermissionManager` handles in-memory grants (yes/no/always/custom rejection).
@@ -200,9 +200,9 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - The universal four options (yes/no/always/custom) are always rendered by the prompt implementation. `PermissionManager` passes only tool-specific extras to `prompt_fn`; the prompt handles the universal set itself.
 
 3. **Bundled Tools** ⚠️ (partial)
-   - `read_file` ✅ — workspace-scoped, no permission by default, session allow-list, line-range support.
-   - `write_file` ✅ — workspace-scoped, permission required by default, session allow-list, full and partial writes.
-   - `find_files` ✅ — glob-pattern search across the workspace. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
+   - `read_file` ✅ — workspace-scoped, no permission by default, disabled by default, session allow-list, line-range support.
+   - `write_file` ✅ — workspace-scoped, permission required by default, disabled by default, session allow-list, full and partial writes.
+   - `find_files` ✅ — glob-pattern search across the workspace, disabled by default. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
    - `tool_manager` 🔲 — **next priority** now that the REPL exists.
 
 4. **Error Handling** ⚠️ (partial)
@@ -240,8 +240,11 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - **`/tools` subcommands** — currently `/tools` only lists enabled tools. Planned subcommands:
      - `/tools list` — list all tools (enabled and disabled) with tier and status.
      - `/tools info <name>` — full details: description, parameters, current settings.
-     - `/tools enable <name> [--session]` / `/tools disable <name> [--session]`
-     - `/tools allow <name>` / `/tools disallow <name>` — toggle `permission_required`.
+     - `/tools enable <name> [--session]` / `/tools disable <name> [--session]` — soft gate.
+     - `/tools allow <name> [--session]` / `/tools disallow <name> [--session]` — hard gate.
+   - **Two-level tool visibility design:**
+     - **enabled / disabled** (soft gate): controls whether the tool appears in the normal per-turn tool list. A `disabled` tool is hidden from the LLM's tool list but `tool_manager` can still transiently enable it for a single turn. Changeable at runtime via `/tools enable`/`disable`.
+     - **allowed / disallowed** (hard gate): controls whether the tool is visible to the agent at all. A `disallowed` tool is not listed by `tool_manager` and cannot be transiently enabled — the agent has no way to know it exists. Only changeable via `/tools allow`/`disallow` or by editing config and restarting. `allow_transient=True` in `ToolRegistry.execute()` must respect this gate (i.e. must not execute a `disallowed` tool).
    - **`/compact [instructions]`** — optional instructions argument (currently ignored).
    - **`/session name "<name>"`** — currently `/session` only shows info; naming not yet wired up.
    - **`completer.py`** — tab completion for slash commands, tool names, and file paths. Interactive `@` popup/picker (vs. the current text-substitution approach).

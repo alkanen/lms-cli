@@ -29,6 +29,7 @@ exclusions.
 from __future__ import annotations
 
 import fnmatch
+import os
 from pathlib import Path
 
 
@@ -199,7 +200,7 @@ class IgnoreFilter:
     def empty(cls, root: Path) -> IgnoreFilter:
         return cls(root, [])
 
-    def is_ignored(self, path: Path) -> bool:
+    def is_ignored(self, path: Path, *, is_dir: bool | None = None) -> bool:
         """
         Return True if *path* is excluded by this filter's patterns.
 
@@ -214,8 +215,29 @@ class IgnoreFilter:
           re-included without first un-ignoring the directory itself.
 
         *path* may be absolute or relative; if absolute it must be under root.
+
+        Parameters
+        ----------
+        path:
+            The path to test.  Symlinks are **not** resolved; callers that walk
+            real (non-symlinked) directory trees can rely on this being safe and
+            fast.  If your paths may contain symlinks that point outside the root,
+            resolve them yourself before calling this method.
+        is_dir:
+            Whether *path* is a directory.  Pass ``True`` or ``False`` when the
+            caller already knows (e.g. from an ``os.walk`` loop) to avoid the
+            extra ``stat()`` call; omit or pass ``None`` to let the method detect
+            it automatically.
         """
-        path = path.resolve() if path.is_absolute() else (self._root / path).resolve()
+        # Use normpath rather than resolve() to avoid calling lstat() on every
+        # path component (resolve() follows symlinks at each level, which is
+        # expensive on network/FUSE filesystems such as WSL → NTFS).  The root
+        # is already fully resolved in __init__, so normpath is sufficient for
+        # paths that don't contain symlinks — the common case in os.walk loops.
+        if path.is_absolute():
+            path = Path(os.path.normpath(path))
+        else:
+            path = Path(os.path.normpath(self._root / path))
         try:
             rel = path.relative_to(self._root)
         except ValueError:
@@ -223,7 +245,8 @@ class IgnoreFilter:
             return False
 
         rel_parts = rel.parts
-        is_dir = path.is_dir()
+        if is_dir is None:
+            is_dir = path.is_dir()
 
         # Iterate patterns in declaration order (outer loop) so that the last
         # matching pattern always wins, regardless of whether it matched the

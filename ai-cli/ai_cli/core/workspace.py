@@ -245,7 +245,7 @@ class Workspace:
     # Ignore rules
     # ------------------------------------------------------------------
 
-    def is_ignored(self, path: Path) -> bool:
+    def is_ignored(self, path: Path, *, is_dir: bool | None = None) -> bool:
         """
         Return ``True`` if *path* is excluded by the combined ignore rules.
 
@@ -255,8 +255,14 @@ class Workspace:
         1. global ``~/.ai-cli/.ignore``
         2. project root ``.gitignore``
         3. project ``.ai-cli/.ignore``
+
+        Parameters
+        ----------
+        is_dir:
+            Whether *path* is a directory.  Pass ``True`` or ``False`` when the
+            caller already knows to avoid an extra ``stat()`` call.
         """
-        return self._ignore_filter.is_ignored(path)
+        return self._ignore_filter.is_ignored(path, is_dir=is_dir)
 
     # ------------------------------------------------------------------
     # Path helpers

@@ -348,7 +348,9 @@ class TestREPLSendToLLM:
         )
         repl._send_to_llm("Read foo.py")
 
-        tool_registry.execute.assert_called_once_with("read_file", {"path": "foo.py"})
+        tool_registry.execute.assert_called_once_with(
+            "read_file", {"path": "foo.py"}, allow_transient=False
+        )
         display.show_tool_call.assert_called_once_with("read_file", {"path": "foo.py"})
         display.show_tool_result.assert_called_once()
         # assistant tool-call message and tool result saved via add_raw_message
@@ -461,6 +463,112 @@ class TestREPLSendToLLM:
         repl._send_to_llm("Hello")
         saved_roles = [c[0][0] for c in session.add_message.call_args_list]
         assert "assistant" not in saved_roles
+
+    def _tool_call_round(self, tool_name, result_data):
+        """Helper: LLM returns one tool_call then stops; tool returns result_data."""
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {
+            "status": "success",
+            "data": result_data,
+        }
+        llm = MagicMock()
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": tool_name,
+                        "call_id": "1",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter([{"type": "done", "stop_reason": "stop", "usage": {}}]),
+        ]
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+        return repl, tool_registry
+
+    def test_transient_schemas_only_accepted_from_tool_manager(self):
+        # A non-tool_manager tool returning transient_schemas must be ignored.
+        schema = {"type": "function", "function": {"name": "read_file"}}
+        repl, tool_registry = self._tool_call_round(
+            "malicious_tool", {"transient_schemas": [schema]}
+        )
+        tool_registry.get.return_value = MagicMock()  # simulate registered tool
+        repl._send_to_llm("exploit")
+        assert repl._pending_transients == {}
+
+    def test_transient_schemas_rejected_for_unregistered_names(self):
+        # Even from tool_manager, schemas for unknown tools must not be accepted.
+        schema = {"type": "function", "function": {"name": "ghost_tool"}}
+        repl, tool_registry = self._tool_call_round(
+            "tool_manager", {"transient_schemas": [schema]}
+        )
+        tool_registry.get.return_value = None  # "ghost_tool" not in registry
+        repl._send_to_llm("enable ghost")
+        assert repl._pending_transients == {}
+
+    def test_transient_schemas_accepted_from_tool_manager_for_known_tool(self):
+        # tool_manager returning a schema for a registered tool name is accepted
+        # and injected into the *next* LLM call's tools list.
+        schema = {"type": "function", "function": {"name": "read_file"}}
+        repl, tool_registry = self._tool_call_round(
+            "tool_manager", {"transient_schemas": [schema]}
+        )
+        tool_registry.get.return_value = MagicMock()  # "read_file" is registered
+        repl._send_to_llm("enable read_file")
+        # The second llm.send call (round 2) receives the transient schema.
+        llm = repl._llm
+        second_tools = llm.send.call_args_list[1][1]["tools"]
+        assert any(t["function"]["name"] == "read_file" for t in second_tools)
+
+    def test_tools_list_deduplicates_by_name(self):
+        # If a transient schema and an already-enabled definition share a name,
+        # only one schema should be sent to the LLM (transient takes precedence).
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+
+        enabled_schema = {
+            "type": "function",
+            "function": {"name": "read_file", "description": "enabled version"},
+        }
+        transient_schema = {
+            "type": "function",
+            "function": {"name": "read_file", "description": "transient version"},
+        }
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = [enabled_schema]
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = MagicMock()
+
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [{"type": "done", "stop_reason": "stop", "usage": {}}]
+        )
+
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+        repl._pending_transients = {"read_file": transient_schema}
+        repl._send_to_llm("go")
+
+        sent_tools = llm.send.call_args[1]["tools"]
+        read_file_schemas = [
+            t for t in sent_tools if t["function"]["name"] == "read_file"
+        ]
+        assert len(read_file_schemas) == 1
+        assert read_file_schemas[0]["function"]["description"] == "transient version"
 
 
 # ---------------------------------------------------------------------------
