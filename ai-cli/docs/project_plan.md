@@ -93,29 +93,30 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
 
 ## Project Structure
 
-Legend: ✅ implemented and tested · 🔲 planned
+Legend: ✅ implemented and tested · 🔲 planned · ⚠️ partial
 
 ```
 ai-cli/
 ├── ai_cli/                         # Python package root
-│   ├── __main__.py                 # ✅ Entry point — --init support only for now
+│   ├── __main__.py                 # ✅ Entry point — --workspace, --init; --resume/--continue 🔲
 │   ├── core/                       # Core functionality
 │   │   ├── config_manager.py       # ✅ Layered YAML config loading
 │   │   ├── workspace.py            # ✅ Workspace root resolution, file ops, ignore rules
 │   │   ├── permission_manager.py   # ✅ In-memory permission state
 │   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, settings
-│   │   ├── llm_client.py           # 🔲 Abstract LLMClient + OpenAI/LMStudio implementations
-│   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
-│   │   └── session_manager.py      # 🔲 Session create/resume/compact/persist
+│   │   ├── llm_client.py           # ✅ LLMClient ABC + OpenAIClient (REST/streaming); LMStudio WebSocket 🔲
+│   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist
+│   │   └── mcp_manager.py          # 🔲 MCP server connections, tool exposure
 │   ├── tools/                      # Bundled tools
 │   │   ├── base.py                 # ✅ Tool abstract base class
 │   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
-│   │   └── tool_manager.py         # 🔲 Context-saving tool gatekeeper (deferred until after REPL)
+│   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
+│   │   └── tool_manager.py         # 🔲 Context-saving tool gatekeeper
 │   ├── cli/                        # CLI interface and user-facing components
-│   │   ├── repl.py                 # 🔲 Main REPL loop, input handling, slash commands
-│   │   ├── completer.py            # 🔲 Tab completion + @ file picker
-│   │   └── display.py              # 🔲 Rich output, summary/verbose modes
+│   │   ├── repl.py                 # ✅ REPL loop; slash commands ⚠️ (subset implemented — see Phase 3)
+│   │   ├── display.py              # ⚠️ Display ABC + PlainDisplay ✅; RichDisplay 🔲
+│   │   └── completer.py            # 🔲 Tab completion + interactive @ file picker
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # 🔲 JSONL structured logging
@@ -128,6 +129,7 @@ ai-cli/
 │   ├── test_tool_base.py
 │   ├── test_read_file.py
 │   ├── test_write_file.py
+│   ├── test_find_files.py
 │   └── test_main.py
 └── docs/                           # Documentation
     └── project_plan.md             # This file
@@ -135,7 +137,7 @@ ai-cli/
 
 ## Implementation Plan
 
-Legend: ✅ done · 🔲 planned · → next
+Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 
 ### Phase 1: Core Infrastructure
 1. **Workspace Handling** ✅
@@ -195,73 +197,82 @@ Legend: ✅ done · 🔲 planned · → next
    - `PermissionManager` handles in-memory grants (yes/no/always/custom rejection).
    - `always` grants are stored per tool name. They persist unless `PermissionManager.reset()` is explicitly called — the session manager must call both `PermissionManager.reset()` and `ToolRegistry.reset_session_overrides()` on session resume to clear all session-scoped state.
    - File tools (`read_file`, `write_file`) additionally manage session-scoped file/dir allow-lists at the tool level via `extra_permission_options()` / `on_permission_granted()` / `reset_session_state()`, which are cleared by `ToolRegistry.reset_session_overrides()`.
+   - The universal four options (yes/no/always/custom) are always rendered by the prompt implementation. `PermissionManager` passes only tool-specific extras to `prompt_fn`; the prompt handles the universal set itself.
 
-3. **Bundled Tools** ✅ (partial)
-   - `read_file` — workspace-scoped, no permission by default, session allow-list, line-range support.
-   - `write_file` — workspace-scoped, permission required by default, session allow-list, full and partial writes.
-   - `tool_manager` — 🔲 **deferred until after the REPL is implemented.** The tool can be implemented and tested independently, but it's only useful once there's a working conversation loop.
+3. **Bundled Tools** ⚠️ (partial)
+   - `read_file` ✅ — workspace-scoped, no permission by default, session allow-list, line-range support.
+   - `write_file` ✅ — workspace-scoped, permission required by default, session allow-list, full and partial writes.
+   - `find_files` ✅ — glob-pattern search across the workspace. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
+   - `tool_manager` 🔲 — **next priority** now that the REPL exists.
 
-4. **Error Handling** (partial)
+4. **Error Handling** ⚠️ (partial)
    - Structured error dicts returned by all tool calls. ✅
    - JSONL logging (`logging_utils.py`) 🔲
    - Session-specific log folders in `~/.ai-cli/` 🔲
 
-### Phase 3: CLI and User Experience 🔲
-1. **LLMClient** → **next priority**
-   - Abstract base class + `OpenAIClient` (OpenAI-compatible REST, streamed) + `LMStudioClient` (WebSocket).
+### Phase 3: CLI and User Experience ⚠️ (partial)
+1. **LLMClient** ✅
+   - `LLMClient` abstract base class with `send()`, `get_model_metadata()`, and `count_tokens()`.
+   - `OpenAIClient` — OpenAI-compatible REST backend with streaming and tool-call support.
+   - LM Studio WebSocket backend 🔲 — planned; LM Studio can be used in OpenAI-compatible mode in the meantime.
    - `create_llm_client(config_manager)` factory function.
-   - Must be complete before the REPL can be built.
 
-2. **CLI Interface**
-   - Redesign the CLI interface to be more intuitive and user-friendly.
-   - Support for interactive mode with:
-     - Tab completion for commands, tools, slash commands, and file paths.
-     - Help system (e.g., `--help`, inline help).
-     - Rich output formatting (e.g., colors, tables).
-     - REPL-like interface for iterative tool execution.
-   - Popup-like mechanism triggered by `@` for file path completion in the current directory and its children.
-     - `@` — filtered mode: only shows files not matching `.ignore` patterns.
-     - `@!` — explicit mode: shows all files regardless of ignore rules, for intentional override.
-     - Abort on escape or backspacing far enough to delete the trigger (`@` or `@!`).
-     - Include file data as attachments with clear references for the LLM.
-   - **Slash commands** available from within the REPL:
-     - `/help [topic]` — show available slash commands and keyboard shortcuts. Optional topic argument gives detailed help on a specific command or subject.
-     - `/exit` — exit the CLI cleanly.
-     - `/clear` — clear the terminal display (does not affect session history).
-     - `/tools` — alias for `/tools list`.
-       - `/tools list` — list all loaded tools with their source tier (bundled/global/project) and current enabled/permission status.
-       - `/tools info <name>` — show full details for a specific tool: description, parameters, and current settings.
-       - `/tools enable <name> [--session]` / `/tools disable <name> [--session]` — toggle a tool's enabled state.
-         - Without `--session`: change is written to project-level `.ai-cli/config.yaml` and persists across sessions.
-         - With `--session`: change is in-memory only for the current session, reset on exit or resume. No config write.
-       - `/tools allow <name>` / `/tools disallow <name>` — toggle `permission_required` for a tool.
-       - Persistent changes (without `--session`) are written to the project-level `.ai-cli/config.yaml`. If the tool is not yet listed there, it is added with only the changed key; all other settings remain at their defaults.
-     - `/compact [instructions]` — manually trigger session compaction. Optional instructions guide the LLM on what to emphasise in the summary.
-     - `/session name "<name>"` — assign a human-readable name to the current session, stored in `metadata.yaml`.
+2. **Session Management** ✅
+   - `Session` and `SessionManager` classes.
+   - Two history files: `history_full.jsonl` (append-only) and `history_current.jsonl` (system prompt + summary + recent messages).
+   - Compaction: LLM-generated summary replaces older messages; full history preserved in `history_full.jsonl`.
+   - `SessionManager.list()`, `load()`, `most_recent()` — used by `--resume` and `--continue`.
+   - `Session.set_name()` — used by `/session name`.
+   - `Session.should_compact()` / `Session.record_usage()` — automatic compaction trigger.
 
-   - **Output verbosity modes** (toggleable during a session via keyboard shortcut):
-     - **Summary mode** (default): Show condensed activity — e.g., tool name being called, one-line status. LLM response text is always shown in full.
-     - **Verbose mode**: Show full tool inputs, outputs, LLM reasoning, and all intermediate steps.
-     - Toggle between modes with a keyboard shortcut (e.g., Ctrl+O or Ctrl+E — exact binding TBD).
+3. **REPL** ✅
+   - Interactive loop using `prompt_toolkit`.
+   - `@path` inline file reference expansion (text substitution). `@path` respects ignore rules; `@!path` bypasses them.
+   - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`.
 
-2. **Testing and Validation**
-   - Write unit tests for core components (e.g., `ToolRegistry`, `Workspace`).
-   - Integrate integration tests for tool execution and configuration.
+4. **Display** ⚠️ (partial)
+   - `Display` ABC with full interface defined.
+   - `PlainDisplay` ✅ — `print()`-based output, `prompt_toolkit` for interactive prompts.
+   - `RichDisplay` 🔲 — Rich-formatted output; currently falls back to `PlainDisplay`.
 
-3. **Documentation**
-   - Update documentation to reflect new features and improvements.
-   - Add examples for tool development and usage.
+5. **Remaining CLI completions** 🔲
+   - **`--resume` / `--resume <id>` / `--continue` CLI flags** in `__main__.py` — session resume at startup.
+   - **`/tools` subcommands** — currently `/tools` only lists enabled tools. Planned subcommands:
+     - `/tools list` — list all tools (enabled and disabled) with tier and status.
+     - `/tools info <name>` — full details: description, parameters, current settings.
+     - `/tools enable <name> [--session]` / `/tools disable <name> [--session]`
+     - `/tools allow <name>` / `/tools disallow <name>` — toggle `permission_required`.
+   - **`/compact [instructions]`** — optional instructions argument (currently ignored).
+   - **`/session name "<name>"`** — currently `/session` only shows info; naming not yet wired up.
+   - **`completer.py`** — tab completion for slash commands, tool names, and file paths. Interactive `@` popup/picker (vs. the current text-substitution approach).
+
+6. **Logging** 🔲
+   - `logging_utils.py` — JSONL structured logging to session-specific folders.
+
+### Phase 4: Advanced Features 🔲
+1. **`tool_manager` tool** → **next priority**
+   - Context-saving tool gatekeeper; `list` and `enable` actions.
+   - Requires `ToolRegistry.enable_transient()`.
+
+2. **MCP Server Support**
+   - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
+
+3. **LM Studio WebSocket backend**
+   - Optional; LM Studio currently works via its OpenAI-compatible HTTP endpoint.
+
+---
 
 ## Key Decisions
 - **MCP**: Anthropic's Model Context Protocol. External tool servers connected via stdio/SSE, exposed through the unified tool registry.
 - **LLM backend**: OpenAI-compatible REST API is primary. LM Studio WebSocket is optional, selected via config or `--backend lmstudio`. No silent fallback between backends.
 - **Configuration format**: YAML throughout. Layered: bundled defaults → `~/.ai-cli/config.yaml` → `<project>/.ai-cli/config.yaml` → CLI flags.
 - **Workspace**: Nearest `.ai-cli/` ancestor when walking up from start directory, skipping `~/.ai-cli/`. Initialised via `--init`.
-- **Permissions**: In-memory only, reset on exit or session resume. Universal options (Yes/No/Always/Custom rejection); tools may add their own variants.
+- **Permissions**: In-memory only, reset on exit or session resume. Universal options (Yes/No/Always/Custom rejection); tools may add their own variants. Universal four are always rendered by the prompt; `PermissionManager` passes only tool-specific extras to `prompt_fn`.
 - **Tool discovery**: Three tiers — bundled → global (`~/.ai-cli/tools/`) → project (`.ai-cli/tools/`). Later tiers override earlier ones with a warning.
 - **Session compaction**: LLM-generated summary. Two history files: `history_full.jsonl` (append-only) and `history_current.jsonl` (system + summary + recent messages).
-- **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new).
-- **Output modes**: Summary (default) and verbose, toggled by keyboard shortcut during session.
+- **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new). 🔲 Not yet wired into `__main__.py`.
+- **Output modes**: Summary (default) and verbose, toggled via `/verbose` slash command (keyboard shortcut binding TBD).
+- **`find_files` directory pruning**: Ignored directories are pruned from `os.walk` for performance. Files inside an ignored directory are never returned even if a negation rule would re-include them — this matches standard Git walk behaviour and is essential for avoiding traversal of `env/`, `.git/`, `node_modules/`, etc.
 
 ## Assumptions
 - The existing `lms_cli` is a starting point but not a strict requirement.
@@ -291,13 +302,15 @@ Legend: ✅ done · 🔲 planned · → next
 
 ---
 
-## Next Steps
-1. Draft initial implementations for core components (`Workspace`, `ConfigManager`, `LLMClient`).
-2. Design tool base class interface and metadata standards, including permission handling.
-3. Implement the tool registry with three-tier discovery and per-tool config loading.
-4. Implement MCP server connection manager.
-5. Build the REPL interface with slash commands, verbosity toggle, and `@` file picker.
-6. Write unit tests for core components.
+## Next Steps (priority order)
+1. **`tool_manager` tool** — implement `list` and `enable` actions, `ToolRegistry.enable_transient()`, and REPL integration for transient tool injection.
+2. **`--resume` / `--continue` CLI flags** — wire `SessionManager` into `__main__.py` startup.
+3. **`/tools` subcommands** — expand `/tools` beyond the current simple list.
+4. **`/session name`** and **`/compact [instructions]`** — complete the remaining slash commands.
+5. **`RichDisplay`** — replace `PlainDisplay` with Rich-formatted output.
+6. **`completer.py`** — tab completion and interactive `@` file picker.
+7. **`logging_utils.py`** — JSONL structured logging.
+8. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry`.
 
 ## Dependencies
 - Python 3.10+
