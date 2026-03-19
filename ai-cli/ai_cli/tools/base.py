@@ -26,6 +26,109 @@ if TYPE_CHECKING:
     from ai_cli.core.workspace import Workspace
 
 
+class ToolArgument:
+    """
+    Typed descriptor for a single tool parameter.
+
+    Produces the ``properties.<name>`` entry expected by the OpenAI
+    function-calling schema.  Mypy can validate constructor arguments,
+    eliminating the need for hand-crafted dicts and the runtime checks they
+    require.
+
+    Parameters
+    ----------
+    name:
+        Parameter name as used in the tool's ``execute(**kwargs)`` signature.
+    description:
+        Human-readable explanation shown to the LLM.
+    argument_type:
+        JSON Schema primitive type: ``"string"``, ``"integer"``, ``"number"``,
+        ``"boolean"``, ``"array"``, or ``"object"``.
+    required:
+        Whether this argument must be present in every call.  Defaults to
+        ``False`` (optional).
+    enum:
+        Restrict valid values to this list (e.g. ``["list", "enable"]``).
+        Only meaningful when *argument_type* is ``"string"``.
+    items:
+        For ``argument_type="array"``, the JSON Schema for each element
+        (e.g. ``{"type": "string"}``).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        argument_type: str,
+        *,
+        required: bool = False,
+        enum: list[str] | None = None,
+        items: dict | None = None,
+    ) -> None:
+        self.name = name
+        self.description = description
+        self.argument_type = argument_type
+        self.required = required
+        self._enum = enum
+        self._items = items
+
+    def schema(self) -> dict:
+        """Return the JSON Schema fragment for this argument."""
+        prop: dict = {"type": self.argument_type, "description": self.description}
+        if self._enum is not None:
+            prop["enum"] = self._enum
+        if self._items is not None:
+            prop["items"] = self._items
+        return prop
+
+
+class ToolSchema:
+    """
+    Typed descriptor for an entire tool schema.
+
+    Produces the ``{"type": "function", "function": {...}}`` dict expected by
+    the OpenAI function-calling API, delegating each argument's fragment to the
+    corresponding :class:`ToolArgument` instance.
+
+    Parameters
+    ----------
+    name:
+        Tool name — must match ``Tool.NAME`` and the registry key.
+    description:
+        One-line summary shown to the LLM.
+    arguments:
+        Ordered list of :class:`ToolArgument` descriptors.  May be empty for
+        tools that take no parameters.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        arguments: list[ToolArgument] | None = None,
+    ) -> None:
+        self.name = name
+        self.description = description
+        self.arguments: list[ToolArgument] = arguments or []
+
+    def schema(self) -> dict:
+        """Return the full OpenAI function-calling schema dict."""
+        properties = {arg.name: arg.schema() for arg in self.arguments}
+        required = [arg.name for arg in self.arguments if arg.required]
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+
 class Tool(ABC):
     """
     Abstract base class for all ai-cli tools.

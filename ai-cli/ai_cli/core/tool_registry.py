@@ -72,6 +72,68 @@ logger = logging.getLogger(__name__)
 _REQUIRED_ATTRS = ("NAME", "DESCRIPTION", "PERMISSION_REQUIRED")
 
 
+def _validate_tool_definition(defn: object, expected_name: str | None = None) -> str:
+    """
+    Validate the OpenAI-format schema returned by a tool's ``definition()`` method.
+
+    Returns an empty string on success, or a human-readable error message that
+    describes the first structural problem found.
+
+    If *expected_name* is provided, the schema's function name must match it
+    exactly.  A mismatch means the LLM would call a name that the registry
+    doesn't recognise, making the tool silently unusable.
+
+    Expected shape::
+
+        {
+            "type": "function",
+            "function": {
+                "name": "<non-empty str>",
+                "description": "<str>",
+                "parameters": {
+                    "type": "object",
+                    "properties": { ... },
+                    "required": ["<param names present in properties>"],
+                },
+            },
+        }
+    """
+    if not isinstance(defn, dict):
+        return "definition() must return a dict"
+    if defn.get("type") != "function":
+        return "definition()['type'] must be 'function'"
+    fn = defn.get("function")
+    if not isinstance(fn, dict):
+        return "definition()['function'] must be a dict"
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        return "definition()['function']['name'] must be a non-empty string"
+    if expected_name is not None and name != expected_name:
+        return (
+            f"definition()['function']['name'] is {name!r} but must match "
+            f"the registered tool name {expected_name!r}"
+        )
+    if not isinstance(fn.get("description"), str):
+        return "definition()['function']['description'] must be a string"
+    params = fn.get("parameters")
+    if not isinstance(params, dict):
+        return "definition()['function']['parameters'] must be a dict"
+    if params.get("type") != "object":
+        return "definition()['function']['parameters']['type'] must be 'object'"
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        return "definition()['function']['parameters']['properties'] must be a dict"
+    required = params.get("required", [])
+    if not isinstance(required, list):
+        return "definition()['function']['parameters']['required'] must be a list"
+    for r in required:
+        if not isinstance(r, str):
+            return f"definition()['function']['parameters']['required'] entry {r!r} must be a string"
+        if r not in props:
+            return f"required parameter {r!r} is not declared in 'properties'"
+    return ""
+
+
 def _validate_tool_class(cls: type) -> str:
     """
     Validate that *cls* declares the required class attributes with correct types.
@@ -231,8 +293,51 @@ class ToolRegistry:
             name=name,
             description=tool_cls.DESCRIPTION,  # type: ignore[attr-defined]
         )
+        try:
+            defn = tool.definition()
+        except Exception as exc:
+            logger.warning(
+                "Skipping tool '%s' from %s tier: definition() raised — %s",
+                name,
+                tier,
+                exc,
+            )
+            return
+        defn_error = _validate_tool_definition(defn, expected_name=name)
+        if defn_error:
+            logger.warning(
+                "Skipping tool '%s' from %s tier: invalid definition() — %s",
+                name,
+                tier,
+                defn_error,
+            )
+            return
+
         self._tools[name] = tool
         self._enabled[name] = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
+        # Allow tools that need registry access (e.g. tool_manager) to receive
+        # a back-reference after construction.  Guard carefully: the attribute
+        # may exist on user-supplied tools with a different shape, and any
+        # exception here would abort loading for all subsequent tools.
+        set_reg = getattr(tool, "set_registry", None)
+        if set_reg is not None:
+            if not callable(set_reg):
+                logger.warning(
+                    "Tool '%s' has a non-callable 'set_registry' attribute — "
+                    "registry back-reference skipped.  If this is intentional, "
+                    "rename the attribute to avoid the conflict.",
+                    name,
+                )
+            else:
+                try:
+                    set_reg(self)
+                except Exception as exc:
+                    logger.warning(
+                        "Tool '%s': set_registry() raised an exception — "
+                        "registry access may not be available: %s",
+                        name,
+                        exc,
+                    )
 
     def register(self, tool_cls: type[Tool], tier: str = "programmatic") -> None:
         """
@@ -331,6 +436,17 @@ class ToolRegistry:
     def all_enabled(self) -> list[Tool]:
         """Return all tools that are currently enabled (session + persistent)."""
         return [tool for name, tool in self._tools.items() if self._is_enabled(name)]
+
+    def list_all(self) -> list[dict]:
+        """Return name, description, and enabled status for every registered tool."""
+        return [
+            {
+                "name": name,
+                "description": tool.description,
+                "enabled": self._is_enabled(name),
+            }
+            for name, tool in self._tools.items()
+        ]
 
     def definitions(self) -> list[dict]:
         """Return OpenAI-format schemas for all enabled tools."""

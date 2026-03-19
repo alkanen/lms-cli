@@ -25,7 +25,7 @@ class _EchoTool(Tool):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {},
+                "parameters": {"type": "object", "properties": {}, "required": []},
             },
         }
 
@@ -44,7 +44,7 @@ class _PermTool(Tool):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {},
+                "parameters": {"type": "object", "properties": {}, "required": []},
             },
         }
 
@@ -64,7 +64,7 @@ class _DisabledByDefaultTool(Tool):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {},
+                "parameters": {"type": "object", "properties": {}, "required": []},
             },
         }
 
@@ -131,6 +131,123 @@ class TestQueries:
         defs = reg.definitions()
         assert len(defs) == 1
         assert defs[0]["function"]["name"] == "echo"
+
+
+# ---------------------------------------------------------------------------
+# definition() validation
+# ---------------------------------------------------------------------------
+
+
+class TestDefinitionValidation:
+    def _make_bad_tool(self, bad_defn: dict) -> type:
+        class _BadDefnTool(_EchoTool):
+            NAME = "bad_tool"
+
+            def definition(self) -> dict:
+                return bad_defn
+
+        return _BadDefnTool
+
+    def test_valid_definition_is_registered(self, tmp_path):
+        reg = make_registry(tmp_path)
+        assert reg.get("echo") is not None
+
+    def test_missing_type_field_rejected(self, tmp_path, caplog):
+        import logging
+
+        cls = self._make_bad_tool(
+            {
+                "function": {
+                    "name": "bad_tool",
+                    "description": "x",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[cls])
+        assert reg.get("bad_tool") is None
+        assert any("invalid definition" in r.message for r in caplog.records)
+
+    def test_missing_function_name_rejected(self, tmp_path, caplog):
+        import logging
+
+        cls = self._make_bad_tool(
+            {
+                "type": "function",
+                "function": {
+                    "name": "",
+                    "description": "x",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[cls])
+        assert reg.get("bad_tool") is None
+
+    def test_required_param_not_in_properties_rejected(self, tmp_path, caplog):
+        import logging
+
+        cls = self._make_bad_tool(
+            {
+                "type": "function",
+                "function": {
+                    "name": "bad_tool",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": ["missing"],
+                    },
+                },
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[cls])
+        assert reg.get("bad_tool") is None
+        assert any("missing" in r.message for r in caplog.records)
+
+    def test_schema_name_mismatch_rejected(self, tmp_path, caplog):
+        import logging
+
+        cls = self._make_bad_tool(
+            {
+                "type": "function",
+                "function": {
+                    "name": "wrong_name",
+                    "description": "x",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[cls])
+        assert reg.get("bad_tool") is None
+        assert any("wrong_name" in r.message for r in caplog.records)
+
+    def test_non_dict_definition_rejected(self, tmp_path, caplog):
+        import logging
+
+        cls = self._make_bad_tool("not a dict")  # type: ignore[arg-type]
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[cls])
+        assert reg.get("bad_tool") is None
+
+    def test_raising_definition_warns_and_tool_not_registered(self, tmp_path, caplog):
+        import logging
+
+        class _RaisingDefnTool(_EchoTool):
+            NAME = "raising_defn"
+
+            def definition(self) -> dict:
+                raise RuntimeError("schema generation failed")
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[_RaisingDefnTool])
+
+        assert reg.get("raising_defn") is None
+        assert any("definition()" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +622,51 @@ class TestSetPermissionRequired:
             project_config_tools={"perm_tool": {"permission_required": False}},
         )
         assert reg.get("perm_tool").permission_required is True
+
+
+# ---------------------------------------------------------------------------
+# set_registry hook safety
+# ---------------------------------------------------------------------------
+
+
+class TestSetRegistryHook:
+    def test_set_registry_called_on_tool_that_defines_it(self, tmp_path):
+        calls = []
+
+        class _RegistryAwareTool(_EchoTool):
+            NAME = "reg_aware"
+
+            def set_registry(self, registry):
+                calls.append(registry)
+
+        reg = make_registry(tmp_path, tool_classes=[_RegistryAwareTool])
+        assert len(calls) == 1
+        assert calls[0] is reg
+
+    def test_non_callable_set_registry_warns_and_does_not_crash(self, tmp_path, caplog):
+        import logging
+
+        class _BadAttrTool(_EchoTool):
+            NAME = "bad_attr"
+            set_registry = "not_callable"  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[_BadAttrTool])
+
+        assert reg.get("bad_attr") is not None
+        assert any("non-callable" in r.message for r in caplog.records)
+
+    def test_raising_set_registry_warns_and_does_not_crash(self, tmp_path, caplog):
+        import logging
+
+        class _RaisingTool(_EchoTool):
+            NAME = "raising_tool"
+
+            def set_registry(self, registry):
+                raise RuntimeError("boom")
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[_RaisingTool])
+
+        assert reg.get("raising_tool") is not None
+        assert any("set_registry" in r.message for r in caplog.records)

@@ -62,8 +62,8 @@ class TestClassAttributes:
     def test_permission_required_false(self):
         assert FindFilesTool.PERMISSION_REQUIRED is False
 
-    def test_not_disabled_by_default(self):
-        assert not getattr(FindFilesTool, "DISABLED_BY_DEFAULT", False)
+    def test_disabled_by_default(self):
+        assert FindFilesTool.DISABLED_BY_DEFAULT is True
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +83,10 @@ class TestDefinition:
         defn = tool.definition()
         assert "pattern" in defn["function"]["parameters"]["required"]
 
-    def test_directory_is_optional(self, tmp_path):
+    def test_only_pattern_parameter(self, tmp_path):
         tool = make_tool(tmp_path)
-        defn = tool.definition()
-        required = defn["function"]["parameters"]["required"]
-        assert "directory" not in required
-        assert "directory" in defn["function"]["parameters"]["properties"]
+        props = tool.definition()["function"]["parameters"]["properties"]
+        assert list(props.keys()) == ["pattern"]
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +128,11 @@ class TestBasicMatching:
         result = tool.execute(pattern="*.py")
         assert result["data"]["matches"] == ["real.py"]
 
-    def test_pattern_and_directory_echoed_in_result(self, tmp_path):
+    def test_pattern_echoed_in_result(self, tmp_path):
         tool = make_tool(tmp_path)
-        result = tool.execute(pattern="*.py", directory=".")
+        result = tool.execute(pattern="*.py")
         assert result["data"]["pattern"] == "*.py"
-        assert result["data"]["directory"] == "."
+        assert "directory" not in result["data"]
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +171,25 @@ class TestRecursiveSearch:
         result = tool.execute(pattern="build/*.py")
         assert result["data"]["matches"] == []
 
-    def test_subdirectory_search(self, tmp_path):
+    def test_ignored_literal_prefix_returns_empty_immediately(self, tmp_path):
+        # When the literal directory prefix of a pattern is ignored, the tool
+        # should short-circuit rather than falling back to walking workspace_root.
+        _write(tmp_path / "build" / "out.py")
+        _write(tmp_path / "src" / "main.py")
+        ignore = tmp_path / ".ai-cli" / ".ignore"
+        ignore.parent.mkdir(parents=True, exist_ok=True)
+        ignore.write_text("build/\n", encoding="utf-8")
+        tool = make_tool(tmp_path)
+        result = tool.execute(pattern="build/**/*.py")
+        assert result["status"] == "success"
+        assert result["data"]["matches"] == []
+
+    def test_subdirectory_search_via_pattern_prefix(self, tmp_path):
         _write(tmp_path / "root.py")
         _write(tmp_path / "src" / "a.py")
         _write(tmp_path / "src" / "b.py")
         tool = make_tool(tmp_path)
-        result = tool.execute(pattern="*.py", directory="src")
-        # Paths are relative to workspace root
+        result = tool.execute(pattern="src/*.py")
         assert set(result["data"]["matches"]) == {"src/a.py", "src/b.py"}
 
     def test_fixed_depth_pattern_with_slash(self, tmp_path):
@@ -226,6 +236,43 @@ class TestRecursiveSearch:
         result = tool.execute(pattern="src/*.py")
         assert result["status"] == "success"
         assert result["data"]["matches"] == []
+
+    def test_recursive_pattern_with_literal_prefix_narrows_walk(self, tmp_path):
+        # 'src/**/*.py' has a literal prefix 'src/', so the walk should start
+        # at src/ and never enter sibling directories like tests/ or docs/.
+        _write(tmp_path / "src" / "a.py")
+        _write(tmp_path / "src" / "sub" / "b.py")
+        _write(tmp_path / "tests" / "c.py")
+        _write(tmp_path / "docs" / "d.py")
+        tool = make_tool(tmp_path)
+        result = tool.execute(pattern="src/**/*.py")
+        assert result["status"] == "success"
+        assert set(result["data"]["matches"]) == {"src/a.py", "src/sub/b.py"}
+
+    def test_double_star_named_dir_matches_at_root(self, tmp_path):
+        # '**/docs/*' must find files in a 'docs/' directory at the workspace
+        # root.  Regression: this pattern stalled when large unignored
+        # directories existed alongside docs/ because is_ignored() used
+        # path.resolve() (expensive on WSL/NTFS) instead of normpath.
+        _write(tmp_path / "docs" / "guide.md")
+        _write(tmp_path / "docs" / "api.md")
+        _write(tmp_path / "src" / "main.py")
+        # Simulate an extra directory not covered by ignore rules.
+        for i in range(5):
+            _write(tmp_path / "other" / f"file_{i}.txt")
+        tool = make_tool(tmp_path)
+        result = tool.execute(pattern="**/docs/*")
+        assert result["status"] == "success"
+        assert set(result["data"]["matches"]) == {"docs/guide.md", "docs/api.md"}
+
+    def test_double_star_named_dir_matches_in_subdirectory(self, tmp_path):
+        # '**/docs/*' must also match when docs/ is nested, not just at root.
+        _write(tmp_path / "pkg" / "docs" / "readme.md")
+        _write(tmp_path / "pkg" / "src" / "main.py")
+        tool = make_tool(tmp_path)
+        result = tool.execute(pattern="**/docs/*")
+        assert result["status"] == "success"
+        assert result["data"]["matches"] == ["pkg/docs/readme.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -374,22 +421,6 @@ class TestErrorCases:
         result = tool.execute(pattern="[z-a].py")
         assert result["status"] == "error"
         assert result["error"] == "invalid_input"
-
-    def test_nonexistent_directory_returns_error(self, tmp_path):
-        tool = make_tool(tmp_path)
-        result = tool.execute(pattern="*.py", directory="does_not_exist")
-        assert result["status"] == "error"
-
-    def test_directory_escape_returns_error(self, tmp_path):
-        tool = make_tool(tmp_path)
-        result = tool.execute(pattern="*.py", directory="../outside")
-        assert result["status"] == "error"
-
-    def test_file_as_directory_returns_error(self, tmp_path):
-        _write(tmp_path / "afile.txt")
-        tool = make_tool(tmp_path)
-        result = tool.execute(pattern="*.py", directory="afile.txt")
-        assert result["status"] == "error"
 
     def test_dotdot_pattern_segment_returns_error(self, tmp_path):
         tool = make_tool(tmp_path)

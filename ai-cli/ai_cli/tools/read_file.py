@@ -1,7 +1,7 @@
 """
 read_file — read a file (or line range) from the workspace.
 
-Enabled by default, no permission required by default.  When
+Disabled by default, no permission required by default.  When
 ``permission_required`` is enabled via config, the tool maintains its own
 session-scoped allow-list so the user can grant permanent-for-session access
 at the file level or at any ancestor directory level up to the workspace root.
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.workspace import WorkspaceError
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -28,6 +28,7 @@ class ReadFileTool(Tool):
         "For an empty file, start_line and end_line are both 0."
     )
     PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = True
 
     def __init__(
         self,
@@ -133,40 +134,37 @@ class ReadFileTool(Tool):
     # ------------------------------------------------------------------
 
     def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": (
-                                "Path to the file, relative to the workspace root "
-                                "(e.g. './src/main.py')."
-                            ),
-                        },
-                        "start_line": {
-                            "type": "integer",
-                            "description": (
-                                "1-based first line to read (inclusive). "
-                                "Omit to start from the beginning of the file."
-                            ),
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": (
-                                "1-based last line to read (inclusive). "
-                                "Omit to read to the end of the file."
-                            ),
-                        },
-                    },
-                    "required": ["path"],
-                },
-            },
-        }
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    name="path",
+                    description=(
+                        "Path to the file, relative to the workspace root "
+                        "(e.g. './src/main.py')."
+                    ),
+                    argument_type="string",
+                    required=True,
+                ),
+                ToolArgument(
+                    name="start_line",
+                    description=(
+                        "1-based first line to read (inclusive). "
+                        "Omit to start from the beginning of the file."
+                    ),
+                    argument_type="integer",
+                ),
+                ToolArgument(
+                    name="end_line",
+                    description=(
+                        "1-based last line to read (inclusive). "
+                        "Omit to read to the end of the file."
+                    ),
+                    argument_type="integer",
+                ),
+            ],
+        ).schema()
 
     # ------------------------------------------------------------------
     # Execution

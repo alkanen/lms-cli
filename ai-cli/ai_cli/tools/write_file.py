@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.workspace import WorkspaceError
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -23,6 +23,7 @@ class WriteFileTool(Tool):
     NAME = "write_file"
     DESCRIPTION = "Write or partially replace a file in the workspace."
     PERMISSION_REQUIRED = True
+    DISABLED_BY_DEFAULT = True
 
     def __init__(
         self,
@@ -128,58 +129,57 @@ class WriteFileTool(Tool):
     # ------------------------------------------------------------------
 
     def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": (
-                    "Write content to a workspace file. "
-                    "If start_line and end_line are omitted, performs a full write — "
-                    "creating the file and any missing parent directories. "
-                    "If both are provided, replaces only those lines in an existing "
-                    "file (the file must already exist for partial writes)."
+        return ToolSchema(
+            name=self.name,
+            description=(
+                "Write content to a workspace file. "
+                "If start_line and end_line are omitted, performs a full write — "
+                "creating the file and any missing parent directories. "
+                "If both are provided, replaces only those lines in an existing "
+                "file (the file must already exist for partial writes)."
+            ),
+            arguments=[
+                ToolArgument(
+                    name="path",
+                    description=(
+                        "Path to the file, relative to the workspace root "
+                        "(e.g. './src/main.py'). For full writes, parent "
+                        "directories are created automatically. For partial "
+                        "writes, the file must already exist."
+                    ),
+                    argument_type="string",
+                    required=True,
                 ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": (
-                                "Path to the file, relative to the workspace root "
-                                "(e.g. './src/main.py'). For full writes, parent "
-                                "directories are created automatically. For partial "
-                                "writes, the file must already exist."
-                            ),
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": (
-                                "For a full write: the complete new file content. "
-                                "For a partial write: the replacement text for lines "
-                                "start_line through end_line."
-                            ),
-                        },
-                        "start_line": {
-                            "type": "integer",
-                            "description": (
-                                "1-based first line to replace (inclusive). "
-                                "Must be provided together with end_line for a "
-                                "partial write. Omit for a full write."
-                            ),
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": (
-                                "1-based last line to replace (inclusive). "
-                                "Must be provided together with start_line for a "
-                                "partial write. Omit for a full write."
-                            ),
-                        },
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-        }
+                ToolArgument(
+                    name="content",
+                    description=(
+                        "For a full write: the complete new file content. "
+                        "For a partial write: the replacement text for lines "
+                        "start_line through end_line."
+                    ),
+                    argument_type="string",
+                    required=True,
+                ),
+                ToolArgument(
+                    name="start_line",
+                    description=(
+                        "1-based first line to replace (inclusive). "
+                        "Must be provided together with end_line for a "
+                        "partial write. Omit for a full write."
+                    ),
+                    argument_type="integer",
+                ),
+                ToolArgument(
+                    name="end_line",
+                    description=(
+                        "1-based last line to replace (inclusive). "
+                        "Must be provided together with start_line for a "
+                        "partial write. Omit for a full write."
+                    ),
+                    argument_type="integer",
+                ),
+            ],
+        ).schema()
 
     # ------------------------------------------------------------------
     # Execution
