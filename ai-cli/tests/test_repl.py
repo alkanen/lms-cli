@@ -530,6 +530,63 @@ class TestREPLSendToLLM:
         second_tools = llm.send.call_args_list[1][1]["tools"]
         assert any(t["function"]["name"] == "read_file" for t in second_tools)
 
+    def test_disallowed_tool_shows_user_hint_and_sends_unknown_tool_to_llm(self):
+        # When the registry returns tool_disallowed, the REPL must:
+        # 1. Show a user-facing hint via show_error (with correct wording).
+        # 2. Replace the result with unknown_tool before it reaches the LLM.
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {
+            "status": "error",
+            "error": "tool_disallowed",
+            "message": "Tool 'secret' is not available.",
+            "code": 403,
+        }
+
+        llm = MagicMock()
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "secret",
+                        "call_id": "1",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter([{"type": "done", "stop_reason": "stop", "usage": {}}]),
+        ]
+
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+        repl._send_to_llm("use secret")
+
+        # User sees the hint with the correct wording.
+        display.show_error.assert_called_once()
+        hint = display.show_error.call_args[0][0]
+        assert "secret" in hint
+        assert "allow" in hint
+        assert "list of available tools" in hint
+
+        # The message saved for the LLM must contain unknown_tool, not tool_disallowed.
+        tool_result_msgs = [
+            c[0][0]
+            for c in session.add_raw_message.call_args_list
+            if c[0][0].get("role") == "tool"
+        ]
+        assert len(tool_result_msgs) == 1
+        import json as _json
+        content = _json.loads(tool_result_msgs[0]["content"])
+        assert content.get("error") == "unknown_tool"
+        assert content.get("error") != "tool_disallowed"
+
     def test_tools_list_deduplicates_by_name(self):
         # If a transient schema and an already-enabled definition share a name,
         # only one schema should be sent to the LLM (transient takes precedence).
@@ -663,3 +720,257 @@ class TestREPLCompaction:
         repl = _make_repl(session=session, display=display)
         repl._check_compaction()
         display.show_error.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# /compact with instructions
+# ---------------------------------------------------------------------------
+
+
+class TestCompactSubcommand:
+    def test_compact_no_instructions_passes_empty_string(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("compact")
+        session.compact.assert_called_once_with(instructions="")
+
+    def test_compact_with_instructions_passes_them(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("compact Summarise the key decisions only")
+        session.compact.assert_called_once_with(
+            instructions="Summarise the key decisions only"
+        )
+
+    def test_compact_error_shows_error(self):
+        session = MagicMock()
+        session.compact.side_effect = SessionError("LLM down")
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("compact focus on bugs")
+        display.show_error.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# /tools subcommands
+# ---------------------------------------------------------------------------
+
+
+class TestToolsSubcommand:
+    def _reg(self, all_enabled=None, all_tools_info=None, tool_info_val=None):
+        tr = MagicMock()
+        tr.all_enabled.return_value = all_enabled if all_enabled is not None else []
+        tr.all_tools_info.return_value = (
+            all_tools_info if all_tools_info is not None else []
+        )
+        tr.tool_info.return_value = tool_info_val
+        return tr
+
+    def test_tools_no_subcommand_shows_enabled_list(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools")
+        display.show_tool_list.assert_called_once_with([])
+
+    def test_tools_list_shows_all_tools(self):
+        info_list = [{"name": "echo", "enabled": True, "allowed": True}]
+        tool_registry = self._reg(all_tools_info=info_list)
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools list")
+        display.show_tool_list_all.assert_called_once_with(info_list)
+
+    def test_tools_info_known_tool(self):
+        info = {"name": "echo", "description": "Echoes."}
+        tool_registry = self._reg(tool_info_val=info)
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools info echo")
+        tool_registry.tool_info.assert_called_once_with("echo")
+        display.show_tool_info.assert_called_once_with(info)
+
+    def test_tools_info_unknown_tool_shows_error(self):
+        tool_registry = self._reg(tool_info_val=None)
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools info ghost")
+        display.show_error.assert_called_once()
+
+    def test_tools_info_missing_name_shows_error(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools info")
+        display.show_error.assert_called_once()
+
+    def test_tools_enable_calls_enable(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable read_file")
+        tool_registry.enable.assert_called_once_with("read_file")
+        display.show_status.assert_called_once()
+
+    def test_tools_disable_calls_disable(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools disable write_file")
+        tool_registry.disable.assert_called_once_with("write_file")
+
+    def test_tools_enable_session_calls_enable_session(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable --session read_file")
+        tool_registry.enable_session.assert_called_once_with("read_file")
+        tool_registry.enable.assert_not_called()
+
+    def test_tools_disable_session_calls_disable_session(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools disable --session write_file")
+        tool_registry.disable_session.assert_called_once_with("write_file")
+
+    def test_tools_allow_calls_allow(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools allow bash")
+        tool_registry.allow.assert_called_once_with("bash")
+
+    def test_tools_disallow_calls_disallow(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools disallow bash")
+        tool_registry.disallow.assert_called_once_with("bash")
+
+    def test_tools_allow_session(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools allow --session bash")
+        tool_registry.allow_session.assert_called_once_with("bash")
+        tool_registry.allow.assert_not_called()
+
+    def test_tools_disallow_session(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools disallow --session bash")
+        tool_registry.disallow_session.assert_called_once_with("bash")
+        tool_registry.disallow.assert_not_called()
+
+    def test_tools_enable_missing_name_shows_error(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable")
+        display.show_error.assert_called_once()
+
+    def test_tools_enable_unknown_tool_shows_error(self):
+        tool_registry = self._reg()
+        tool_registry.get.return_value = None  # unknown tool
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable ghost_tool")
+        display.show_error.assert_called_once()
+        tool_registry.enable.assert_not_called()
+
+    def test_tools_unknown_subcommand_shows_error(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools frobnicate")
+        display.show_error.assert_called_once()
+        assert "frobnicate" in display.show_error.call_args[0][0]
+
+    def test_status_message_uses_correct_past_tense(self):
+        for sub, expected_past in [
+            ("enable", "enabled"),
+            ("disable", "disabled"),
+            ("allow", "allowed"),
+            ("disallow", "disallowed"),
+        ]:
+            tool_registry = self._reg()
+            display = MagicMock()
+            repl = _make_repl(tool_registry=tool_registry, display=display)
+            repl._handle_slash_command(f"tools {sub} read_file")
+            msg = display.show_status.call_args[0][0]
+            assert expected_past in msg, (
+                f"{sub!r} → expected {expected_past!r} in {msg!r}"
+            )
+
+    def test_status_message_mentions_scope_persistent(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable read_file")
+        msg = display.show_status.call_args[0][0]
+        assert "persistently" in msg
+
+    def test_status_message_mentions_scope_session(self):
+        tool_registry = self._reg()
+        display = MagicMock()
+        repl = _make_repl(tool_registry=tool_registry, display=display)
+        repl._handle_slash_command("tools enable --session read_file")
+        msg = display.show_status.call_args[0][0]
+        assert "session" in msg
+
+
+# ---------------------------------------------------------------------------
+# /session subcommands
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSubcommand:
+    def test_session_no_subcommand_shows_info(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session")
+        display.show_session_info.assert_called_once_with(session)
+
+    def test_session_name_calls_set_name(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session name my-chat")
+        session.set_name.assert_called_once_with("my-chat")
+        display.show_status.assert_called_once()
+
+    def test_session_name_with_spaces(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session name bug fix session")
+        session.set_name.assert_called_once_with("bug fix session")
+
+    def test_session_name_missing_name_shows_error(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session name")
+        display.show_error.assert_called_once()
+        session.set_name.assert_not_called()
+
+    def test_session_name_error_shows_error(self):
+        session = MagicMock()
+        session.set_name.side_effect = SessionError("disk full")
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session name my-name")
+        display.show_error.assert_called_once()
+
+    def test_session_unknown_subcommand_shows_error(self):
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("session frobnicate")
+        display.show_error.assert_called_once()
+        assert "frobnicate" in display.show_error.call_args[0][0]

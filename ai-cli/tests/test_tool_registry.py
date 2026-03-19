@@ -483,6 +483,107 @@ class TestSessionEnable:
 
 
 # ---------------------------------------------------------------------------
+# Allow / disallow
+# ---------------------------------------------------------------------------
+
+
+class TestAllowed:
+    def test_disallowed_tool_not_in_all_enabled(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        assert not any(t.name == "echo" for t in reg.all_enabled())
+
+    def test_disallowed_tool_not_in_list_all(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        names = [t["name"] for t in reg.list_all()]
+        assert "echo" not in names
+
+    def test_disallowed_tool_execute_returns_error(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        result = reg.execute("echo", {})
+        assert result["status"] == "error"
+        assert result["error"] == "tool_disallowed"
+
+    def test_disallow_persists_to_config(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        cfg = yaml.safe_load((tmp_path / ".ai-cli" / "config.yaml").read_text())
+        assert cfg["tools"]["echo"]["allowed"] is False
+
+    def test_allow_re_enables_disallowed_tool(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        assert not reg._is_allowed("echo")
+        reg.allow("echo")
+        assert reg._is_allowed("echo")
+
+    def test_allow_writes_to_project_config(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        reg.allow("echo")
+        cfg = yaml.safe_load((tmp_path / ".ai-cli" / "config.yaml").read_text())
+        assert cfg["tools"]["echo"]["allowed"] is True
+
+    def test_disallow_session_hides_tool(self, tmp_path):
+        reg = make_registry(tmp_path)
+        assert reg._is_allowed("echo")
+        reg.disallow_session("echo")
+        assert not reg._is_allowed("echo")
+
+    def test_allow_session_overrides_persistent_disallow(self, tmp_path):
+        reg = make_registry(tmp_path, config_tools={"echo": {"allowed": False}})
+        assert not reg._is_allowed("echo")
+        reg.allow_session("echo")
+        assert reg._is_allowed("echo")
+
+    def test_session_disallow_does_not_write_config(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow_session("echo")
+        config_path = tmp_path / ".ai-cli" / "config.yaml"
+        assert not config_path.exists()
+
+    def test_transient_enable_blocked_for_disallowed(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        assert reg.enable_transient("echo") is None
+
+    def test_reset_clears_session_allowed_overrides(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow_session("echo")
+        assert not reg._is_allowed("echo")
+        reg.reset_session_overrides()
+        assert reg._is_allowed("echo")
+
+    def test_all_tools_info_includes_disallowed(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("echo")
+        info_list = reg.all_tools_info()
+        echo_info = next(i for i in info_list if i["name"] == "echo")
+        assert echo_info["allowed"] is False
+
+    def test_tool_info_returns_none_for_unknown(self, tmp_path):
+        reg = make_registry(tmp_path)
+        assert reg.tool_info("ghost") is None
+
+    def test_tool_info_returns_dict_for_known(self, tmp_path):
+        reg = make_registry(tmp_path)
+        info = reg.tool_info("echo")
+        assert info is not None
+        assert info["name"] == "echo"
+        assert "parameters" in info
+
+    def test_allow_unknown_tool_is_noop(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.allow("nonexistent")  # should not raise
+
+    def test_disallow_unknown_tool_is_noop(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.disallow("nonexistent")  # should not raise
+
+
+# ---------------------------------------------------------------------------
 # Transient enable
 # ---------------------------------------------------------------------------
 
@@ -556,25 +657,75 @@ class TestConfigApplication:
         # Default should be preserved (False), not coerced to True.
         assert reg.get("echo").permission_required is False
 
-    def test_project_config_cannot_lower_permission_required(self, tmp_path):
-        # Project config is untrusted — it must not silently disable permissions.
+    def test_project_config_can_lower_permission_required(self, tmp_path):
+        # Project config overrides global — it can lower permission_required.
         reg = make_registry(
             tmp_path,
             tool_classes=[_PermTool],
             config_tools={"perm_tool": {"permission_required": False}},
             project_config_tools={"perm_tool": {"permission_required": False}},
         )
-        assert reg.get("perm_tool").permission_required is True
+        assert reg.get("perm_tool").permission_required is False
 
     def test_global_config_can_lower_permission_required(self, tmp_path):
-        # Global (~/.ai-cli/config.yaml) is trusted — lowering is allowed without marker.
+        # Global config can lower permission_required when no project override exists.
         reg = make_registry(
             tmp_path,
             tool_classes=[_PermTool],
             config_tools={"perm_tool": {"permission_required": False}},
-            # project_config_tools left empty → lowering came from global only
         )
         assert reg.get("perm_tool").permission_required is False
+
+    def test_lowering_permission_required_logs_warning(self, tmp_path, caplog):
+        # Config is allowed to lower permission_required, but a warning must be logged
+        # so the user knows their prompts are being skipped.
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            make_registry(
+                tmp_path,
+                tool_classes=[_PermTool],
+                config_tools={"perm_tool": {"permission_required": False}},
+            )
+        assert any(
+            "perm_tool" in r.message and "permission_required" in r.message
+            for r in caplog.records
+        )
+
+    def test_config_can_re_allow_tool(self, tmp_path):
+        # A tool disallowed by config can be re-allowed by a higher-precedence config entry.
+        reg_disallowed = make_registry(
+            tmp_path,
+            tool_classes=[_EchoTool],
+            config_tools={"echo": {"allowed": False}},
+        )
+        assert not reg_disallowed._is_allowed("echo")
+
+        reg_reallowed = make_registry(
+            tmp_path,
+            tool_classes=[_EchoTool],
+            config_tools={"echo": {"allowed": True}},
+        )
+        assert reg_reallowed._is_allowed("echo")
+
+    def test_project_config_can_re_allow_tool(self, tmp_path):
+        # Project config overrides global — project allowed: true re-allows a globally
+        # disallowed tool (project config is the higher-precedence layer).
+        reg_global_disallowed = make_registry(
+            tmp_path,
+            tool_classes=[_EchoTool],
+            config_tools={"echo": {"allowed": False}},
+        )
+        assert not reg_global_disallowed._is_allowed("echo")
+
+        reg_project_reallowed = make_registry(
+            tmp_path,
+            tool_classes=[_EchoTool],
+            # merged config reflects project overriding global disallow
+            config_tools={"echo": {"allowed": True}},
+            project_config_tools={"echo": {"allowed": True}},
+        )
+        assert reg_project_reallowed._is_allowed("echo")
 
 
 # ---------------------------------------------------------------------------
@@ -595,16 +746,13 @@ class TestSetPermissionRequired:
         cfg = yaml.safe_load((tmp_path / ".ai-cli" / "config.yaml").read_text())
         assert cfg["tools"]["echo"]["permission_required"] is True
 
-    def test_lowering_permission_requires_user_confirmed_marker(self, tmp_path):
-        # set_permission_required(False) writes user_confirmed=True so the
-        # setting survives a config reload without being blocked as untrusted.
+    def test_lowering_permission_persists_and_survives_reload(self, tmp_path):
+        # set_permission_required(False) writes to project config and survives reload.
         reg = make_registry(tmp_path, tool_classes=[_PermTool])
-        assert reg.get("perm_tool").permission_required is True
         reg.set_permission_required("perm_tool", False)
         cfg = yaml.safe_load((tmp_path / ".ai-cli" / "config.yaml").read_text())
         assert cfg["tools"]["perm_tool"]["permission_required"] is False
-        assert cfg["tools"]["perm_tool"]["user_confirmed"] is True
-        # Simulated reload — the marker in the project layer allows the lowering.
+        # Reload — project config overrides the tool default, lowering is honoured.
         reg2 = make_registry(
             tmp_path,
             tool_classes=[_PermTool],
@@ -612,16 +760,6 @@ class TestSetPermissionRequired:
             project_config_tools=cfg["tools"],
         )
         assert reg2.get("perm_tool").permission_required is False
-
-    def test_untrusted_config_cannot_lower_permission(self, tmp_path):
-        # Project config without user_confirmed must not lower permission_required.
-        reg = make_registry(
-            tmp_path,
-            tool_classes=[_PermTool],
-            config_tools={"perm_tool": {"permission_required": False}},
-            project_config_tools={"perm_tool": {"permission_required": False}},
-        )
-        assert reg.get("perm_tool").permission_required is True
 
 
 # ---------------------------------------------------------------------------

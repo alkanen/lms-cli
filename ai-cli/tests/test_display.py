@@ -381,6 +381,136 @@ class TestPlainDisplaySessionList:
 
 
 # ---------------------------------------------------------------------------
+# PlainDisplay — show_tool_list_all
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayToolListAll:
+    def _info(
+        self,
+        name: str,
+        *,
+        enabled: bool = True,
+        allowed: bool = True,
+        permission_required: bool = False,
+        tier: str = "bundled",
+    ) -> dict:
+        return {
+            "name": name,
+            "description": f"The {name} tool.",
+            "enabled": enabled,
+            "allowed": allowed,
+            "permission_required": permission_required,
+            "tier": tier,
+        }
+
+    def test_prints_tool_names(self, capsys):
+        d = _plain()
+        d.show_tool_list_all([self._info("read_file"), self._info("write_file")])
+        out = capsys.readouterr().out
+        assert "read_file" in out
+        assert "write_file" in out
+
+    def test_enabled_status_shown(self, capsys):
+        d = _plain()
+        d.show_tool_list_all([self._info("echo", enabled=True)])
+        assert "enabled" in capsys.readouterr().out
+
+    def test_disabled_status_shown(self, capsys):
+        d = _plain()
+        d.show_tool_list_all([self._info("echo", enabled=False)])
+        assert "disabled" in capsys.readouterr().out
+
+    def test_disallowed_status_shown(self, capsys):
+        d = _plain()
+        d.show_tool_list_all([self._info("echo", allowed=False)])
+        assert "disallowed" in capsys.readouterr().out
+
+    def test_empty_list_shows_no_tools_message(self, capsys):
+        d = _plain()
+        d.show_tool_list_all([])
+        assert "No tools" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# PlainDisplay — show_tool_info
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayToolInfo:
+    def _info(
+        self,
+        *,
+        enabled: bool = True,
+        allowed: bool = True,
+        permission_required: bool = False,
+    ) -> dict:
+        return {
+            "name": "read_file",
+            "description": "Read a file from the workspace.",
+            "enabled": enabled,
+            "allowed": allowed,
+            "permission_required": permission_required,
+            "tier": "bundled",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                },
+                "required": ["path"],
+            },
+        }
+
+    def test_prints_name(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info())
+        assert "read_file" in capsys.readouterr().out
+
+    def test_prints_description(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info())
+        assert "Read a file" in capsys.readouterr().out
+
+    def test_enabled_status(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info(enabled=True))
+        assert "enabled" in capsys.readouterr().out
+
+    def test_disallowed_status(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info(allowed=False))
+        assert "disallowed" in capsys.readouterr().out
+
+    def test_disabled_status(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info(enabled=False))
+        assert "disabled" in capsys.readouterr().out
+
+    def test_prints_parameter_name(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info())
+        assert "path" in capsys.readouterr().out
+
+    def test_marks_required_parameter(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info())
+        assert "path: string (required)" in capsys.readouterr().out
+
+    def test_permission_not_required(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info(permission_required=False))
+        assert "not required" in capsys.readouterr().out
+
+    def test_permission_required(self, capsys):
+        d = _plain()
+        d.show_tool_info(self._info(permission_required=True))
+        # "required" appears either in "required" or "not required"
+        out = capsys.readouterr().out
+        assert "required" in out
+        assert "not required" not in out
+
+
+# ---------------------------------------------------------------------------
 # create_display factory
 # ---------------------------------------------------------------------------
 
