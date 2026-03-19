@@ -2,11 +2,13 @@
 
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ai_cli.__main__ import _RESUME_PICK, _pick_session
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
+from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
 
 
@@ -224,3 +226,254 @@ class TestInvalidGlobalDirEnv:
         assert exc_info.value.code != 0
         err = capsys.readouterr().err
         assert "AI_CLI_GLOBAL_DIR" in err
+
+
+# ---------------------------------------------------------------------------
+# parse_args — new session flags
+# ---------------------------------------------------------------------------
+
+
+class TestParseArgs:
+    def test_no_session_flags(self):
+        with patch("sys.argv", ["ai-cli"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.resume is None
+        assert args.continue_ is False
+
+    def test_resume_no_argument_stores_sentinel(self):
+        with patch("sys.argv", ["ai-cli", "--resume"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.resume is _RESUME_PICK
+
+    def test_resume_with_session_id(self):
+        with patch("sys.argv", ["ai-cli", "--resume", "20260319T120000-abcd1234"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.resume == "20260319T120000-abcd1234"
+
+    def test_continue_flag(self):
+        with patch("sys.argv", ["ai-cli", "--continue"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.continue_ is True
+
+
+# ---------------------------------------------------------------------------
+# _pick_session
+# ---------------------------------------------------------------------------
+
+
+def _make_session(session_id: str = "abc") -> MagicMock:
+    s = MagicMock()
+    s.session_id = session_id
+    return s
+
+
+def _make_meta(session_id: str = "abc") -> MagicMock:
+    m = MagicMock()
+    m.session_id = session_id
+    return m
+
+
+class TestPickSession:
+    def _sm(
+        self,
+        *,
+        new_session=None,
+        loaded_session=None,
+        recent_session=None,
+        sessions=None,
+    ):
+        sm = MagicMock()
+        sm.new.return_value = new_session or _make_session("new-id")
+        sm.load.return_value = loaded_session or _make_session("loaded-id")
+        sm.most_recent.return_value = recent_session
+        sm.list.return_value = sessions if sessions is not None else []
+        return sm
+
+    def _display(self, choice=None):
+        d = MagicMock()
+        d.show_session_list.return_value = choice
+        return d
+
+    def test_no_flags_creates_new_session(self):
+        new_sess = _make_session("new-id")
+        sm = self._sm(new_session=new_sess)
+        session, resumed = _pick_session(
+            sm,
+            self._display(),
+            MagicMock(),
+            resume_id=None,
+            resume_list=False,
+            continue_=False,
+        )
+        sm.new.assert_called_once()
+        assert session is new_sess
+        assert resumed is False
+
+    def test_resume_id_loads_specific_session(self):
+        loaded = _make_session("target-id")
+        sm = self._sm(loaded_session=loaded)
+        session, resumed = _pick_session(
+            sm,
+            self._display(),
+            MagicMock(),
+            resume_id="target-id",
+            resume_list=False,
+            continue_=False,
+        )
+        sm.load.assert_called_once_with("target-id")
+        assert session is loaded
+        assert resumed is True
+
+    def test_resume_id_propagates_session_error(self):
+        sm = self._sm()
+        sm.load.side_effect = SessionError("not found")
+        with pytest.raises(SessionError, match="not found"):
+            _pick_session(
+                sm,
+                self._display(),
+                MagicMock(),
+                resume_id="bad-id",
+                resume_list=False,
+                continue_=False,
+            )
+
+    def test_resume_list_user_picks_session(self):
+        meta = _make_meta("picked-id")
+        loaded = _make_session("picked-id")
+        sm = self._sm(loaded_session=loaded, sessions=[meta])
+        display = self._display(choice=meta)
+        workspace_root = MagicMock()
+
+        session, resumed = _pick_session(
+            sm,
+            display,
+            workspace_root,
+            resume_id=None,
+            resume_list=True,
+            continue_=False,
+        )
+        sm.list.assert_called_once_with(workspace_root)
+        display.show_session_list.assert_called_once_with([meta])
+        sm.load.assert_called_once_with("picked-id")
+        assert session is loaded
+        assert resumed is True
+
+    def test_resume_list_user_declines_creates_new(self):
+        new_sess = _make_session("new-id")
+        sm = self._sm(new_session=new_sess, sessions=[_make_meta()])
+        display = self._display(choice=None)
+
+        session, resumed = _pick_session(
+            sm,
+            display,
+            MagicMock(),
+            resume_id=None,
+            resume_list=True,
+            continue_=False,
+        )
+        sm.new.assert_called_once()
+        assert session is new_sess
+        assert resumed is False
+
+    def test_resume_list_empty_sessions_creates_new(self):
+        new_sess = _make_session("new-id")
+        sm = self._sm(new_session=new_sess, sessions=[])
+        display = self._display(choice=None)
+
+        session, resumed = _pick_session(
+            sm,
+            display,
+            MagicMock(),
+            resume_id=None,
+            resume_list=True,
+            continue_=False,
+        )
+        sm.new.assert_called_once()
+        assert session is new_sess
+        assert resumed is False
+
+    def test_continue_with_existing_session(self):
+        recent = _make_session("recent-id")
+        sm = self._sm(recent_session=recent)
+        workspace_root = MagicMock()
+
+        session, resumed = _pick_session(
+            sm,
+            self._display(),
+            workspace_root,
+            resume_id=None,
+            resume_list=False,
+            continue_=True,
+        )
+        sm.most_recent.assert_called_once_with(workspace_root)
+        assert session is recent
+        assert resumed is True
+
+    def test_continue_no_sessions_creates_new(self):
+        new_sess = _make_session("new-id")
+        sm = self._sm(new_session=new_sess, recent_session=None)
+        workspace_root = MagicMock()
+
+        session, resumed = _pick_session(
+            sm,
+            self._display(),
+            workspace_root,
+            resume_id=None,
+            resume_list=False,
+            continue_=True,
+        )
+        sm.most_recent.assert_called_once_with(workspace_root)
+        sm.new.assert_called_once()
+        assert session is new_sess
+        assert resumed is False
+
+
+# ---------------------------------------------------------------------------
+# main() — flag routing and mutual-exclusion
+# ---------------------------------------------------------------------------
+
+
+class TestMainRouting:
+    """Verify that main() routes flags to the correct _cmd_repl kwargs."""
+
+    def _run(self, argv, monkeypatch):
+        captured = {}
+
+        def fake_repl(*args, **kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr("ai_cli.__main__._cmd_repl", fake_repl)
+        run_main(argv)
+        return captured
+
+    def test_no_flags_calls_default(self, monkeypatch):
+        kwargs = self._run([], monkeypatch)
+        assert not kwargs.get("resume_id")
+        assert not kwargs.get("resume_list")
+        assert not kwargs.get("continue_")
+
+    def test_resume_no_arg_sets_resume_list(self, monkeypatch):
+        kwargs = self._run(["--resume"], monkeypatch)
+        assert kwargs.get("resume_list") is True
+
+    def test_resume_with_id_sets_resume_id(self, monkeypatch):
+        kwargs = self._run(["--resume", "20260319T120000-abcd1234"], monkeypatch)
+        assert kwargs.get("resume_id") == "20260319T120000-abcd1234"
+
+    def test_continue_sets_continue(self, monkeypatch):
+        kwargs = self._run(["--continue"], monkeypatch)
+        assert kwargs.get("continue_") is True
+
+    def test_resume_and_continue_together_exits_nonzero(self, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            run_main(["--resume", "--continue"])
+        assert exc_info.value.code == 1
+        assert "--resume" in capsys.readouterr().err

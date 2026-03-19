@@ -5,7 +5,9 @@ Run with:  python -m ai_cli [options]
 
 Currently implemented:
   --init [--workspace PATH]   Scaffold a .ai-cli/ project directory.
-  (no flags)                  Start the interactive REPL.
+  --resume [SESSION_ID]       Resume a session: pick from list, or load by ID.
+  --continue                  Continue the most recent session (or start new).
+  (no flags)                  Start the interactive REPL with a fresh session.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -21,9 +24,16 @@ from ai_cli.cli.repl import REPL
 from ai_cli.core.config_manager import ConfigError, ConfigManager
 from ai_cli.core.llm_client import LLMError, create_llm_client
 from ai_cli.core.permission_manager import PermissionManager
-from ai_cli.core.session_manager import SessionError, SessionManager
+from ai_cli.core.session_manager import Session, SessionError, SessionManager
 from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
+
+if TYPE_CHECKING:
+    from ai_cli.cli.display import Display
+
+# Sentinel stored by argparse when --resume is given with no SESSION_ID argument.
+# Using an object() ensures it cannot be confused with a real session-ID string.
+_RESUME_PICK: object = object()
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +51,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Initialise a new .ai-cli/ project scaffold in the workspace directory.",
     )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const=_RESUME_PICK,
+        metavar="SESSION_ID",
+        help=(
+            "Resume a previous session. "
+            "Without SESSION_ID, shows a list of recent sessions to pick from. "
+            "With SESSION_ID, resumes that specific session directly."
+        ),
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_",
+        action="store_true",
+        help="Continue the most recent session. Starts a new session if none exists.",
+    )
     return parser.parse_args()
 
 
@@ -53,9 +80,55 @@ def _load_dotenv(start: Path) -> None:
             load_dotenv(env_file)
 
 
+def _pick_session(
+    session_manager: SessionManager,
+    display: Display,
+    workspace_root: Path,
+    *,
+    resume_id: str | None,
+    resume_list: bool,
+    continue_: bool,
+) -> tuple[Session, bool]:
+    """
+    Select or create a session based on startup flags.
+
+    Returns ``(session, resumed)`` where *resumed* is ``True`` when an
+    existing session was loaded, and ``False`` when a fresh session was created.
+
+    Raises
+    ------
+    SessionError
+        Propagated from any of the underlying ``SessionManager`` calls
+        (``load``, ``list``, ``most_recent``, or ``new``).
+    """
+    if resume_id is not None:
+        return session_manager.load(resume_id), True
+
+    if resume_list:
+        sessions = session_manager.list(workspace_root)
+        choice = display.show_session_list(sessions)
+        if choice is not None:
+            return session_manager.load(choice.session_id), True
+        return session_manager.new(), False
+
+    if continue_:
+        session = session_manager.most_recent(workspace_root)
+        if session is not None:
+            return session, True
+        return session_manager.new(), False
+
+    return session_manager.new(), False
+
+
 def main() -> None:
     args = parse_args()
     start = Path(args.workspace).resolve() if args.workspace else Path.cwd()
+
+    if args.resume is not None and args.continue_:
+        print(
+            "Error: --resume and --continue cannot be used together.", file=sys.stderr
+        )
+        sys.exit(1)
 
     try:
         _load_dotenv(start)
@@ -76,10 +149,24 @@ def main() -> None:
         _cmd_init(start)
         return
 
-    _cmd_repl(start, global_dir)
+    if args.resume is _RESUME_PICK:
+        _cmd_repl(start, global_dir, resume_list=True)
+    elif args.resume is not None:
+        _cmd_repl(start, global_dir, resume_id=str(args.resume))
+    elif args.continue_:
+        _cmd_repl(start, global_dir, continue_=True)
+    else:
+        _cmd_repl(start, global_dir)
 
 
-def _cmd_repl(start: Path, global_dir: Path) -> None:
+def _cmd_repl(
+    start: Path,
+    global_dir: Path,
+    *,
+    resume_id: str | None = None,
+    resume_list: bool = False,
+    continue_: bool = False,
+) -> None:
     """Bootstrap all core objects and start the interactive REPL."""
     root = Workspace.find_root(start)
     if root is None:
@@ -106,10 +193,20 @@ def _cmd_repl(start: Path, global_dir: Path) -> None:
 
     try:
         session_manager = SessionManager(workspace, llm_client, sessions_dir)
-        session = session_manager.new()
+        session, resumed = _pick_session(
+            session_manager,
+            display,
+            root,
+            resume_id=resume_id,
+            resume_list=resume_list,
+            continue_=continue_,
+        )
     except SessionError as exc:
-        print(f"Error creating session: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if resumed:
+        display.show_status(f"Resuming session {session.session_id}.")
 
     repl = REPL(session, tool_registry, llm_client, display, workspace)
     repl.run()
