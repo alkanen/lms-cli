@@ -98,7 +98,7 @@ Legend: ✅ implemented and tested · 🔲 planned · ⚠️ partial
 ```
 ai-cli/
 ├── ai_cli/                         # Python package root
-│   ├── __main__.py                 # ✅ Entry point — --workspace, --init; --resume/--continue 🔲
+│   ├── __main__.py                 # ✅ Entry point — --workspace, --init, --resume, --continue
 │   ├── core/                       # Core functionality
 │   │   ├── config_manager.py       # ✅ Layered YAML config loading
 │   │   ├── workspace.py            # ✅ Workspace root resolution, file ops, ignore rules
@@ -112,7 +112,7 @@ ai-cli/
 │   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
-│   │   └── tool_manager.py         # 🔲 Context-saving tool gatekeeper
+│   │   └── tool_manager.py         # ✅ Context-saving tool gatekeeper
 │   ├── cli/                        # CLI interface and user-facing components
 │   │   ├── repl.py                 # ✅ REPL loop; slash commands ⚠️ (subset implemented — see Phase 3)
 │   │   ├── display.py              # ⚠️ Display ABC + PlainDisplay ✅; RichDisplay 🔲
@@ -203,7 +203,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `read_file` ✅ — workspace-scoped, no permission by default, disabled by default, session allow-list, line-range support.
    - `write_file` ✅ — workspace-scoped, permission required by default, disabled by default, session allow-list, full and partial writes.
    - `find_files` ✅ — glob-pattern search across the workspace, disabled by default. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
-   - `tool_manager` 🔲 — **next priority** now that the REPL exists.
+   - `tool_manager` ✅ — context-saving tool gatekeeper; `list` and `enable` actions; transient one-call schema injection via `ToolRegistry.enable_transient()`.
 
 4. **Error Handling** ⚠️ (partial)
    - Structured error dicts returned by all tool calls. ✅
@@ -236,7 +236,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `RichDisplay` 🔲 — Rich-formatted output; currently falls back to `PlainDisplay`.
 
 5. **Remaining CLI completions** 🔲
-   - **`--resume` / `--resume <id>` / `--continue` CLI flags** in `__main__.py` — session resume at startup.
+   - **`--resume` / `--resume <id>` / `--continue` CLI flags** ✅ in `__main__.py` — session resume at startup.
    - **`/tools` subcommands** — currently `/tools` only lists enabled tools. Planned subcommands:
      - `/tools list` — list all tools (enabled and disabled) with tier and status.
      - `/tools info <name>` — full details: description, parameters, current settings.
@@ -253,9 +253,9 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `logging_utils.py` — JSONL structured logging to session-specific folders.
 
 ### Phase 4: Advanced Features 🔲
-1. **`tool_manager` tool** → **next priority**
+1. **`tool_manager` tool** ✅
    - Context-saving tool gatekeeper; `list` and `enable` actions.
-   - Requires `ToolRegistry.enable_transient()`.
+   - `ToolRegistry.enable_transient()` injects schemas for a single API call with no persistent state change.
 
 2. **MCP Server Support**
    - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
@@ -273,7 +273,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 - **Permissions**: In-memory only, reset on exit or session resume. Universal options (Yes/No/Always/Custom rejection); tools may add their own variants. Universal four are always rendered by the prompt; `PermissionManager` passes only tool-specific extras to `prompt_fn`.
 - **Tool discovery**: Three tiers — bundled → global (`~/.ai-cli/tools/`) → project (`.ai-cli/tools/`). Later tiers override earlier ones with a warning.
 - **Session compaction**: LLM-generated summary. Two history files: `history_full.jsonl` (append-only) and `history_current.jsonl` (system + summary + recent messages).
-- **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new). 🔲 Not yet wired into `__main__.py`.
+- **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new). Flag routing wired into `__main__.py` via `_pick_session()` ✅. Remaining planned behaviours 🔲: (a) session list displaying name and last-message preview with role indicator (currently shows `first_user_message` only); (b) on resume, prompt to resend if the last message was from the user, or display the last assistant message in full so the user can respond.
 - **Output modes**: Summary (default) and verbose, toggled via `/verbose` slash command (keyboard shortcut binding TBD).
 - **`find_files` directory pruning**: Ignored directories are pruned from `os.walk` for performance. Files inside an ignored directory are never returned even if a negation rule would re-include them — this matches standard Git walk behaviour and is essential for avoiding traversal of `env/`, `.git/`, `node_modules/`, etc.
 
