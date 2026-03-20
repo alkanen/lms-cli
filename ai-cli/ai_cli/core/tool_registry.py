@@ -37,6 +37,21 @@ tool name::
       my_tool:
         permission_required: false
         disabled: true
+        allowed: false
+
+Configuration hierarchy (lowest to highest precedence):
+
+  1. Hardcoded tool defaults (``PERMISSION_REQUIRED``, ``DISABLED_BY_DEFAULT``)
+  2. Global config (``AI_CLI_GLOBAL_DIR/config.yaml``, default ``~/.ai-cli/``)
+  3. Project config (``.ai-cli/config.yaml``)
+  4. Session-level overrides (in-memory, reset on session resume)
+  5. Transient enables (single API call, no persistent state change)
+
+Later entries override earlier ones.  A project-level setting always wins
+over the same setting in global config.  Runtime mutations (``enable``,
+``disable``, ``allow``, ``disallow``, ``set_permission_required``) are
+persisted to the *project* config so that changes are scoped to the current
+project and do not affect other projects.
 
 Three enable modes (highest precedence first):
 
@@ -45,6 +60,12 @@ Three enable modes (highest precedence first):
   persistent — stored in project .ai-cli/config.yaml
 
 Session overrides always win over the persistent enabled state.
+
+Allowed/disallowed is a hard gate that takes precedence over the
+enabled/disabled state.  A disallowed tool cannot be executed or
+transiently enabled, regardless of its enabled state.  Use ``allowed: false``
+in config to permanently block a tool; ``disallow()`` or ``disallow_session()``
+to do so at runtime.
 """
 
 from __future__ import annotations
@@ -182,6 +203,12 @@ class ToolRegistry:
         self._enabled: dict[str, bool] = {}
         # name → session-level override (reset on session resume)
         self._session_overrides: dict[str, bool] = {}
+        # name → persistent allowed state (default True)
+        self._allowed: dict[str, bool] = {}
+        # name → session-level allowed overrides (reset on session resume)
+        self._session_allowed_overrides: dict[str, bool] = {}
+        # name → which tier each tool came from
+        self._tiers: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Loading
@@ -198,6 +225,9 @@ class ToolRegistry:
         self._tools.clear()
         self._enabled.clear()
         self._session_overrides.clear()
+        self._allowed.clear()
+        self._session_allowed_overrides.clear()
+        self._tiers.clear()
 
         bundled_dir = Path(__file__).parent.parent / "tools"
         self._load_bundled(bundled_dir)
@@ -315,6 +345,8 @@ class ToolRegistry:
 
         self._tools[name] = tool
         self._enabled[name] = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
+        self._allowed[name] = True
+        self._tiers[name] = tier
         # Allow tools that need registry access (e.g. tool_manager) to receive
         # a back-reference after construction.  Guard carefully: the attribute
         # may exist on user-supplied tools with a different shape, and any
@@ -357,7 +389,12 @@ class ToolRegistry:
         self._register(tool_cls, tier)
 
     def _apply_config(self) -> None:
-        """Apply per-tool settings from config.yaml over the loaded defaults.
+        """Apply per-tool settings from the merged config over the loaded defaults.
+
+        Settings are read from the merged ``tools`` mapping (global config
+        overridden by project config — see module docstring for the full
+        hierarchy).  Project-level values therefore take precedence over
+        global-level values for every key.
 
         The ``tools`` key in config is a dict keyed by tool name::
 
@@ -371,12 +408,6 @@ class ToolRegistry:
         tools_cfg = self._config.get("tools", {})
         if not isinstance(tools_cfg, dict):
             return
-        # Project-layer tools dict (without global/CLI merge) — used to
-        # determine whether a security-lowering setting came from the
-        # untrusted project config or from the trusted global config.
-        project_tools_cfg = self._config.get_project("tools") or {}
-        if not isinstance(project_tools_cfg, dict):
-            project_tools_cfg = {}
         for name, entry in tools_cfg.items():
             if not isinstance(name, str) or not isinstance(entry, dict):
                 continue
@@ -391,28 +422,13 @@ class ToolRegistry:
                         name,
                         val,
                     )
-                elif not val and tool.permission_required:
-                    # Lowering permission_required from the project config layer
-                    # is untrusted (a cloned repo could silently disable prompts).
-                    # It is only honoured when the entry carries a
-                    # 'user_confirmed: true' marker written by
-                    # set_permission_required().  Global config is trusted
-                    # (it is the user's own ~/.ai-cli/config.yaml), so entries
-                    # that don't appear in the project layer bypass this check.
-                    project_entry = project_tools_cfg.get(name, {})
-                    from_project = isinstance(project_entry, dict) and (
-                        "permission_required" in project_entry
-                    )
-                    if not from_project or project_entry.get("user_confirmed") is True:
-                        tool.permission_required = val
-                    else:
+                else:
+                    if tool.permission_required and not val:
                         logger.warning(
-                            "Tool '%s': project config attempts to disable "
-                            "'permission_required' without explicit user "
-                            "confirmation — ignored.",
+                            "Tool '%s': config lowers 'permission_required' from True "
+                            "to False — user prompts will be skipped for this tool.",
                             name,
                         )
-                else:
                     tool.permission_required = val
             if "disabled" in entry:
                 val = entry["disabled"]
@@ -424,6 +440,16 @@ class ToolRegistry:
                         name,
                         val,
                     )
+            if "allowed" in entry:
+                val = entry["allowed"]
+                if not isinstance(val, bool):
+                    logger.warning(
+                        "Tool '%s': 'allowed' must be a boolean, got %r — ignored.",
+                        name,
+                        val,
+                    )
+                else:
+                    self._allowed[name] = val
 
     # ------------------------------------------------------------------
     # Queries
@@ -434,11 +460,15 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def all_enabled(self) -> list[Tool]:
-        """Return all tools that are currently enabled (session + persistent)."""
-        return [tool for name, tool in self._tools.items() if self._is_enabled(name)]
+        """Return all tools that are currently enabled and allowed."""
+        return [
+            tool
+            for name, tool in self._tools.items()
+            if self._is_allowed(name) and self._is_enabled(name)
+        ]
 
     def list_all(self) -> list[dict]:
-        """Return name, description, and enabled status for every registered tool."""
+        """Return name, description, and enabled status for every allowed tool."""
         return [
             {
                 "name": name,
@@ -446,7 +476,43 @@ class ToolRegistry:
                 "enabled": self._is_enabled(name),
             }
             for name, tool in self._tools.items()
+            if self._is_allowed(name)
         ]
+
+    def all_tools_info(self) -> list[dict]:
+        """Return full info for ALL tools including disallowed (for /tools list)."""
+        return [
+            {
+                "name": name,
+                "description": tool.description,
+                "enabled": self._is_enabled(name),
+                "allowed": self._is_allowed(name),
+                "permission_required": tool.permission_required,
+                "tier": self._tiers.get(name, "unknown"),
+            }
+            for name, tool in self._tools.items()
+        ]
+
+    def tool_info(self, name: str) -> dict | None:
+        """Return detailed info for a single tool, or ``None`` if unknown."""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        try:
+            defn = tool.definition()
+            params = defn.get("function", {}).get("parameters", {})
+        except Exception as exc:
+            logger.warning("tool_info: definition() raised for '%s': %s", name, exc)
+            params = {}
+        return {
+            "name": name,
+            "description": tool.description,
+            "enabled": self._is_enabled(name),
+            "allowed": self._is_allowed(name),
+            "permission_required": tool.permission_required,
+            "tier": self._tiers.get(name, "unknown"),
+            "parameters": params,
+        }
 
     def definitions(self) -> list[dict]:
         """Return OpenAI-format schemas for all enabled tools."""
@@ -456,6 +522,11 @@ class ToolRegistry:
         if name in self._session_overrides:
             return self._session_overrides[name]
         return self._enabled.get(name, False)
+
+    def _is_allowed(self, name: str) -> bool:
+        if name in self._session_allowed_overrides:
+            return self._session_allowed_overrides[name]
+        return self._allowed.get(name, True)
 
     # ------------------------------------------------------------------
     # Execution
@@ -481,6 +552,9 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return Tool._err("unknown_tool", f"No tool named '{name}'.", 404)
+
+        if not self._is_allowed(name):
+            return Tool._err("tool_disallowed", f"Tool '{name}' is not available.", 403)
 
         if not allow_transient and not self._is_enabled(name):
             return Tool._err("tool_disabled", f"Tool '{name}' is disabled.", 403)
@@ -559,9 +633,44 @@ class ToolRegistry:
         if name in self._tools:
             self._session_overrides[name] = False
 
+    # ------------------------------------------------------------------
+    # Allow / disallow (persistent — writes to config)
+    # ------------------------------------------------------------------
+
+    def allow(self, name: str) -> None:
+        """Re-allow a disallowed tool and persist the change to project config."""
+        if name not in self._tools:
+            return
+        self._session_allowed_overrides.pop(name, None)
+        self._allowed[name] = True
+        self._persist_tool_setting(name, "allowed", True)
+
+    def disallow(self, name: str) -> None:
+        """Disallow a tool and persist the change to project config."""
+        if name not in self._tools:
+            return
+        self._session_allowed_overrides.pop(name, None)
+        self._allowed[name] = False
+        self._persist_tool_setting(name, "allowed", False)
+
+    # ------------------------------------------------------------------
+    # Allow / disallow (session — no config write)
+    # ------------------------------------------------------------------
+
+    def allow_session(self, name: str) -> None:
+        """Allow for this session only — no config write."""
+        if name in self._tools:
+            self._session_allowed_overrides[name] = True
+
+    def disallow_session(self, name: str) -> None:
+        """Disallow for this session only — no config write."""
+        if name in self._tools:
+            self._session_allowed_overrides[name] = False
+
     def reset_session_overrides(self) -> None:
         """Clear all session-level overrides and tool session state. Called on session resume."""
         self._session_overrides.clear()
+        self._session_allowed_overrides.clear()
         for tool in self._tools.values():
             try:
                 tool.reset_session_state()
@@ -577,8 +686,10 @@ class ToolRegistry:
     def enable_transient(self, name: str) -> dict | None:
         """
         Return the named tool's schema for one-call injection without
-        changing its enabled state.  Returns ``None`` if unknown.
+        changing its enabled state.  Returns ``None`` if unknown or disallowed.
         """
+        if not self._is_allowed(name):
+            return None
         tool = self._tools.get(name)
         return tool.definition() if tool is not None else None
 
@@ -588,18 +699,12 @@ class ToolRegistry:
 
     def set_permission_required(self, name: str, value: bool) -> None:
         """
-        Toggle *permission_required* for *name* and persist to config.
-
-        When *value* is ``False`` (lowering security), a ``user_confirmed: true``
-        marker is also written so that ``_apply_config()`` can distinguish an
-        explicit user action from an untrusted project config entry.
+        Toggle *permission_required* for *name* and persist to project config.
         """
         tool = self._tools.get(name)
         if tool is not None:
             tool.permission_required = value
             self._persist_tool_setting(name, "permission_required", value)
-            if not value:
-                self._persist_tool_setting(name, "user_confirmed", True)
 
     # ------------------------------------------------------------------
     # Config persistence

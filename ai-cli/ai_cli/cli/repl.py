@@ -44,9 +44,20 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/clear", "Clear the current conversation history"),
     ("/verbose", "Toggle verbose mode (show full tool args and results)"),
     ("/markdown", "Toggle Markdown rendering of LLM output"),
-    ("/compact", "Summarise the conversation to free up context window space"),
+    (
+        "/compact [instructions]",
+        "Summarise the conversation; optional: guide the summary",
+    ),
     ("/tools", "List currently enabled tools"),
+    ("/tools list", "List all registered tools with enabled/allowed/tier status"),
+    ("/tools info <name>", "Show details for a single tool"),
+    ("/tools enable|disable [--session] <name>", "Enable or disable a tool"),
+    (
+        "/tools allow|disallow [--session] <name>",
+        "Allow or disallow a tool (hard gate)",
+    ),
     ("/session", "Show information about the current session"),
+    ("/session name <name>", "Set a display name for this session"),
 ]
 
 
@@ -162,18 +173,21 @@ class REPL:
             self._display.show_status(f"Markdown rendering {state}.")
 
         elif cmd == "compact":
+            instructions = command[len(cmd) :].strip()
             self._display.show_status("Compacting conversation history…")
             try:
-                self._session.compact()
+                self._session.compact(instructions=instructions)
                 self._display.show_status("Compaction complete.")
             except SessionError as exc:
                 self._display.show_error(f"Compaction failed: {exc}")
 
         elif cmd == "tools":
-            self._display.show_tool_list(self._tool_registry.all_enabled())
+            remainder = command[len(cmd) :].strip()
+            self._handle_tools_subcommand(remainder)
 
         elif cmd == "session":
-            self._display.show_session_info(self._session)
+            remainder = command[len(cmd) :].strip()
+            self._handle_session_subcommand(remainder)
 
         elif cmd == "":
             self._display.show_error(
@@ -184,6 +198,113 @@ class REPL:
             self._display.show_error(
                 f"Unknown command: /{cmd}. Type /help for a list of commands."
             )
+
+    # ------------------------------------------------------------------
+    # /tools subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_tools_subcommand(self, remainder: str) -> None:
+        """Dispatch /tools [subcommand] [args]."""
+        parts = remainder.split()
+        sub = parts[0].lower() if parts else ""
+
+        if not sub:
+            self._display.show_tool_list(self._tool_registry.all_enabled())
+            return
+
+        if sub == "list":
+            self._display.show_tool_list_all(self._tool_registry.all_tools_info())
+            return
+
+        if sub == "info":
+            if len(parts) < 2:
+                self._display.show_error("Usage: /tools info <name>")
+                return
+            name = parts[1]
+            info = self._tool_registry.tool_info(name)
+            if info is None:
+                self._display.show_error(f"Unknown tool: '{name}'")
+                return
+            self._display.show_tool_info(info)
+            return
+
+        if sub in ("enable", "disable", "allow", "disallow"):
+            rest = parts[1:]
+            session_flag = "--session" in rest
+            if session_flag:
+                rest = [p for p in rest if p != "--session"]
+            if not rest:
+                self._display.show_error(f"Usage: /tools {sub} [--session] <name>")
+                return
+            name = rest[0]
+            if self._tool_registry.get(name) is None:
+                self._display.show_error(f"Unknown tool: '{name}'")
+                return
+            if sub == "enable":
+                if session_flag:
+                    self._tool_registry.enable_session(name)
+                else:
+                    self._tool_registry.enable(name)
+            elif sub == "disable":
+                if session_flag:
+                    self._tool_registry.disable_session(name)
+                else:
+                    self._tool_registry.disable(name)
+            elif sub == "allow":
+                if session_flag:
+                    self._tool_registry.allow_session(name)
+                else:
+                    self._tool_registry.allow(name)
+            elif sub == "disallow":
+                if session_flag:
+                    self._tool_registry.disallow_session(name)
+                else:
+                    self._tool_registry.disallow(name)
+            _past = {
+                "enable": "enabled",
+                "disable": "disabled",
+                "allow": "allowed",
+                "disallow": "disallowed",
+            }
+            scope = "this session" if session_flag else "persistently"
+            self._display.show_status(f"Tool '{name}': {_past[sub]} {scope}.")
+            return
+
+        self._display.show_error(
+            f"Unknown /tools subcommand: '{sub}'. "
+            "Try /tools, /tools list, /tools info <name>, "
+            "or /tools enable|disable|allow|disallow [--session] <name>."
+        )
+
+    # ------------------------------------------------------------------
+    # /session subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_session_subcommand(self, remainder: str) -> None:
+        """Dispatch /session [subcommand] [args]."""
+        parts = remainder.split()
+        sub = parts[0].lower() if parts else ""
+
+        if not sub:
+            self._display.show_session_info(self._session)
+            return
+
+        if sub == "name":
+            if len(parts) < 2:
+                self._display.show_error("Usage: /session name <new-name>")
+                return
+            new_name = " ".join(parts[1:])
+            try:
+                self._session.set_name(new_name)
+                self._display.show_status(f"Session name set to '{new_name}'.")
+            except SessionError as exc:
+                self._display.show_error(f"Could not set session name: {exc}")
+            return
+
+        self._display.show_error(
+            f"Unknown /session subcommand: '{sub}'. "
+            "Try /session or /session name <name>."
+        )
 
     # ------------------------------------------------------------------
     # @ file reference expansion
@@ -325,6 +446,20 @@ class REPL:
                 result = self._tool_registry.execute(
                     call["name"], call["arguments"], allow_transient=allow_transient
                 )
+                # Disallowed tools: show a user-facing hint but replace the
+                # result with a generic unknown-tool error before it reaches
+                # the LLM — the agent must not learn that the tool exists.
+                if result.get("error") == "tool_disallowed":
+                    self._display.show_error(
+                        f"Tool '{call['name']}' is not available in the current "
+                        f"configuration. Use '/tools allow {call['name']}' to add it to the list of available tools."
+                    )
+                    result = {
+                        "status": "error",
+                        "error": "unknown_tool",
+                        "message": f"No tool named '{call['name']}'.",
+                        "code": 404,
+                    }
                 # Only tool_manager may inject transient schemas; any other tool
                 # returning this key is ignored.  Each schema is also validated
                 # against the registry so only known tools can be transiently

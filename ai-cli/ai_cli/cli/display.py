@@ -130,6 +130,24 @@ class Display(ABC):
     def show_session_info(self, session: Session) -> None:
         """Render metadata for the current session (id, start time, message count, name)."""
 
+    @abstractmethod
+    def show_tool_list_all(self, tools_info: list[dict]) -> None:
+        """
+        Render all registered tools with their enabled/allowed/permission status.
+
+        *tools_info* is a list of dicts as returned by
+        :meth:`~ai_cli.core.tool_registry.ToolRegistry.all_tools_info`.
+        """
+
+    @abstractmethod
+    def show_tool_info(self, tool_info: dict) -> None:
+        """
+        Render detailed information for a single tool.
+
+        *tool_info* is a dict as returned by
+        :meth:`~ai_cli.core.tool_registry.ToolRegistry.tool_info`.
+        """
+
     # ------------------------------------------------------------------
     # Interactive prompts
     # ------------------------------------------------------------------
@@ -253,6 +271,48 @@ class PlainDisplay(Display):
         started = meta.get("started_at", "unknown")
         print(f"Started:   {started}")
         print(f"Messages:  {meta.get('message_count', 0)}")
+
+    def show_tool_list_all(self, tools_info: list[dict]) -> None:
+        if not tools_info:
+            print("No tools registered.")
+            return
+        print("\nAll tools:")
+        for info in tools_info:
+            if not info.get("allowed", True):
+                status = "disallowed"
+            elif info.get("enabled", False):
+                status = "enabled"
+            else:
+                status = "disabled"
+            if info.get("permission_required", False):
+                status += ", perm"
+            tier = info.get("tier", "")
+            desc = info.get("description", "")[:50]
+            print(f"  {info['name']:<20}  [{status:<18}]  {tier:<10}  {desc}")
+
+    def show_tool_info(self, tool_info: dict) -> None:
+        name = tool_info.get("name", "")
+        print(f"\nTool: {name}")
+        print(f"  Description:  {tool_info.get('description', '')}")
+        print(f"  Tier:         {tool_info.get('tier', 'unknown')}")
+        if not tool_info.get("allowed", True):
+            print("  Status:       disallowed")
+        elif tool_info.get("enabled", False):
+            print("  Status:       enabled")
+        else:
+            print("  Status:       disabled")
+        perm = "required" if tool_info.get("permission_required") else "not required"
+        print(f"  Permission:   {perm}")
+        params = tool_info.get("parameters", {})
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        required = params.get("required", []) if isinstance(params, dict) else []
+        if props:
+            print("  Parameters:")
+            for pname, pdef in props.items():
+                req = " (required)" if pname in required else ""
+                ptype = pdef.get("type", "") if isinstance(pdef, dict) else ""
+                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
+                print(f"    {pname}: {ptype}{req} — {pdesc}")
 
     # ------------------------------------------------------------------
     # Interactive prompts

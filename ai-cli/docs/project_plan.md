@@ -55,16 +55,14 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
    - Configuration stored in YAML files (`config.yaml`) at global and project level.
    - CLI overrides for critical parameters (e.g., config file paths, server addresses, working directories).
    - Small, localized configurations with minimal overhead.
-   - **Configuration resolution** follows a layered model — each level overrides the previous:
-     - **System prompt**:
-       1. Built-in default bundled with the tool.
-       2. User-global override: `~/.ai-cli/system_prompt.md` (if present).
-       3. Project-specific override: `<project>/.ai-cli/system_prompt.md` (if present).
-     - **Model/backend configuration** (no built-in default — must be explicitly provided):
-       1. User-global config: `~/.ai-cli/config.yaml`.
-       2. Project-specific override: `<project>/.ai-cli/config.yaml`.
-       3. CLI flag overrides (highest priority).
-       - If no model configuration is found at any level, the CLI exits with a clear error message guiding the user to set one up.
+   - **Configuration resolution** follows a layered model — each level overrides the previous (more specific = higher priority):
+     1. Hardcoded defaults (built-in tool attributes, bundled system prompt).
+     2. User-global config: `~/.ai-cli/config.yaml` (or `AI_CLI_GLOBAL_DIR/config.yaml`).
+     3. Project-specific config: `<project>/.ai-cli/config.yaml`.
+     4. CLI flag overrides (highest priority).
+     - Project config always wins over global config. Global config acts as default values for projects that do not override them.
+     - Persistent runtime mutations (`/tools enable`, `/tools allow`, `set_permission_required`, etc., **without** `--session`) are written to the **project** config so that changes are scoped to the current project and do not affect other projects. Session-scoped variants (`--session`) are held in memory only and are not persisted.
+     - If no model configuration is found at any level, the CLI exits with a clear error message guiding the user to set one up.
 
 7. **Improved Permission Handling**
    - Permissions are held in-memory only, scoped to the current process lifetime.
