@@ -583,6 +583,7 @@ class TestREPLSendToLLM:
         ]
         assert len(tool_result_msgs) == 1
         import json as _json
+
         content = _json.loads(tool_result_msgs[0]["content"])
         assert content.get("error") == "unknown_tool"
         assert content.get("error") != "tool_disallowed"

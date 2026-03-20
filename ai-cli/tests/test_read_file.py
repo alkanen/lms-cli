@@ -88,7 +88,7 @@ class TestClassAttributes:
 class TestDefinition:
     def test_schema_shape(self, tmp_path):
         tool = make_tool(tmp_path)
-        d = tool.definition()
+        d = tool.definition().schema()
         assert d["type"] == "function"
         fn = d["function"]
         assert fn["name"] == "read_file"

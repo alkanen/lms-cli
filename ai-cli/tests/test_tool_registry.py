@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import yaml
 
 from ai_cli.core.tool_registry import ToolRegistry
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolSchema
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -19,15 +19,20 @@ class _EchoTool(Tool):
     DESCRIPTION = "Echoes input."
     PERMISSION_REQUIRED = False
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        }
+    def definition(self) -> ToolSchema:
+        from ai_cli.tools.base import ToolArgument
+
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    name="message",
+                    description="Message to echo.",
+                    argument_type="string",
+                ),
+            ],
+        )
 
     def execute(self, **kwargs: Any) -> dict:
         return self._ok({"echo": kwargs.get("message", "")})
@@ -38,15 +43,8 @@ class _PermTool(Tool):
     DESCRIPTION = "Requires permission."
     PERMISSION_REQUIRED = True
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        }
+    def definition(self) -> ToolSchema:
+        return ToolSchema(name=self.name, description=self.description)
 
     def execute(self, **kwargs: Any) -> dict:
         return self._ok()
@@ -58,15 +56,8 @@ class _DisabledByDefaultTool(Tool):
     PERMISSION_REQUIRED = False
     DISABLED_BY_DEFAULT = True
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        }
+    def definition(self) -> ToolSchema:
+        return ToolSchema(name=self.name, description=self.description)
 
     def execute(self, **kwargs: Any) -> dict:
         return self._ok()
@@ -139,12 +130,19 @@ class TestQueries:
 
 
 class TestDefinitionValidation:
-    def _make_bad_tool(self, bad_defn: dict) -> type:
+    def _make_bad_tool(self, bad_defn: object) -> type:
+        class _BadSchema(ToolSchema):
+            def __init__(self) -> None:
+                pass  # skip normal __init__
+
+            def schema(self) -> dict:  # type: ignore[override]
+                return bad_defn  # type: ignore[return-value]
+
         class _BadDefnTool(_EchoTool):
             NAME = "bad_tool"
 
-            def definition(self) -> dict:
-                return bad_defn
+            def definition(self) -> ToolSchema:
+                return _BadSchema()
 
         return _BadDefnTool
 
@@ -240,13 +238,378 @@ class TestDefinitionValidation:
         class _RaisingDefnTool(_EchoTool):
             NAME = "raising_defn"
 
-            def definition(self) -> dict:
+            def definition(self) -> ToolSchema:
                 raise RuntimeError("schema generation failed")
 
         with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
             reg = make_registry(tmp_path, tool_classes=[_RaisingDefnTool])
 
         assert reg.get("raising_defn") is None
+        assert any("definition()" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+
+
+class _ArgTool(Tool):
+    """Tool with a mix of required and optional typed arguments for validation tests."""
+
+    NAME = "arg_tool"
+    DESCRIPTION = "Tool with typed arguments."
+    PERMISSION_REQUIRED = False
+
+    def definition(self) -> ToolSchema:
+        from ai_cli.tools.base import ToolArgument
+
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    name="count",
+                    description="An integer count.",
+                    argument_type="integer",
+                    required=True,
+                ),
+                ToolArgument(
+                    name="label",
+                    description="An optional string label.",
+                    argument_type="string",
+                ),
+                ToolArgument(
+                    name="active",
+                    description="An optional boolean flag.",
+                    argument_type="boolean",
+                ),
+                ToolArgument(
+                    name="ratio",
+                    description="An optional float.",
+                    argument_type="number",
+                ),
+                ToolArgument(
+                    name="score",
+                    description="An integer score from 0 to 100.",
+                    argument_type="integer",
+                    minimum=0,
+                    maximum=100,
+                ),
+                ToolArgument(
+                    name="temperature",
+                    description="A float from 0.0 to 1.0.",
+                    argument_type="number",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+            ],
+        )
+
+    def execute(self, **kwargs: Any) -> dict:
+        return self._ok(kwargs)
+
+
+class TestArgumentValidation:
+    def _reg(self, tmp_path: Any) -> Any:
+        return make_registry(tmp_path, tool_classes=[_ArgTool])
+
+    def test_valid_args_pass_through(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 3})
+        assert result["status"] == "success"
+        assert result["data"]["count"] == 3
+
+    def test_missing_required_arg_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "count" in result["message"]
+
+    def test_optional_arg_can_be_omitted(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1})
+        assert result["status"] == "success"
+        assert "label" not in result["data"]
+
+    def test_unknown_arg_is_stripped(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "surprise": "x"})
+        assert result["status"] == "success"
+        assert "surprise" not in result["data"]
+
+    def test_unknown_arg_logs_warning(self, tmp_path, caplog):
+        import logging
+
+        reg = self._reg(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg.execute("arg_tool", {"count": 1, "surprise": "x"})
+        assert any("surprise" in r.message for r in caplog.records)
+
+    def test_wrong_type_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": "not-an-int"})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "count" in result["message"]
+        assert "integer" in result["message"]
+
+    def test_bool_rejected_for_integer_arg(self, tmp_path):
+        # bool is a subclass of int in Python but not a valid JSON integer.
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": True})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_string_rejected_for_boolean_arg(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "active": "true"})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "active" in result["message"]
+
+    def test_string_rejected_for_number_arg(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "ratio": "3.14"})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "ratio" in result["message"]
+
+    def test_correct_types_pass_through(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute(
+            "arg_tool", {"count": 5, "label": "hi", "active": True, "ratio": 2.5}
+        )
+        assert result["status"] == "success"
+        assert result["data"] == {
+            "count": 5,
+            "label": "hi",
+            "active": True,
+            "ratio": 2.5,
+        }
+
+    def test_int_accepted_for_number_arg(self, tmp_path):
+        # JSON "number" covers both int and float.
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "ratio": 3})
+        assert result["status"] == "success"
+        assert result["data"]["ratio"] == 3
+
+
+
+# ---------------------------------------------------------------------------
+# Bounds validation
+# ---------------------------------------------------------------------------
+
+
+class TestBoundsValidation:
+    def _reg(self, tmp_path: Any) -> Any:
+        return make_registry(tmp_path, tool_classes=[_ArgTool])
+
+    def test_value_within_bounds_passes(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "score": 50})
+        assert result["status"] == "success"
+        assert result["data"]["score"] == 50
+
+    def test_value_at_minimum_passes(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "score": 0})
+        assert result["status"] == "success"
+
+    def test_value_at_maximum_passes(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "score": 100})
+        assert result["status"] == "success"
+
+    def test_value_below_minimum_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "score": -1})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "score" in result["message"]
+        assert "minimum" in result["message"]
+
+    def test_value_above_maximum_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "score": 101})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "score" in result["message"]
+        assert "maximum" in result["message"]
+
+    def test_float_within_bounds_passes(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "temperature": 0.5})
+        assert result["status"] == "success"
+
+    def test_float_below_minimum_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "temperature": -0.1})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "temperature" in result["message"]
+
+    def test_float_above_maximum_returns_error(self, tmp_path):
+        reg = self._reg(tmp_path)
+        result = reg.execute("arg_tool", {"count": 1, "temperature": 1.1})
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "temperature" in result["message"]
+
+    def test_minimum_only_enforced(self, tmp_path):
+        reg = self._reg(tmp_path)
+        # ratio has no bounds — any number passes
+        result = reg.execute("arg_tool", {"count": 1, "ratio": -999.9})
+        assert result["status"] == "success"
+
+    def test_bounds_in_schema_output(self, tmp_path):
+        reg = self._reg(tmp_path)
+        tool = reg.get("arg_tool")
+        schema = tool.definition().schema()
+        props = schema["function"]["parameters"]["properties"]
+        assert props["score"]["minimum"] == 0
+        assert props["score"]["maximum"] == 100
+        assert props["temperature"]["minimum"] == 0.0
+        assert props["temperature"]["maximum"] == 1.0
+
+    def test_unbounded_arg_has_no_bounds_in_schema(self, tmp_path):
+        reg = self._reg(tmp_path)
+        tool = reg.get("arg_tool")
+        schema = tool.definition().schema()
+        props = schema["function"]["parameters"]["properties"]
+        assert "minimum" not in props["ratio"]
+        assert "maximum" not in props["ratio"]
+
+    def test_inverted_bounds_skipped_with_warning(self, tmp_path, caplog):
+        import logging
+        from ai_cli.tools.base import ToolArgument
+
+        # Bypass __init__ validation by mutating after construction.
+        arg = ToolArgument(name="x", description="x", argument_type="integer",
+                           minimum=0, maximum=10)
+        arg.minimum = 99
+        arg.maximum = 1  # now inverted
+
+        from ai_cli.core.tool_registry import _check_bounds
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            result = _check_bounds(5, arg)
+        assert result is None  # skipped, not an error
+        assert any("inverted" in r.message for r in caplog.records)
+
+    def test_non_numeric_bound_skipped_with_warning(self, tmp_path, caplog):
+        import logging
+        from ai_cli.tools.base import ToolArgument
+        from ai_cli.core.tool_registry import _check_bounds
+
+        arg = ToolArgument(name="x", description="x", argument_type="integer",
+                           minimum=0, maximum=10)
+        arg.minimum = "bad"  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            result = _check_bounds(5, arg)
+        assert result is None
+        assert any("non-numeric" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# ToolArgument bounds validation
+# ---------------------------------------------------------------------------
+
+
+class TestToolArgumentBoundsValidation:
+    def test_valid_integer_bounds_accepted(self):
+        from ai_cli.tools.base import ToolArgument
+        arg = ToolArgument(name="n", description="n", argument_type="integer",
+                           minimum=0, maximum=100)
+        assert arg.minimum == 0
+        assert arg.maximum == 100
+
+    def test_valid_number_bounds_accepted(self):
+        from ai_cli.tools.base import ToolArgument
+        arg = ToolArgument(name="r", description="r", argument_type="number",
+                           minimum=0.0, maximum=1.0)
+        assert arg.minimum == 0.0
+        assert arg.maximum == 1.0
+
+    def test_minimum_only_accepted(self):
+        from ai_cli.tools.base import ToolArgument
+        arg = ToolArgument(name="n", description="n", argument_type="integer",
+                           minimum=1)
+        assert arg.minimum == 1
+        assert arg.maximum is None
+
+    def test_maximum_only_accepted(self):
+        from ai_cli.tools.base import ToolArgument
+        arg = ToolArgument(name="n", description="n", argument_type="integer",
+                           maximum=10)
+        assert arg.minimum is None
+        assert arg.maximum == 10
+
+    def test_bounds_on_string_type_raises(self):
+        import pytest
+        from ai_cli.tools.base import ToolArgument
+        with pytest.raises(ValueError, match="integer.*number"):
+            ToolArgument(name="s", description="s", argument_type="string",
+                         minimum=0)
+
+    def test_bounds_on_boolean_type_raises(self):
+        import pytest
+        from ai_cli.tools.base import ToolArgument
+        with pytest.raises(ValueError, match="integer.*number"):
+            ToolArgument(name="b", description="b", argument_type="boolean",
+                         maximum=1)
+
+    def test_non_numeric_minimum_raises(self):
+        import pytest
+        from ai_cli.tools.base import ToolArgument
+        with pytest.raises(ValueError, match="numeric"):
+            ToolArgument(name="n", description="n", argument_type="integer",
+                         minimum="zero")  # type: ignore[arg-type]
+
+    def test_bool_minimum_raises(self):
+        import pytest
+        from ai_cli.tools.base import ToolArgument
+        with pytest.raises(ValueError, match="numeric"):
+            ToolArgument(name="n", description="n", argument_type="integer",
+                         minimum=True)  # type: ignore[arg-type]
+
+    def test_inverted_bounds_raises(self):
+        import pytest
+        from ai_cli.tools.base import ToolArgument
+        with pytest.raises(ValueError, match="minimum.*maximum|<="):
+            ToolArgument(name="n", description="n", argument_type="integer",
+                         minimum=10, maximum=5)
+
+    def test_equal_bounds_accepted(self):
+        from ai_cli.tools.base import ToolArgument
+        arg = ToolArgument(name="n", description="n", argument_type="integer",
+                           minimum=5, maximum=5)
+        assert arg.minimum == 5
+        assert arg.maximum == 5
+
+    def test_invalid_bounds_cause_tool_to_be_skipped(self, tmp_path, caplog):
+        import logging
+
+        class _BadBoundsTool(_EchoTool):
+            NAME = "bad_bounds"
+
+            def definition(self) -> ToolSchema:
+                # Will raise ValueError in ToolArgument.__init__
+                from ai_cli.tools.base import ToolArgument
+                return ToolSchema(
+                    name=self.name,
+                    description=self.description,
+                    arguments=[
+                        ToolArgument(name="x", description="x",
+                                     argument_type="integer",
+                                     minimum=100, maximum=1),
+                    ],
+                )
+
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg = make_registry(tmp_path, tool_classes=[_BadBoundsTool])
+        assert reg.get("bad_bounds") is None
         assert any("definition()" in r.message for r in caplog.records)
 
 
@@ -261,6 +624,13 @@ class TestExecute:
         result = reg.execute("echo", {"message": "hi"})
         assert result["status"] == "success"
         assert result["data"]["echo"] == "hi"
+
+    def test_non_dict_kwargs_returns_error(self, tmp_path):
+        reg = make_registry(tmp_path)
+        for bad in (None, [], "args", 42):
+            result = reg.execute("echo", bad)  # type: ignore[arg-type]
+            assert result["status"] == "error", f"expected error for {bad!r}"
+            assert result["error"] == "invalid_arguments"
 
     def test_unknown_tool_returns_error(self, tmp_path):
         reg = make_registry(tmp_path)
@@ -292,6 +662,22 @@ class TestExecute:
         class FolderTool(_EchoTool):
             NAME = "folder_tool"
             PERMISSION_REQUIRED = True  # must be True so permission prompt fires
+
+            def definition(self) -> ToolSchema:
+                from ai_cli.tools.base import ToolArgument
+
+                return ToolSchema(
+                    name=self.name,
+                    description=self.description,
+                    arguments=[
+                        ToolArgument(
+                            name="path",
+                            description="Path argument.",
+                            argument_type="string",
+                            required=True,
+                        ),
+                    ],
+                )
 
             def extra_permission_options(self, **kwargs: Any) -> list[str]:
                 return ["always_in_this_folder"] if kwargs.get("path") else []

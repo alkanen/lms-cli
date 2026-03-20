@@ -116,7 +116,7 @@ class FindFilesTool(Tool):
     # Schema
     # ------------------------------------------------------------------
 
-    def definition(self) -> dict:
+    def definition(self) -> ToolSchema:
         return ToolSchema(
             name=self.name,
             description=self.description,
@@ -133,7 +133,7 @@ class FindFilesTool(Tool):
                     required=True,
                 ),
             ],
-        ).schema()
+        )
 
     # ------------------------------------------------------------------
     # Execution

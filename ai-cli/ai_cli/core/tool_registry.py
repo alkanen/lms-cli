@@ -81,7 +81,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 if TYPE_CHECKING:
     from ai_cli.core.config_manager import ConfigManager
@@ -173,6 +173,96 @@ def _validate_tool_class(cls: type) -> str:
     return ""
 
 
+def _check_type(val: object, arg_type: str) -> str | None:
+    """Return ``None`` if *val* matches *arg_type*, or a human-readable reason
+    string if it does not.
+
+    Checks JSON Schema primitive types only; ``"array"`` and ``"object"`` are
+    accepted without inspecting their contents.
+    """
+    if arg_type == "integer":
+        # bool is a subclass of int in Python — reject it here.
+        if isinstance(val, int) and not isinstance(val, bool):
+            return None
+        return f"expected integer, got {type(val).__name__} ({val!r})"
+    if arg_type == "number":
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return None
+        return f"expected number, got {type(val).__name__} ({val!r})"
+    if arg_type == "boolean":
+        if isinstance(val, bool):
+            return None
+        return f"expected boolean, got {type(val).__name__} ({val!r})"
+    if arg_type == "string":
+        if isinstance(val, str):
+            return None
+        return f"expected string, got {type(val).__name__} ({val!r})"
+    if arg_type == "array":
+        if isinstance(val, list):
+            return None
+        return f"expected array, got {type(val).__name__}"
+    if arg_type == "object":
+        if isinstance(val, dict):
+            return None
+        return f"expected object, got {type(val).__name__}"
+    # Unknown type — accept without checking.
+    return None
+
+
+def _check_bounds(val: object, arg: ToolArgument) -> str | None:
+    """Return ``None`` if *val* is within *arg*'s declared bounds, or a
+    human-readable reason string if it is not.
+
+    Only applies to ``"integer"`` and ``"number"`` arguments that declare
+    a ``minimum`` or ``maximum``.  Both bounds are inclusive.
+
+    Applies defensive validation to the bounds themselves — non-numeric or
+    inverted bounds are skipped with a warning rather than crashing dispatch.
+    """
+    if arg.minimum is None and arg.maximum is None:
+        return None
+
+    min_bound = arg.minimum
+    max_bound = arg.maximum
+
+    for bound_name, bound_val in (("minimum", min_bound), ("maximum", max_bound)):
+        if bound_val is not None and (
+            isinstance(bound_val, bool) or not isinstance(bound_val, (int, float))
+        ):
+            logger.warning(
+                "Tool argument '%s': ignoring non-numeric %s bound %r",
+                arg.name,
+                bound_name,
+                bound_val,
+            )
+            if bound_name == "minimum":
+                min_bound = None
+            else:
+                max_bound = None
+
+    if min_bound is not None and max_bound is not None and min_bound > max_bound:
+        logger.warning(
+            "Tool argument '%s': ignoring inverted bounds (minimum %r > maximum %r)",
+            arg.name,
+            min_bound,
+            max_bound,
+        )
+        min_bound = None
+        max_bound = None
+
+    if min_bound is None and max_bound is None:
+        return None
+
+    if not isinstance(val, (int, float)) or isinstance(val, bool):
+        return None  # type mismatch already caught by _check_type
+
+    if min_bound is not None and val < min_bound:
+        return f"value {val} is below minimum {min_bound}"
+    if max_bound is not None and val > max_bound:
+        return f"value {val} is above maximum {max_bound}"
+    return None
+
+
 class ToolRegistry:
     """
     Discovers, loads, and dispatches tool calls.
@@ -209,6 +299,8 @@ class ToolRegistry:
         self._session_allowed_overrides: dict[str, bool] = {}
         # name → which tier each tool came from
         self._tiers: dict[str, str] = {}
+        # name → ToolSchema cached at registration time (for arg validation)
+        self._schemas: dict[str, ToolSchema] = {}
 
     # ------------------------------------------------------------------
     # Loading
@@ -228,6 +320,7 @@ class ToolRegistry:
         self._allowed.clear()
         self._session_allowed_overrides.clear()
         self._tiers.clear()
+        self._schemas.clear()
 
         bundled_dir = Path(__file__).parent.parent / "tools"
         self._load_bundled(bundled_dir)
@@ -324,10 +417,20 @@ class ToolRegistry:
             description=tool_cls.DESCRIPTION,  # type: ignore[attr-defined]
         )
         try:
-            defn = tool.definition()
+            tool_schema = tool.definition()
         except Exception as exc:
             logger.warning(
                 "Skipping tool '%s' from %s tier: definition() raised — %s",
+                name,
+                tier,
+                exc,
+            )
+            return
+        try:
+            defn = tool_schema.schema()
+        except Exception as exc:
+            logger.warning(
+                "Skipping tool '%s' from %s tier: ToolSchema.schema() raised — %s",
                 name,
                 tier,
                 exc,
@@ -344,6 +447,7 @@ class ToolRegistry:
             return
 
         self._tools[name] = tool
+        self._schemas[name] = tool_schema
         self._enabled[name] = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
         self._allowed[name] = True
         self._tiers[name] = tier
@@ -499,7 +603,7 @@ class ToolRegistry:
         if tool is None:
             return None
         try:
-            defn = tool.definition()
+            defn = tool.definition().schema()
             params = defn.get("function", {}).get("parameters", {})
         except Exception as exc:
             logger.warning("tool_info: definition() raised for '%s': %s", name, exc)
@@ -516,7 +620,7 @@ class ToolRegistry:
 
     def definitions(self) -> list[dict]:
         """Return OpenAI-format schemas for all enabled tools."""
-        return [tool.definition() for tool in self.all_enabled()]
+        return [tool.definition().schema() for tool in self.all_enabled()]
 
     def _is_enabled(self, name: str) -> bool:
         if name in self._session_overrides:
@@ -559,6 +663,18 @@ class ToolRegistry:
         if not allow_transient and not self._is_enabled(name):
             return Tool._err("tool_disabled", f"Tool '{name}' is disabled.", 403)
 
+        if not isinstance(kwargs, dict):
+            return Tool._err(
+                "invalid_arguments",
+                f"Tool '{name}' arguments must be a JSON object, got "
+                f"{type(kwargs).__name__}.",
+                400,
+            )
+
+        kwargs, arg_error = self._validate_args(name, kwargs)
+        if arg_error is not None:
+            return arg_error
+
         choice = ""
         if tool.permission_required:
 
@@ -586,6 +702,66 @@ class ToolRegistry:
                 f"Tool '{name}' failed during execution. See logs for details.",
                 500,
             )
+
+    def _validate_args(self, name: str, kwargs: dict) -> tuple[dict, dict | None]:
+        """Validate *kwargs* against the cached ToolSchema for *name*.
+
+        Checks that all required arguments are present, that present arguments
+        have the correct JSON Schema types, and strips unknown keys (with a
+        warning log).  Returns an ``invalid_arguments`` error so the model can
+        self-correct rather than silently coercing bad values.
+
+        Returns ``(validated_kwargs, None)`` on success, or ``({}, error_dict)``
+        on the first validation failure.
+        """
+        schema = self._schemas.get(name)
+        if schema is None:
+            return kwargs, None
+
+        declared = {arg.name: arg for arg in schema.arguments}
+
+        missing = [
+            arg.name
+            for arg in schema.arguments
+            if arg.required and arg.name not in kwargs
+        ]
+        if missing:
+            return {}, Tool._err(
+                "invalid_arguments",
+                f"Tool '{name}' missing required argument(s): {', '.join(missing)}.",
+                400,
+            )
+
+        unknown = [k for k in kwargs if k not in declared]
+        if unknown:
+            logger.warning(
+                "Tool '%s': ignoring unknown argument(s) sent by model: %s",
+                name,
+                ", ".join(unknown),
+            )
+
+        result: dict = {}
+        for arg in schema.arguments:
+            if arg.name not in kwargs:
+                continue
+            val = kwargs[arg.name]
+            type_error = _check_type(val, arg.argument_type)
+            if type_error:
+                return {}, Tool._err(
+                    "invalid_arguments",
+                    f"Tool '{name}' argument '{arg.name}': {type_error}.",
+                    400,
+                )
+            bounds_error = _check_bounds(val, arg)
+            if bounds_error:
+                return {}, Tool._err(
+                    "invalid_arguments",
+                    f"Tool '{name}' argument '{arg.name}': {bounds_error}.",
+                    400,
+                )
+            result[arg.name] = val
+
+        return result, None
 
     # ------------------------------------------------------------------
     # Enable / disable (persistent — writes to config)
@@ -691,7 +867,7 @@ class ToolRegistry:
         if not self._is_allowed(name):
             return None
         tool = self._tools.get(name)
-        return tool.definition() if tool is not None else None
+        return tool.definition().schema() if tool is not None else None
 
     # ------------------------------------------------------------------
     # Permission toggle (persistent)
