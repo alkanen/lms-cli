@@ -8,6 +8,7 @@ coordinates Session, ToolRegistry, LLMClient, and Display.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -58,6 +59,7 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ),
     ("/session", "Show information about the current session"),
     ("/session name <name>", "Set a display name for this session"),
+    ("/history", "Browse the full conversation history in a scrollable view"),
 ]
 
 
@@ -188,6 +190,14 @@ class REPL:
         elif cmd == "session":
             remainder = command[len(cmd) :].strip()
             self._handle_session_subcommand(remainder)
+
+        elif cmd == "history":
+            try:
+                messages = self._session.get_messages()
+            except SessionError as exc:
+                self._display.show_error(f"Could not load history: {exc}")
+                return
+            self._display.show_history(messages)
 
         elif cmd == "":
             self._display.show_error(
@@ -390,12 +400,19 @@ class REPL:
                     if chunk["type"] == "text":
                         self._display.stream_text(chunk["delta"])
                         text_parts.append(chunk["delta"])
+                    elif chunk["type"] == "reasoning":
+                        self._display.stream_reasoning(chunk["delta"])
                     elif chunk["type"] == "tool_call":
                         tool_calls.append(chunk)
                     elif chunk["type"] == "done":
-                        prompt_tokens = chunk.get("usage", {}).get("prompt_tokens")
+                        usage = chunk.get("usage", {})
+                        prompt_tokens = usage.get("prompt_tokens")
                         if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
                             self._session.record_usage(prompt_tokens)
+                        context_window = self._llm.get_model_metadata().get(
+                            "context_window", 0
+                        )
+                        self._display.update_usage(usage, context_window)
             except LLMError as exc:
                 self._display.end_assistant_turn()
                 self._display.show_error(f"LLM error: {exc}")
@@ -487,7 +504,14 @@ class REPL:
                                 self._pending_transients[name] = schema
                 elif data is not None:
                     data.pop("transient_schemas", None)
-                self._display.show_tool_result(call["name"], result)
+                display_str: str | None = None
+                tool_obj = self._tool_registry.get(call["name"])
+                if tool_obj is not None:
+                    with contextlib.suppress(Exception):
+                        display_str = tool_obj.format_display(
+                            args=call["arguments"], result=result
+                        )
+                self._display.show_tool_result(call["name"], result, display_str)
                 try:
                     self._session.add_raw_message(
                         {

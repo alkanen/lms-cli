@@ -94,9 +94,9 @@ def show_tool_result(self, name: str, result: dict,
 ```
 
 In **summary mode** `show_tool_call` prints one compact line; `show_tool_result`
-is silent unless `display_str` is provided, in which case a brief formatted
-version is shown (the LLM incorporates the full result in its next message).
-In **verbose mode** both show full detail.
+is always silent (the LLM incorporates the full result in its next message).
+In **verbose mode** both show full detail; when `display_str` is provided,
+backends render it instead of their default table/JSON dump.
 
 ### Usage update
 
@@ -196,11 +196,11 @@ all interactive input.
 - `stream_reasoning(delta)` → verbose only: `print(delta, end="", flush=True)` prefixed by `[thinking] ` on first call per turn; silent in summary mode
 - `end_assistant_turn()` → `print()` (trailing newline)
 - `show_tool_call(name, args)` → summary: `▶ name(key=val …)` one-liner; verbose: full JSON
-- `show_tool_result(name, result, display_str=None)` → if `display_str`: print it; elif verbose: full JSON; else: silent
+- `show_tool_result(name, result, display_str=None)` → verbose only: `display_str` if provided, else full JSON; silent in summary mode
 - `show_status(message)` → `print(f"# {message}")`
 - `show_error(message)` → `print(f"✗ {message}", file=sys.stderr)`
 - `update_usage(usage, context_window)` → no-op (no toolbar available)
-- `show_history(messages)` → formats each message with `---` separators and role labels, pipes through `$PAGER` if set or `less -R` if available, otherwise prints directly
+- `show_history(messages)` → formats each message as `[{role}] {content}` with blank lines between messages and passes the result to `pydoc.pager()` for paging
 - `show_permission_prompt(question, extra_options)` → numbered menu via `print()` + `prompt_toolkit.prompt()`
 - `show_session_list(sessions)` → numbered list via `print()` + `prompt_toolkit.prompt()`
 

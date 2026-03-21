@@ -97,11 +97,7 @@ class ToolArgument:
                         f"ToolArgument '{name}': {bound_name} must be a numeric "
                         f"value, got {type(bound_val).__name__}"
                     )
-            if (
-                minimum is not None
-                and maximum is not None
-                and minimum > maximum
-            ):
+            if minimum is not None and maximum is not None and minimum > maximum:
                 raise ValueError(
                     f"ToolArgument '{name}': minimum ({minimum}) must be <= "
                     f"maximum ({maximum})"
@@ -257,6 +253,22 @@ class Tool(ABC):
         override this method and clear that state.  The default is a no-op.
         """
         ...
+
+    def format_display(self, *, args: dict, result: dict) -> str | None:
+        """
+        Return a human-readable summary of this tool call for display purposes.
+
+        Called by the REPL after :meth:`execute` completes.  Return a string
+        (which may contain ANSI escape codes) to use in place of the default
+        JSON result display, or ``None`` to fall back to the default.
+
+        :class:`~ai_cli.cli.display.RichDisplay` passes the string through
+        ``Text.from_ansi()``.  :class:`~ai_cli.cli.display.PlainDisplay`
+        prints it verbatim.
+
+        The default implementation returns ``None``.
+        """
+        return None
 
     def on_permission_granted(self, choice: str, **kwargs: Any) -> None:  # noqa: B027
         """

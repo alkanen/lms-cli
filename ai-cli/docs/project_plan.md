@@ -240,8 +240,8 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `@path` inline file reference expansion. `@path` respects ignore rules; `@!path` bypasses them.
      - **Text files**: the `@ref` token is replaced with a `[file: …]\ncontent\n[/file]` block inline; message stays a plain string.
      - **Image files** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) 🔲: the file is base64-encoded and the user message is converted to a content block array (`{"type": "text", …}` + `{"type": "image_url", …}`). `_preprocess_at_references()` returns `str | list[dict]`; the REPL calls `add_raw_message` when the result is a list. The backend adapter is responsible for translating canonical `image_url` blocks to the wire format required by its endpoint (e.g. `input_image` for the OpenAI Responses API). See `docs/technical_requirements.md` — Multimodal Messages.
-   - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`.
-   - Pending REPL changes for RichDisplay support 🔲:
+   - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`, `/history`.
+   - RichDisplay prerequisite REPL changes ✅:
      - Route `{"type": "reasoning", "delta": str}` chunks to `display.stream_reasoning()`.
      - Capture `usage` from `"done"` chunk and call `display.update_usage(usage, context_window)`.
      - `/history` command: call `display.show_history(session.get_messages())`.
