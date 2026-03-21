@@ -74,7 +74,7 @@ class TestDefinition:
     def test_schema_shape(self, tmp_path):
         _init(tmp_path)
         tool = make_real_tool(tmp_path)
-        d = tool.definition()
+        d = tool.definition().schema()
         assert d["type"] == "function"
         fn = d["function"]
         assert fn["name"] == "write_file"

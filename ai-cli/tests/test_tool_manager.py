@@ -194,7 +194,7 @@ class TestUnknownAction:
 class TestDefinition:
     def test_schema_structure(self):
         tool = _make_tool()
-        defn = tool.definition()
+        defn = tool.definition().schema()
         assert defn["type"] == "function"
         fn = defn["function"]
         assert fn["name"] == "tool_manager"

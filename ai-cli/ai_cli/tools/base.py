@@ -53,6 +53,14 @@ class ToolArgument:
     items:
         For ``argument_type="array"``, the JSON Schema for each element
         (e.g. ``{"type": "string"}``).
+    minimum:
+        Inclusive lower bound for ``"integer"`` and ``"number"`` arguments.
+        Emitted as ``minimum`` in the JSON Schema and enforced at call time
+        by the registry.
+    maximum:
+        Inclusive upper bound for ``"integer"`` and ``"number"`` arguments.
+        Emitted as ``maximum`` in the JSON Schema and enforced at call time
+        by the registry.
     """
 
     def __init__(
@@ -64,6 +72,8 @@ class ToolArgument:
         required: bool = False,
         enum: list[str] | None = None,
         items: dict | None = None,
+        minimum: int | float | None = None,
+        maximum: int | float | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -72,6 +82,34 @@ class ToolArgument:
         self._enum = enum
         self._items = items
 
+        if minimum is not None or maximum is not None:
+            if argument_type not in ("integer", "number"):
+                raise ValueError(
+                    f"ToolArgument '{name}': minimum/maximum are only valid for "
+                    f"'integer' or 'number' types, not '{argument_type}'"
+                )
+            for bound_name, bound_val in (("minimum", minimum), ("maximum", maximum)):
+                if bound_val is not None and (
+                    isinstance(bound_val, bool)
+                    or not isinstance(bound_val, (int, float))
+                ):
+                    raise ValueError(
+                        f"ToolArgument '{name}': {bound_name} must be a numeric "
+                        f"value, got {type(bound_val).__name__}"
+                    )
+            if (
+                minimum is not None
+                and maximum is not None
+                and minimum > maximum
+            ):
+                raise ValueError(
+                    f"ToolArgument '{name}': minimum ({minimum}) must be <= "
+                    f"maximum ({maximum})"
+                )
+
+        self.minimum = minimum
+        self.maximum = maximum
+
     def schema(self) -> dict:
         """Return the JSON Schema fragment for this argument."""
         prop: dict = {"type": self.argument_type, "description": self.description}
@@ -79,6 +117,10 @@ class ToolArgument:
             prop["enum"] = self._enum
         if self._items is not None:
             prop["items"] = self._items
+        if self.minimum is not None:
+            prop["minimum"] = self.minimum
+        if self.maximum is not None:
+            prop["maximum"] = self.maximum
         return prop
 
 
@@ -171,12 +213,14 @@ class Tool(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def definition(self) -> dict:
+    def definition(self) -> ToolSchema:
         """
-        Return the OpenAI function-calling schema for this tool.
+        Return the ``ToolSchema`` describing this tool's function-calling schema.
 
-        The returned dict must follow the ``{"type": "function", "function":
-        {...}}`` wrapper format documented in docs/technical_requirements.md.
+        The registry calls ``.schema()`` on the returned object to produce the
+        ``{"type": "function", "function": {...}}`` dict expected by the API.
+        Subclasses should construct and return a :class:`ToolSchema` instance
+        rather than building the raw dict themselves.
         """
 
     @abstractmethod

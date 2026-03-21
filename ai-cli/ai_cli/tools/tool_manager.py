@@ -69,7 +69,7 @@ class ToolManagerTool(Tool):
     # Schema
     # ------------------------------------------------------------------
 
-    def definition(self) -> dict:
+    def definition(self) -> ToolSchema:
         return ToolSchema(
             name=self.name,
             description=self.description,
@@ -96,7 +96,7 @@ class ToolManagerTool(Tool):
                     items={"type": "string"},
                 ),
             ],
-        ).schema()
+        )
 
     # ------------------------------------------------------------------
     # Execution

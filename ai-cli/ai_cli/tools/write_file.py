@@ -128,7 +128,7 @@ class WriteFileTool(Tool):
     # Schema
     # ------------------------------------------------------------------
 
-    def definition(self) -> dict:
+    def definition(self) -> ToolSchema:
         return ToolSchema(
             name=self.name,
             description=(
@@ -179,7 +179,7 @@ class WriteFileTool(Tool):
                     argument_type="integer",
                 ),
             ],
-        ).schema()
+        )
 
     # ------------------------------------------------------------------
     # Execution

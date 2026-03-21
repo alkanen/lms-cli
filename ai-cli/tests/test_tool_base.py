@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ai_cli.tools.base import Tool
+from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 # ---------------------------------------------------------------------------
 # Minimal concrete tool for testing
@@ -15,21 +15,19 @@ from ai_cli.tools.base import Tool
 class EchoTool(Tool):
     """A minimal Tool subclass that echoes its input."""
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message": {"type": "string", "description": "Text to echo."}
-                    },
-                    "required": ["message"],
-                },
-            },
-        }
+    def definition(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    name="message",
+                    description="Text to echo.",
+                    argument_type="string",
+                    required=True,
+                )
+            ],
+        )
 
     def execute(self, **kwargs: Any) -> dict:
         return self._ok({"echo": kwargs.get("message", "")})
@@ -65,7 +63,7 @@ class TestConstruction:
 
     def test_definition_returns_schema(self):
         tool, _, _ = make_tool()
-        d = tool.definition()
+        d = tool.definition().schema()
         assert d["type"] == "function"
         assert d["function"]["name"] == "echo"
 

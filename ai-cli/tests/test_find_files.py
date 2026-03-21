@@ -74,18 +74,18 @@ class TestClassAttributes:
 class TestDefinition:
     def test_returns_function_type(self, tmp_path):
         tool = make_tool(tmp_path)
-        defn = tool.definition()
+        defn = tool.definition().schema()
         assert defn["type"] == "function"
         assert defn["function"]["name"] == "find_files"
 
     def test_pattern_is_required(self, tmp_path):
         tool = make_tool(tmp_path)
-        defn = tool.definition()
+        defn = tool.definition().schema()
         assert "pattern" in defn["function"]["parameters"]["required"]
 
     def test_only_pattern_parameter(self, tmp_path):
         tool = make_tool(tmp_path)
-        props = tool.definition()["function"]["parameters"]["properties"]
+        props = tool.definition().schema()["function"]["parameters"]["properties"]
         assert list(props.keys()) == ["pattern"]
 
 
