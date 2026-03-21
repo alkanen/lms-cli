@@ -86,11 +86,27 @@ This document outlines the technical requirements for the AI CLI tool project. I
 
 - **LLM Messages**:
   - Use JSON for LLM messages, including user inputs and tool responses.
-  - Example:
+  - Text-only example:
     ```json
     {
       "role": "user",
       "content": "List the files in the current directory."
+    }
+    ```
+  - Multimodal example (text + image — see Multimodal Messages section below):
+    ```json
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What does this diagram show?" },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,<b64data>",
+            "detail": "auto"
+          }
+        }
+      ]
     }
     ```
 
@@ -114,6 +130,111 @@ This document outlines the technical requirements for the AI CLI tool project. I
     }
     ```
   - The `data`, `details` fields are optional. All other fields are required. The error format in the **Error Handling** section below uses the same shape.
+
+---
+
+## Multimodal Messages
+
+When the user attaches an image file via `@path/to/image.png`, the user message
+must be sent to the LLM as a **content block array** rather than a plain string.
+The exact wire format depends on the API endpoint in use.
+
+### Canonical in-memory / on-disk format
+
+The session layer and all internal code use the OpenAI `chat/completions` content
+block shape as the canonical representation. This is what gets stored in
+`history_current.jsonl` and `history_full.jsonl`:
+
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "text",      "text": "Explain this architecture diagram." },
+    { "type": "image_url", "image_url": { "url": "data:image/png;base64,<b64>", "detail": "auto" } }
+  ]
+}
+```
+
+Pure-text messages continue to use a plain `"content": "string"` value.
+Mixed text+image messages always use the array form even if only one block is
+present.
+
+### OpenAI `chat/completions` API
+
+The current backend (`OpenAIClient`) uses `client.chat.completions.create()`.
+This endpoint accepts content blocks natively:
+
+| Content type | Block shape |
+|---|---|
+| Text | `{"type": "text", "text": "..."}` |
+| Image (base64) | `{"type": "image_url", "image_url": {"url": "data:<mime>;base64,<b64>", "detail": "auto\|low\|high"}}` |
+
+The canonical format is sent as-is — no translation needed.
+
+### OpenAI `responses` API (future)
+
+The `/v1/responses` endpoint uses different block type names. An `LLMClient`
+adapter targeting this endpoint must rewrite blocks before sending:
+
+| Canonical type | Responses API type |
+|---|---|
+| `"text"` | `"input_text"` (field: `"text"`) |
+| `"image_url"` | `"input_image"` (field: `"image_url"`, data URI unchanged) |
+
+Example translated block:
+```json
+{ "type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,<b64>" }
+```
+
+The translation is the adapter's responsibility. Session history is always
+stored in canonical form so it can be replayed through any future adapter.
+
+### LM Studio (OpenAI-compatible REST)
+
+LM Studio's REST endpoint accepts the same `image_url` block shape as the
+OpenAI `chat/completions` API. No special handling is required when using LM
+Studio via the `openai` backend with a custom `base_url`. Vision capability
+depends on the loaded model; if the model lacks vision support the API returns
+an error, which surfaces to the user as an `LLMError`.
+
+### Image encoding
+
+Images are always inlined as base64 data URIs. URL-based references (remote
+images) are not supported — all content must be workspace-local.
+
+```python
+import base64
+data = path.read_bytes()
+b64 = base64.b64encode(data).decode()
+url = f"data:{mime_type};base64,{b64}"
+```
+
+### Supported image formats
+
+| Extension | MIME type | Notes |
+|---|---|---|
+| `.png` | `image/png` | |
+| `.jpg`, `.jpeg` | `image/jpeg` | |
+| `.gif` | `image/gif` | OpenAI treats animated GIFs as a single frame |
+| `.webp` | `image/webp` | |
+
+Files with any other extension are treated as text. Future work: MIME-sniff the
+leading bytes for extensionless or misnamed files.
+
+### Token counting
+
+`count_tokens()` uses tiktoken, which only counts text tokens. Image token cost
+is model- and resolution-dependent. OpenAI's tile-based pricing:
+
+- `"detail": "low"` — fixed 85 tokens per image.
+- `"detail": "high"` — 85 base + 170 per 512×512 tile (capped at the image
+  size). A 1024×1024 image costs 85 + 4×170 = 765 tokens.
+- `"detail": "auto"` — the model decides; treat as `"high"` for worst-case
+  estimates.
+
+The local tiktoken estimate will undercount when images are present. Compaction
+threshold decisions should prefer the actual `usage` figures returned by the API
+in the `"done"` chunk over the local estimate.
 
 ---
 

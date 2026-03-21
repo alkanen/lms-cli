@@ -101,12 +101,12 @@ ai-cli/
 │   │   ├── config_manager.py       # ✅ Layered YAML config loading
 │   │   ├── workspace.py            # ✅ Workspace root resolution, file ops, ignore rules
 │   │   ├── permission_manager.py   # ✅ In-memory permission state
-│   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, settings
+│   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, argument validation
 │   │   ├── llm_client.py           # ✅ LLMClient ABC + OpenAIClient (REST/streaming); LMStudio WebSocket 🔲
 │   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist
 │   │   └── mcp_manager.py          # 🔲 MCP server connections, tool exposure
 │   ├── tools/                      # Bundled tools
-│   │   ├── base.py                 # ✅ Tool abstract base class
+│   │   ├── base.py                 # ✅ Tool ABC; ToolArgument (with min/max bounds); ToolSchema
 │   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
@@ -130,7 +130,8 @@ ai-cli/
 │   ├── test_find_files.py
 │   └── test_main.py
 └── docs/                           # Documentation
-    └── project_plan.md             # This file
+    ├── project_plan.md             # This file
+    └── HOWTO_custom_tools.md       # ✅ Guide for writing custom tools
 ```
 
 ## Implementation Plan
@@ -179,6 +180,16 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      ```
    - Currently the registry applies only `permission_required` and `disabled` from the config. Other keys (e.g., `allow_outside_workspace`) are reserved for future extension; the `Tool` base class would need to accept per-tool settings before they can be applied.
    - **Security**: Project-level `config.yaml` is treated as untrusted. For `permission_required`, `ToolRegistry._apply_config()` ignores any attempt to lower it unless the entry carries `user_confirmed: true` (written by `ToolRegistry.set_permission_required()`; the 🔲 planned `/tools allow` REPL command will call this), and logs a warning otherwise. A startup confirmation prompt for untrusted settings is 🔲 planned for when the REPL exists, but is not yet implemented. Other security-weakening keys such as `allow_outside_workspace` are reserved for future extension and are currently ignored.
+   - **`ToolSchema` as return type**: `Tool.definition()` returns a `ToolSchema` object (not a raw dict). The registry calls `.schema()` on it at registration time to produce the OpenAI function-calling dict. This gives full type-checking on tool definitions at load time.
+   - **`ToolArgument` bounds**: `ToolArgument` accepts optional `minimum` and `maximum` keyword arguments for `"integer"` and `"number"` types. Validation in `__init__` rejects non-numeric bounds, bounds on non-numeric argument types, and `minimum > maximum` with a `ValueError` (causing the tool to be skipped at registration). The registry enforces bounds at call time via `_check_bounds()`.
+   - **Pre-call argument validation** (`_validate_args()`): Before `execute()` is called, the registry validates the incoming kwargs against the tool's declared `ToolSchema`:
+     - Required arguments must be present (returns `invalid_arguments` error if missing).
+     - Unknown arguments are stripped with a warning log (not an error — the model can send extra keys).
+     - Each argument's JSON Schema primitive type is checked via `_check_type()`; mismatches return `invalid_arguments`.
+     - `bool` is rejected for `"integer"` and `"number"` types (Python `bool` is a subclass of `int`).
+     - `int` is accepted for `"number"` type (widening conversion).
+     - Numeric bounds (`minimum`, `maximum`) are enforced via `_check_bounds()` with defensive handling of post-construction mutation.
+   - All `invalid_arguments` errors are returned to the LLM so the model can self-correct — values are never silently coerced.
 
 4. **MCP Support** 🔲
    - Implement a `MCPManager` class to discover, connect to, and communicate with MCP servers.
@@ -190,6 +201,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Canonical `{"status": "success"/"error", ...}` response shape standardised via `_ok()`/`_err()` helpers and followed by built-in tools by convention — nothing enforces that third-party tools use them.
    - `ToolRegistry.execute()` handles unknown tool, disabled tool, permission denied, and execution errors — all return canonical error dicts.
    - `allow_transient=True` parameter lets the REPL execute transiently-injected tools that aren't in the persistent enabled set. This intentionally bypasses the *disabled* gate (soft) but must never bypass the *disallowed* gate (hard) — see the two-level permission design under `/tools` subcommands below.
+   - Pre-call argument validation (`_validate_args`) runs before `execute()` — see Tool Registry Enhancements above.
 
 2. **Permission System** ✅
    - `PermissionManager` handles in-memory grants (yes/no/always/custom rejection).
@@ -225,7 +237,9 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 
 3. **REPL** ✅
    - Interactive loop using `prompt_toolkit`.
-   - `@path` inline file reference expansion (text substitution). `@path` respects ignore rules; `@!path` bypasses them.
+   - `@path` inline file reference expansion. `@path` respects ignore rules; `@!path` bypasses them.
+     - **Text files**: the `@ref` token is replaced with a `[file: …]\ncontent\n[/file]` block inline; message stays a plain string.
+     - **Image files** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) 🔲: the file is base64-encoded and the user message is converted to a content block array (`{"type": "text", …}` + `{"type": "image_url", …}`). `_preprocess_at_references()` returns `str | list[dict]`; the REPL calls `add_raw_message` when the result is a list. The backend adapter is responsible for translating canonical `image_url` blocks to the wire format required by its endpoint (e.g. `input_image` for the OpenAI Responses API). See `docs/technical_requirements.md` — Multimodal Messages.
    - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`.
 
 4. **Display** ⚠️ (partial)
@@ -233,27 +247,20 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `PlainDisplay` ✅ — `print()`-based output, `prompt_toolkit` for interactive prompts.
    - `RichDisplay` 🔲 — Rich-formatted output; currently falls back to `PlainDisplay`.
 
-5. **Remaining CLI completions** 🔲
-   - **`--resume` / `--resume <id>` / `--continue` CLI flags** ✅ in `__main__.py` — session resume at startup.
-   - **`/tools` subcommands** — currently `/tools` only lists enabled tools. Planned subcommands:
-     - `/tools list` — list all tools (enabled and disabled) with tier and status.
-     - `/tools info <name>` — full details: description, parameters, current settings.
-     - `/tools enable <name> [--session]` / `/tools disable <name> [--session]` — soft gate.
-     - `/tools allow <name> [--session]` / `/tools disallow <name> [--session]` — hard gate.
-   - **Two-level tool visibility design:**
+5. **Remaining CLI completions** ✅ (all implemented and tested)
+   - **`--resume` / `--resume <id>` / `--continue` CLI flags** ✅ in `__main__.py`.
+   - **`/tools` subcommands** ✅ — `/tools list`, `/tools info <name>`, `/tools enable|disable|allow|disallow [--session] <name>`.
+   - **Two-level tool visibility design** ✅:
      - **enabled / disabled** (soft gate): controls whether the tool appears in the normal per-turn tool list. A `disabled` tool is hidden from the LLM's tool list but `tool_manager` can still transiently enable it for a single turn. Changeable at runtime via `/tools enable`/`disable`.
      - **allowed / disallowed** (hard gate): controls whether the tool is visible to the agent at all. A `disallowed` tool is not listed by `tool_manager` and cannot be transiently enabled — the agent has no way to know it exists. Only changeable via `/tools allow`/`disallow` or by editing config and restarting. `allow_transient=True` in `ToolRegistry.execute()` must respect this gate (i.e. must not execute a `disallowed` tool).
-   - **`/compact [instructions]`** — optional instructions argument (currently ignored).
-   - **`/session name "<name>"`** — currently `/session` only shows info; naming not yet wired up.
-   - **`completer.py`** — tab completion for slash commands, tool names, and file paths. Interactive `@` popup/picker (vs. the current text-substitution approach).
+   - **`/compact [instructions]`** ✅ — instructions string forwarded to `session.compact()`.
+   - **`/session name "<name>"`** ✅ — calls `session.set_name()`.
+   - **`completer.py`** 🔲 — tab completion for slash commands, tool names, and file paths. Interactive `@` popup/picker (vs. the current text-substitution approach). Image files shown in the `@` picker are attached as base64 content blocks rather than text.
 
 6. **Logging** 🔲
    - `logging_utils.py` — JSONL structured logging to session-specific folders.
 
 ### Phase 4: Advanced Features 🔲
-1. **`tool_manager` tool** ✅
-   - Context-saving tool gatekeeper; `list` and `enable` actions.
-   - `ToolRegistry.enable_transient()` injects schemas for a single API call with no persistent state change.
 
 2. **MCP Server Support**
    - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
@@ -274,6 +281,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 - **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new). Flag routing wired into `__main__.py` via `_pick_session()` ✅. Remaining planned behaviours 🔲: (a) session list displaying name and last-message preview with role indicator (currently shows `first_user_message` only); (b) on resume, prompt to resend if the last message was from the user, or display the last assistant message in full so the user can respond.
 - **Output modes**: Summary (default) and verbose, toggled via `/verbose` slash command (keyboard shortcut binding TBD).
 - **`find_files` directory pruning**: Ignored directories are pruned from `os.walk` for performance. Files inside an ignored directory are never returned even if a negation rule would re-include them — this matches standard Git walk behaviour and is essential for avoiding traversal of `env/`, `.git/`, `node_modules/`, etc.
+- **Multimodal `@` references — canonical content block format**: Image files attached via `@ref` are stored in session history using the OpenAI `chat/completions` content block shape (`"type": "text"` / `"type": "image_url"`) as the canonical in-memory and on-disk representation. Backend adapters that target other endpoints (e.g. the OpenAI `responses` API) translate to the required wire format before sending. This keeps the session layer backend-agnostic. See `docs/technical_requirements.md` — Multimodal Messages.
 
 ## Assumptions
 - The existing `lms_cli` is a starting point but not a strict requirement.
@@ -304,14 +312,10 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **`tool_manager` tool** — implement `list` and `enable` actions, `ToolRegistry.enable_transient()`, and REPL integration for transient tool injection.
-2. **`--resume` / `--continue` CLI flags** — wire `SessionManager` into `__main__.py` startup.
-3. **`/tools` subcommands** — expand `/tools` beyond the current simple list.
-4. **`/session name`** and **`/compact [instructions]`** — complete the remaining slash commands.
-5. **`RichDisplay`** — replace `PlainDisplay` with Rich-formatted output.
-6. **`completer.py`** — tab completion and interactive `@` file picker.
-7. **`logging_utils.py`** — JSONL structured logging.
-8. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry`.
+1. **`RichDisplay`** — replace `PlainDisplay` with Rich-formatted output.
+2. **`completer.py`** — tab completion and interactive `@` file picker.
+3. **`logging_utils.py`** — JSONL structured logging.
+4. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry`.
 
 ## Dependencies
 - Python 3.10+

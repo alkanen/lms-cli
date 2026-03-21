@@ -68,16 +68,7 @@ raw input
 ### `@` file references
 
 `@path/to/file` anywhere in the user's message is replaced inline before the
-message is sent to the LLM. Resolution:
-
-1. `workspace.resolve(path)` — enforces workspace bounds.
-2. `workspace.read_file(path)` — reads the file content.
-3. The `@ref` token is replaced with:
-   ```
-   [file: path/to/file]
-   <content>
-   [/file]
-   ```
+message is sent to the LLM.
 
 If resolution fails (file not found, ignored, outside workspace), the `@ref`
 is left in place and `display.show_error()` is called with an explanation.
@@ -85,6 +76,120 @@ The user can then correct or send anyway.
 
 `@!path/to/file` bypasses the ignore filter (explicit override, consistent with
 the Completer design). Behaviour otherwise identical.
+
+#### Text files
+
+For non-image files, resolution:
+
+1. `workspace.resolve(path)` — enforces workspace bounds.
+2. `workspace.read_file(path)` — reads the file as UTF-8 text.
+3. The `@ref` token is replaced inline with:
+   ```
+   [file: path/to/file]
+   <content>
+   [/file]
+   ```
+4. The overall message content remains a plain string and is saved to session
+   history with `session.add_message("user", text)` as normal.
+
+#### Image files
+
+Files with a recognised image extension (`.png`, `.jpg`/`.jpeg`, `.gif`,
+`.webp`) are handled differently because the LLM cannot parse them as text.
+
+1. `workspace.resolve(path)` — enforces workspace bounds (same as text).
+2. The file is **not** ignore-filtered by default when referenced with `@`
+   (the user is explicitly attaching it). `@!` is still accepted for clarity
+   or consistency but has no additional effect for binary files.
+3. The file is read as raw bytes and base64-encoded.
+4. The overall user message is converted from a plain string into a **content
+   block array** — the OpenAI multimodal message format — containing:
+   - One `text` block with the rest of the user's message text (the `@ref`
+     token itself is removed; no `[file: …]` wrapper is inserted).
+   - One image block per image reference.
+5. The assembled raw message is saved with `session.add_raw_message({"role":
+   "user", "content": [...]})` instead of `add_message()`.
+
+**Return type of `_preprocess_at_references()`:** the method currently returns
+`str`. With image support it must return `str | list[dict]` (a content block
+array when at least one image is present). The REPL dispatches on the type to
+choose the correct `Session` write call.
+
+**Content block format — OpenAI `chat/completions` (current backend):**
+
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "text", "text": "What does this diagram show?" },
+    {
+      "type": "image_url",
+      "image_url": {
+        "url": "data:image/png;base64,<b64data>",
+        "detail": "auto"
+      }
+    }
+  ]
+}
+```
+
+The `detail` field controls tile-based processing cost (`"auto"`, `"low"`,
+`"high"`). Default to `"auto"` so the model decides.
+
+**Content block format — OpenAI `responses` API (future):**
+
+The `/v1/responses` endpoint uses different content block types. Text blocks
+become `"input_text"` and image blocks become `"input_image"`:
+
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "input_text", "text": "What does this diagram show?" },
+    {
+      "type": "input_image",
+      "detail": "auto",
+      "image_url": "data:image/png;base64,<b64data>"
+    }
+  ]
+}
+```
+
+The `LLMClient` backend is responsible for translating the internal content
+block representation into whichever wire format its endpoint requires. The REPL
+and session layer always use the `chat/completions` content block shape
+(`"text"` / `"image_url"`) as the canonical in-memory and on-disk format;
+adapters that target the `responses` endpoint rewrite the blocks before sending.
+
+**LM Studio compatibility:**
+
+LM Studio's OpenAI-compatible REST endpoint accepts the same `image_url`
+content block format as the OpenAI `chat/completions` API. No special handling
+is needed when using LM Studio via the `openai` backend with a custom
+`base_url`. Vision capability depends on the loaded model; if the model does
+not support vision the API will return an error, which surfaces as an
+`LLMError` to the user.
+
+**Supported MIME types and extensions:**
+
+| Extension | MIME type |
+|---|---|
+| `.png` | `image/png` |
+| `.jpg`, `.jpeg` | `image/jpeg` |
+| `.gif` | `image/gif` |
+| `.webp` | `image/webp` |
+
+Unrecognised extensions are treated as text files. Future: MIME-sniff the first
+few bytes as a fallback for extensionless files.
+
+**Token counting caveat:**
+
+`count_tokens()` uses tiktoken, which can only count text tokens. Image tokens
+are model- and resolution-dependent (OpenAI charges roughly 85–1105 tokens per
+image tile depending on `detail` level). The local estimate will therefore
+undercount when images are present. The actual token usage returned by the API
+in the `"done"` chunk should be preferred for compaction threshold decisions
+whenever available.
 
 ---
 
