@@ -245,6 +245,52 @@ in the `"done"` chunk over the local estimate.
 - The active backend is selected via configuration file, with a CLI flag override (e.g., `--backend openai` or `--backend lmstudio`).
 - The interface must support: sending messages, receiving streamed responses, and querying model metadata (context window, token limits).
 
+### Chunk types
+
+All backends yield the same normalised chunk dict format:
+
+| Type | Fields | Notes |
+|---|---|---|
+| `text` | `delta: str` | LLM response text delta; yield immediately as received |
+| `reasoning` | `delta: str` | Reasoning/thinking content delta (see below) |
+| `tool_call` | `name`, `call_id`, `arguments: dict` | Buffered internally until complete; emitted as one chunk |
+| `done` | `stop_reason: str`, `usage: dict` | Always the last chunk; `usage` has `prompt_tokens`, `completion_tokens`, `total_tokens` |
+
+### Reasoning content
+
+Several model families expose internal chain-of-thought reasoning separately
+from the visible response.  The LLMClient normalises all sources into
+`{"type": "reasoning", "delta": str}` chunks so the Display layer handles
+them uniformly.
+
+**Source 1 — `reasoning_content` delta field (OpenAI `o1`, `o3`, compatible
+models):** The streaming delta may carry a `reasoning_content` field alongside
+`content`.  The backend extracts it and emits a `reasoning` chunk in parallel
+with any `text` chunk from the same delta.
+
+**Source 2 — `<think>…</think>` tags embedded in the text stream (DeepSeek R1,
+QwQ, and similar open-source reasoning models):** The content between the tags
+is reasoning; text outside the tags is the visible response.  A stateful
+`_ThinkTagParser` in the LLMClient intercepts the text stream:
+
+```
+State machine:
+  OUTSIDE  →  text before <think>   → emit as "text" chunks
+  INSIDE   →  text between tags     → emit as "reasoning" chunks
+  OUTSIDE  ←  text after </think>   → emit as "text" chunks
+
+Tag boundaries may fall mid-chunk; the parser buffers until the full tag is
+confirmed or ruled out.
+```
+
+The parser is implemented as a helper class on the backend, not in the Display
+or REPL.  This keeps the two layers decoupled: adding a new reasoning source
+(e.g. Anthropic thinking blocks, a future model convention) requires only a
+new extraction path in the LLMClient, with no changes to Display or REPL.
+
+The REPL routes `reasoning` chunks to `display.stream_reasoning(delta)` in the
+same streaming loop as `text` chunks.
+
 ### OpenAI-Compatible REST API (Primary)
 - **Authentication**:
   - Prefer environment variables for API keys (e.g., `OPENAI_API_KEY`); never commit API keys to source control.

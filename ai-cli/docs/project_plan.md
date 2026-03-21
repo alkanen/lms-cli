@@ -241,11 +241,28 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - **Text files**: the `@ref` token is replaced with a `[file: …]\ncontent\n[/file]` block inline; message stays a plain string.
      - **Image files** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) 🔲: the file is base64-encoded and the user message is converted to a content block array (`{"type": "text", …}` + `{"type": "image_url", …}`). `_preprocess_at_references()` returns `str | list[dict]`; the REPL calls `add_raw_message` when the result is a list. The backend adapter is responsible for translating canonical `image_url` blocks to the wire format required by its endpoint (e.g. `input_image` for the OpenAI Responses API). See `docs/technical_requirements.md` — Multimodal Messages.
    - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`.
+   - Pending REPL changes for RichDisplay support 🔲:
+     - Route `{"type": "reasoning", "delta": str}` chunks to `display.stream_reasoning()`.
+     - Capture `usage` from `"done"` chunk and call `display.update_usage(usage, context_window)`.
+     - `/history` command: call `display.show_history(session.get_messages())`.
+     - After each tool execute, call `tool.format_display(args, result)` and pass result to `display.show_tool_result(..., display_str=...)`.  See `docs/design_display.md` — Tool call display.
 
 4. **Display** ⚠️ (partial)
    - `Display` ABC with full interface defined.
    - `PlainDisplay` ✅ — `print()`-based output, `prompt_toolkit` for interactive prompts.
-   - `RichDisplay` 🔲 — Rich-formatted output; currently falls back to `PlainDisplay`.
+   - `RichDisplay` 🔲 — design complete (see `docs/design_display.md`); currently falls back to `PlainDisplay`. Key design points:
+     - Scrolling output model (no fixed TUI panels); TUI layout deferred as future `TUIDisplay`.
+     - `Live(transient=True)` during streaming → formatted Markdown on turn end.
+     - Reasoning preview (dim, truncated) live during stream; full block in verbose mode only.
+     - Turn separators: coloured `Rule` + left-bordered `Panel`; user=green, assistant=cyan, tool=yellow.
+     - Bottom toolbar via `prompt_toolkit` `refresh_interval=1`: context bar + two elapsed timers + last status.
+     - Permission prompt: `prompt_toolkit.application.Application` with arrow-key navigation and hotkeys.
+     - `/history`: `Console.pager()` for screen/tmux-safe scrollable history view.
+     - `tool.format_display(args, result) -> str | None` on Tool base class for ANSI-capable custom tool output.
+   - New ABC methods added (all non-abstract with defaults except `show_history`):
+     - `stream_reasoning(delta)` — reasoning/thinking content; no-op default
+     - `update_usage(usage, context_window)` — token counts for toolbar; no-op default
+     - `show_history(messages)` — pageable history viewer; abstract
 
 5. **Remaining CLI completions** ✅ (all implemented and tested)
    - **`--resume` / `--resume <id>` / `--continue` CLI flags** ✅ in `__main__.py`.
@@ -312,8 +329,8 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **`RichDisplay`** — replace `PlainDisplay` with Rich-formatted output.
-2. **`completer.py`** — tab completion and interactive `@` file picker.
+1. **`RichDisplay`** — design complete; implement (see `docs/design_display.md`). Requires parallel work on LLMClient (`reasoning` chunk type + `<think>` tag parser) and REPL (`stream_reasoning`, `update_usage`, `/history`, `format_display` plumbing).
+2. **`completer.py`** — tab completion and interactive `@` file picker (image files shown as attachments).
 3. **`logging_utils.py`** — JSONL structured logging.
 4. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry`.
 
