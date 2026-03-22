@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import io
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 
-from ai_cli.cli.display import _UNIVERSAL_OPTIONS, Display, PlainDisplay, create_display
+from ai_cli.cli.display import (
+    _UNIVERSAL_OPTIONS,
+    Display,
+    PlainDisplay,
+    RichDisplay,
+    create_display,
+)
 from ai_cli.core.session_manager import SessionMeta
 
 _PAGER_PATCH = "ai_cli.cli.display.pydoc.pager"
@@ -39,6 +47,21 @@ def _make_session_meta(
 
 def _plain(verbose: bool = False) -> PlainDisplay:
     return PlainDisplay(verbose=verbose)
+
+
+def _rich(
+    verbose: bool = False, markdown_enabled: bool = True
+) -> tuple[RichDisplay, io.StringIO, io.StringIO]:
+    """Return a RichDisplay wired to StringIO consoles (no ANSI, width=80).
+
+    Returns ``(display, stdout_buf, stderr_buf)``.
+    """
+    buf = io.StringIO()
+    err_buf = io.StringIO()
+    d = RichDisplay(verbose=verbose, markdown_enabled=markdown_enabled)
+    d._console = Console(file=buf, no_color=True, width=80, highlight=False, markup=False)
+    d._stderr_console = Console(file=err_buf, no_color=True, width=80, highlight=False, markup=False)
+    return d, buf, err_buf
 
 
 # ---------------------------------------------------------------------------
@@ -730,13 +753,11 @@ class TestCreateDisplay:
         d = create_display(self._config("plain"))
         assert isinstance(d, PlainDisplay)
 
-    def test_rich_falls_back_to_plain(self, caplog):
-        import logging
+    def test_rich_backend(self):
+        from ai_cli.cli.display import RichDisplay
 
-        with caplog.at_level(logging.WARNING):
-            d = create_display(self._config("rich"))
-        assert isinstance(d, PlainDisplay)
-        assert "not yet implemented" in caplog.text.lower()
+        d = create_display(self._config("rich"))
+        assert isinstance(d, RichDisplay)
 
     def test_unknown_backend_falls_back_to_plain(self, caplog):
         import logging
@@ -753,3 +774,403 @@ class TestCreateDisplay:
     def test_markdown_flag_passed_through(self):
         d = create_display(self._config(markdown=False))
         assert d.markdown_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# RichDisplay
+# ---------------------------------------------------------------------------
+
+
+class TestRichDisplayStreaming:
+    def test_begin_turn_prints_rule(self):
+        d, buf, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+        assert "Assistant" in buf.getvalue()
+
+    def test_stream_text_accumulates(self):
+        d, _, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_text("hello")
+            d.stream_text(" world")
+        assert d._text_acc == "hello world"
+
+    def test_stream_reasoning_accumulates(self):
+        d, _, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_reasoning("some thinking")
+        assert d._reasoning_acc == "some thinking"
+
+    def test_end_turn_prints_response(self):
+        d, buf, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_text("Hello!")
+            d.end_assistant_turn()
+        assert "Hello!" in buf.getvalue()
+
+    def test_end_turn_no_response_when_empty(self):
+        """Empty text buffer → no response block printed (tool-only turn)."""
+        d, buf, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.end_assistant_turn()
+        # Only the Rule separator was printed; no left-border block
+        assert "│" not in buf.getvalue()
+
+    def test_reasoning_block_shown_in_verbose(self):
+        d, buf, _ = _rich(verbose=True)
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_reasoning("my reasoning")
+            d.stream_text("answer")
+            d.end_assistant_turn()
+        out = buf.getvalue()
+        assert "Reasoning" in out
+        assert "my reasoning" in out
+
+    def test_reasoning_block_hidden_in_summary(self):
+        d, buf, _ = _rich(verbose=False)
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_reasoning("secret thinking")
+            d.stream_text("answer")
+            d.end_assistant_turn()
+        out = buf.getvalue()
+        assert "Reasoning" not in out
+        assert "secret thinking" not in out
+
+    def test_response_rule_not_shown_without_response_text(self):
+        # Reasoning-only turn (e.g. tool call): verbose must not emit a dangling
+        # "Response" separator when there is no response text to follow it.
+        d, buf, _ = _rich(verbose=True)
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.stream_reasoning("some thinking")
+            # no stream_text call
+            d.end_assistant_turn()
+        out = buf.getvalue()
+        assert "Reasoning" in out
+        assert "Response" not in out
+
+    def test_update_usage_stores_values(self):
+        d, _, _ = _rich()
+        d.update_usage({"prompt_tokens": 100, "completion_tokens": 50}, 4096)
+        assert d._prompt_tokens == 100
+        assert d._context_window == 4096
+
+    def test_live_cleaned_up_on_end_turn(self):
+        d, _, _ = _rich()
+        mock_live = MagicMock()
+        with patch("ai_cli.cli.display.Live", return_value=mock_live):
+            d.begin_assistant_turn()
+            d.stream_text("x")
+            d.end_assistant_turn()
+        mock_live.stop.assert_called_once()
+        assert d._live is None
+
+
+class TestRichDisplayToolActivity:
+    def test_show_tool_call_summary_compact(self):
+        d, buf, _ = _rich(verbose=False)
+        d.show_tool_call("read_file", {"path": "src/foo.py"})
+        out = buf.getvalue()
+        assert "read_file" in out
+        assert "src/foo.py" in out
+        assert "▶" in out
+
+    def test_show_tool_call_verbose_prints_rule(self):
+        d, buf, _ = _rich(verbose=True)
+        d.show_tool_call("read_file", {"path": "src/foo.py"})
+        out = buf.getvalue()
+        assert "read_file" in out
+        assert "src/foo.py" in out
+        assert "Tool:" in out
+
+    def test_show_tool_call_no_args(self):
+        d, buf, _ = _rich()
+        d.show_tool_call("noop_tool", {})
+        assert "noop_tool" in buf.getvalue()
+
+    def test_show_tool_result_display_str_verbose(self):
+        d, buf, _ = _rich(verbose=True)
+        d.show_tool_result(
+            "read_file", {"status": "success"}, display_str="file content here"
+        )
+        assert "file content here" in buf.getvalue()
+
+    def test_show_tool_result_display_str_silent_in_summary(self):
+        d, buf, _ = _rich(verbose=False)
+        d.show_tool_result(
+            "read_file", {"status": "success"}, display_str="file content here"
+        )
+        assert buf.getvalue() == ""
+
+    def test_show_tool_result_verbose_json(self):
+        d, buf, _ = _rich(verbose=True)
+        d.show_tool_result("read_file", {"status": "success", "data": "x"})
+        out = buf.getvalue()
+        assert "success" in out
+
+    def test_show_tool_result_summary_silent(self):
+        d, buf, _ = _rich(verbose=False)
+        d.show_tool_result("read_file", {"status": "success"})
+        assert buf.getvalue() == ""
+
+    def test_show_tool_result_summary_error_silent(self):
+        d, buf, _ = _rich(verbose=False)
+        d.show_tool_result("read_file", {"status": "error", "message": "not found"})
+        assert buf.getvalue() == ""
+
+
+class TestRichDisplayStatusError:
+    def test_show_status_prints_message(self):
+        d, buf, _ = _rich()
+        d.show_status("Compaction complete.")
+        assert "Compaction complete." in buf.getvalue()
+
+    def test_show_status_updates_last_status(self):
+        d, _, _ = _rich()
+        d.show_status("ok")
+        assert d._last_status == "ok"
+
+    def test_show_error_prints_to_stderr(self):
+        d, buf, err_buf = _rich()
+        d.show_error("Something broke.")
+        assert "Something broke." in err_buf.getvalue()
+        assert "✗" in err_buf.getvalue()
+        assert buf.getvalue() == ""
+
+    def test_show_error_updates_last_status(self):
+        d, _, _ = _rich()
+        d.show_error("oops")
+        assert "✗" in d._last_status
+        assert "oops" in d._last_status
+
+
+class TestRichDisplayToolbar:
+    def test_prompt_session_kwargs_has_toolbar(self):
+        d, _, _ = _rich()
+        kwargs = d.prompt_session_kwargs()
+        assert "bottom_toolbar" in kwargs
+        assert "refresh_interval" in kwargs
+        assert kwargs["refresh_interval"] == 1
+
+    def test_toolbar_empty_before_any_turn(self):
+        d, _, _ = _rich()
+        tb = d._build_toolbar()
+        assert tb == ""
+
+    def test_toolbar_shows_ctx_after_usage(self):
+        d, _, _ = _rich()
+        d.update_usage({"prompt_tokens": 1024}, 4096)
+        tb = d._build_toolbar()
+        assert "ctx:" in tb
+        assert "25%" in tb
+
+    def test_toolbar_shows_status(self):
+        d, _, _ = _rich()
+        # Set last status directly; avoid printing to the console buffer
+        d._last_status = "Session saved."
+        tb = d._build_toolbar()
+        assert "Session saved." in tb
+
+    def test_toolbar_timer_shows_during_active_turn(self):
+        d, _, _ = _rich()
+        from datetime import timedelta
+
+        d._turn_start_time = datetime.now() - timedelta(seconds=90)
+        tb = d._build_toolbar()
+        assert "⏱" in tb
+        assert "01:30" in tb
+
+    def test_toolbar_timer_shows_fixed_duration_after_turn(self):
+        d, _, _ = _rich()
+        d._last_turn_duration = 75.0  # 1 min 15 sec
+        tb = d._build_toolbar()
+        assert "⏱" in tb
+        assert "01:15" in tb
+
+    def test_toolbar_timer_not_live_after_turn_ends(self):
+        d, _, _ = _rich()
+        with patch("ai_cli.cli.display.Live"):
+            d.begin_assistant_turn()
+            d.end_assistant_turn()
+        # _turn_start_time must be cleared so the timer stops counting up
+        assert d._turn_start_time is None
+        assert d._last_turn_duration is not None
+
+
+class TestRichDisplaySlashCommands:
+    def test_show_help(self):
+        d, buf, _ = _rich()
+        d.show_help([("/help", "Show help"), ("/exit", "Quit")])
+        out = buf.getvalue()
+        assert "/help" in out
+        assert "Show help" in out
+
+    def test_show_tool_list(self):
+        tool = MagicMock()
+        tool.name = "read_file"
+        tool.description = "Read a file"
+        d, buf, _ = _rich()
+        d.show_tool_list([tool])
+        out = buf.getvalue()
+        assert "read_file" in out
+        assert "Read a file" in out
+
+    def test_show_tool_list_empty(self):
+        d, buf, _ = _rich()
+        d.show_tool_list([])
+        assert "No tools" in buf.getvalue()
+
+    def test_show_session_info(self):
+        session = MagicMock()
+        session.session_id = "20240101T000000-aabbccdd"
+        session.get_meta.return_value = {
+            "started_at": "2024-01-01T12:00:00",
+            "message_count": 4,
+            "name": "Test",
+        }
+        d, buf, _ = _rich()
+        d.show_session_info(session)
+        out = buf.getvalue()
+        assert "20240101T000000-aabbccdd" in out
+        assert "Test" in out
+        assert "4" in out
+
+    def test_show_tool_list_all(self):
+        d, buf, _ = _rich()
+        d.show_tool_list_all(
+            [
+                {
+                    "name": "read_file",
+                    "allowed": True,
+                    "enabled": True,
+                    "permission_required": False,
+                    "tier": "basic",
+                    "description": "Read files",
+                },
+            ]
+        )
+        out = buf.getvalue()
+        assert "read_file" in out
+        assert "enabled" in out
+
+    def test_show_tool_info(self):
+        d, buf, _ = _rich()
+        d.show_tool_info(
+            {
+                "name": "read_file",
+                "description": "Read a file",
+                "tier": "basic",
+                "allowed": True,
+                "enabled": True,
+                "permission_required": False,
+                "parameters": {
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"],
+                },
+            }
+        )
+        out = buf.getvalue()
+        assert "read_file" in out
+        assert "path" in out
+        assert "required" in out
+
+
+class TestRichDisplayHistory:
+    _PAGER_PATCH = "ai_cli.cli.display.Console.pager"
+
+    def test_show_history_calls_pager(self):
+        d, _, _ = _rich()
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        with patch("ai_cli.cli.display.Console.pager") as mock_pager:
+            mock_pager.return_value.__enter__ = MagicMock(return_value=None)
+            mock_pager.return_value.__exit__ = MagicMock(return_value=False)
+            d.show_history(msgs)
+        mock_pager.assert_called_once()
+
+    def test_show_history_renders_roles(self):
+        d, buf, _ = _rich()
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "World"},
+        ]
+        # Bypass pager so output goes to buf
+        import contextlib
+
+        with patch.object(d._console, "pager", return_value=contextlib.nullcontext()):
+            d.show_history(msgs)
+        out = buf.getvalue()
+        assert "User" in out
+        assert "Assistant" in out
+        assert "Hello" in out
+        assert "World" in out
+
+
+class TestRichDisplayPermissionPrompt:
+    def _prompt(
+        self, inputs: list[str], extra: list[str] | None = None
+    ) -> tuple[str, str]:
+        d, _, _ = _rich()
+        with patch(_PATCH, side_effect=inputs):
+            return d.show_permission_prompt("Allow?", extra or [])
+
+    def test_yes(self):
+        assert self._prompt(["y"]) == ("yes", "")
+
+    def test_no(self):
+        assert self._prompt(["n"]) == ("no", "")
+
+    def test_always(self):
+        assert self._prompt(["a"]) == ("always", "")
+
+    def test_custom(self):
+        choice, text = self._prompt(["c", "Please don't"])
+        assert choice == "custom"
+        assert text == "Please don't"
+
+    def test_extra_option(self):
+        choice, _ = self._prompt(["0"], extra=["file:./src"])
+        assert choice == "file:./src"
+
+    def test_eof_returns_no(self):
+        d, _, _ = _rich()
+        with patch(_PATCH, side_effect=EOFError):
+            choice, _ = d.show_permission_prompt("Allow?", [])
+        assert choice == "no"
+
+
+class TestRichDisplaySessionList:
+    def test_empty_returns_none(self):
+        d, _, _ = _rich()
+        assert d.show_session_list([]) is None
+
+    def test_quit_returns_none(self):
+        d, _, _ = _rich()
+        s = _make_session_meta()
+        with patch(_PATCH, return_value="q"):
+            result = d.show_session_list([s])
+        assert result is None
+
+    def test_pick_by_index(self):
+        d, _, _ = _rich()
+        s = _make_session_meta()
+        with patch(_PATCH, return_value="0"):
+            result = d.show_session_list([s])
+        assert result is s
+
+    def test_eof_returns_none(self):
+        d, _, _ = _rich()
+        s = _make_session_meta()
+        with patch(_PATCH, side_effect=EOFError):
+            result = d.show_session_list([s])
+        assert result is None

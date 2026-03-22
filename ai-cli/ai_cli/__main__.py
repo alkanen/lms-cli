@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue the most recent session. Starts a new session if none exists.",
     )
+    parser.add_argument(
+        "--display",
+        choices=["plain", "rich"],
+        default=None,
+        metavar="{plain,rich}",
+        help=(
+            "Display backend. Default: from config (which itself defaults to 'rich'). "
+            "When provided, overrides 'display_backend' in config."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -150,13 +160,13 @@ def main() -> None:
         return
 
     if args.resume is _RESUME_PICK:
-        _cmd_repl(start, global_dir, resume_list=True)
+        _cmd_repl(start, global_dir, resume_list=True, display=args.display)
     elif args.resume is not None:
-        _cmd_repl(start, global_dir, resume_id=str(args.resume))
+        _cmd_repl(start, global_dir, resume_id=str(args.resume), display=args.display)
     elif args.continue_:
-        _cmd_repl(start, global_dir, continue_=True)
+        _cmd_repl(start, global_dir, continue_=True, display=args.display)
     else:
-        _cmd_repl(start, global_dir)
+        _cmd_repl(start, global_dir, display=args.display)
 
 
 def _cmd_repl(
@@ -166,6 +176,7 @@ def _cmd_repl(
     resume_id: str | None = None,
     resume_list: bool = False,
     continue_: bool = False,
+    display: str | None = None,
 ) -> None:
     """Bootstrap all core objects and start the interactive REPL."""
     root = Workspace.find_root(start)
@@ -177,8 +188,11 @@ def _cmd_repl(
         )
         sys.exit(1)
 
+    cli_overrides: dict = {}
+    if display is not None:
+        cli_overrides["display_backend"] = display
     try:
-        config = ConfigManager(root, {})
+        config = ConfigManager(root, cli_overrides)
         workspace = Workspace(root, config)
         llm_client = create_llm_client(config)
     except (ConfigError, WorkspaceError, LLMError) as exc:
@@ -186,8 +200,8 @@ def _cmd_repl(
         sys.exit(1)
 
     sessions_dir = global_dir / "sessions"
-    display = create_display(config)
-    permission_manager = PermissionManager(prompt_fn=display.show_permission_prompt)
+    ui = create_display(config)
+    permission_manager = PermissionManager(prompt_fn=ui.show_permission_prompt)
     tool_registry = ToolRegistry(workspace, config, permission_manager)
     tool_registry.load()
 
@@ -195,7 +209,7 @@ def _cmd_repl(
         session_manager = SessionManager(workspace, llm_client, sessions_dir)
         session, resumed = _pick_session(
             session_manager,
-            display,
+            ui,
             root,
             resume_id=resume_id,
             resume_list=resume_list,
@@ -206,9 +220,9 @@ def _cmd_repl(
         sys.exit(1)
 
     if resumed:
-        display.show_status(f"Resuming session {session.session_id}.")
+        ui.show_status(f"Resuming session {session.session_id}.")
 
-    repl = REPL(session, tool_registry, llm_client, display, workspace)
+    repl = REPL(session, tool_registry, llm_client, ui, workspace)
     repl.run()
 
 

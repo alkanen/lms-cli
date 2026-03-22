@@ -604,8 +604,8 @@ class Display(ABC):
 
 def create_display(config: ConfigManager, *, verbose: bool = False) -> Display:
     """
-    Factory: reads display_backend and display_markdown from config.
-    'plain' → PlainDisplay. Unknown/unimplemented backends warn and fall back to PlainDisplay.
+    Factory: reads display_backend (default 'rich') and display_markdown from config.
+    'plain' → PlainDisplay, 'rich' → RichDisplay. Unknown backends warn and fall back to PlainDisplay.
     """
 ```
 
