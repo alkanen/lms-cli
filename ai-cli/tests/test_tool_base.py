@@ -155,6 +155,26 @@ class TestRequestPermission:
 # ---------------------------------------------------------------------------
 
 
+class TestFormatDisplay:
+    def test_returns_none_by_default(self):
+        tool, _, _ = make_tool()
+        result = tool.format_display(
+            args={"message": "hi"}, result={"status": "success"}
+        )
+        assert result is None
+
+    def test_can_be_overridden_to_return_string(self):
+        class FancyTool(EchoTool):
+            def format_display(self, *, args, result):
+                return f"echo: {args.get('message', '')}"
+
+        workspace, pm = MagicMock(), MagicMock()
+        pm.request.return_value = (True, "")
+        tool = FancyTool(workspace, pm, False, "fancy_echo", "Fancy echo.")
+        out = tool.format_display(args={"message": "hi"}, result={})
+        assert out == "echo: hi"
+
+
 class TestResultHelpers:
     def test_ok_empty_data(self):
         result = Tool._ok()

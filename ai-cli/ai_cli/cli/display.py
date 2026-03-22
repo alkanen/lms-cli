@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pydoc
 import sys
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
@@ -72,9 +73,32 @@ class Display(ABC):
     def stream_text(self, delta: str) -> None:
         """Called for each text chunk as it arrives from the LLM."""
 
+    def stream_reasoning(self, delta: str) -> None:  # noqa: B027
+        """
+        Called for each reasoning/thinking chunk as it arrives from the LLM.
+
+        Reasoning content comes from ``reasoning_content`` delta fields (o1/o3)
+        or ``<think>…</think>`` tags when ``extract_think_tags`` is enabled.
+
+        The default implementation is a no-op.  Subclasses may override to
+        display reasoning content (e.g. in verbose mode or as a dim preview).
+        """
+
     @abstractmethod
     def end_assistant_turn(self) -> None:
         """Called once after the final chunk.  Flush/finalise any buffered output."""
+
+    def update_usage(self, usage: dict, context_window: int) -> None:  # noqa: B027
+        """
+        Called once per LLM turn with the token usage returned in the ``done``
+        chunk.
+
+        *usage* has keys ``prompt_tokens``, ``completion_tokens``,
+        ``total_tokens``.  *context_window* is the model's total context size.
+
+        The default implementation is a no-op.  Display backends that show a
+        status bar (e.g. RichDisplay) override this to update the token counter.
+        """
 
     # ------------------------------------------------------------------
     # Tool activity
@@ -90,12 +114,15 @@ class Display(ABC):
         """
 
     @abstractmethod
-    def show_tool_result(self, name: str, result: dict) -> None:
+    def show_tool_result(
+        self, name: str, result: dict, display_str: str | None = None
+    ) -> None:
         """
         Show the outcome of a tool call.
 
         Summary mode: silent (the LLM incorporates the result in its reply).
-        Verbose mode: full pretty-printed result dict.
+        Verbose mode: *display_str* if provided (may contain ANSI codes),
+        otherwise the full pretty-printed *result* dict.
         """
 
     # ------------------------------------------------------------------
@@ -146,6 +173,16 @@ class Display(ABC):
 
         *tool_info* is a dict as returned by
         :meth:`~ai_cli.core.tool_registry.ToolRegistry.tool_info`.
+        """
+
+    @abstractmethod
+    def show_history(self, messages: list[dict]) -> None:
+        """
+        Render the full conversation history in a scrollable view.
+
+        *messages* is the list returned by ``Session.get_messages()``.
+        Each entry is a dict with at minimum ``role`` and ``content`` keys;
+        ``content`` may be a plain string or a list of content blocks.
         """
 
     # ------------------------------------------------------------------
@@ -204,17 +241,40 @@ class PlainDisplay(Display):
     has no visual effect here — output is always raw text.
     """
 
+    def __init__(self, *, verbose: bool = False, markdown_enabled: bool = True) -> None:
+        super().__init__(verbose=verbose, markdown_enabled=markdown_enabled)
+        self._reasoning_started = False
+
     # ------------------------------------------------------------------
     # Streaming assistant output
     # ------------------------------------------------------------------
 
     def begin_assistant_turn(self) -> None:
-        pass  # nothing to set up for plain text
+        self._reasoning_started = False  # reset per-turn reasoning prefix state
 
     def stream_text(self, delta: str) -> None:
+        if self._verbose and self._reasoning_started:
+            # Reasoning was streamed without a trailing newline; end that line
+            # then print the closing marker on its own line before any text.
+            print()
+            print("[/thinking]")
+            self._reasoning_started = False
+        print(delta, end="", flush=True)
+
+    def stream_reasoning(self, delta: str) -> None:
+        if not self._verbose:
+            return
+        if not self._reasoning_started:
+            print("[thinking] ", end="", flush=True)
+            self._reasoning_started = True
         print(delta, end="", flush=True)
 
     def end_assistant_turn(self) -> None:
+        if self._verbose and self._reasoning_started:
+            # Reasoning was the only output — close the block before the turn ends.
+            self._reasoning_started = False
+            print()
+            print("[/thinking]")
         print()  # move to a fresh line after the response
 
     # ------------------------------------------------------------------
@@ -229,10 +289,15 @@ class PlainDisplay(Display):
             summary = ", ".join(f"{k}={v!r}" for k, v in args.items())
             print(f"▶ {name}({summary})")
 
-    def show_tool_result(self, name: str, result: dict) -> None:
+    def show_tool_result(
+        self, name: str, result: dict, display_str: str | None = None
+    ) -> None:
         if self._verbose:
             print(f"[result:{name}]")
-            print(json.dumps(result, indent=2))
+            if display_str is not None:
+                print(display_str)
+            else:
+                print(json.dumps(result, indent=2))
         # silent in summary mode
 
     # ------------------------------------------------------------------
@@ -313,6 +378,25 @@ class PlainDisplay(Display):
                 ptype = pdef.get("type", "") if isinstance(pdef, dict) else ""
                 pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
                 print(f"    {pname}: {ptype}{req} — {pdesc}")
+
+    def show_history(self, messages: list[dict]) -> None:
+        lines: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if isinstance(text, str):
+                            text_parts.append(text)
+                content = " ".join(text_parts)
+            if not isinstance(content, str):
+                content = ""
+            lines.append(f"[{role}] {content}")
+            lines.append("")
+        pydoc.pager("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Interactive prompts

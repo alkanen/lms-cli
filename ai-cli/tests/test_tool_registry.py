@@ -396,7 +396,6 @@ class TestArgumentValidation:
         assert result["data"]["ratio"] == 3
 
 
-
 # ---------------------------------------------------------------------------
 # Bounds validation
 # ---------------------------------------------------------------------------
@@ -483,15 +482,18 @@ class TestBoundsValidation:
 
     def test_inverted_bounds_skipped_with_warning(self, tmp_path, caplog):
         import logging
+
         from ai_cli.tools.base import ToolArgument
 
         # Bypass __init__ validation by mutating after construction.
-        arg = ToolArgument(name="x", description="x", argument_type="integer",
-                           minimum=0, maximum=10)
+        arg = ToolArgument(
+            name="x", description="x", argument_type="integer", minimum=0, maximum=10
+        )
         arg.minimum = 99
         arg.maximum = 1  # now inverted
 
         from ai_cli.core.tool_registry import _check_bounds
+
         with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
             result = _check_bounds(5, arg)
         assert result is None  # skipped, not an error
@@ -499,11 +501,13 @@ class TestBoundsValidation:
 
     def test_non_numeric_bound_skipped_with_warning(self, tmp_path, caplog):
         import logging
-        from ai_cli.tools.base import ToolArgument
-        from ai_cli.core.tool_registry import _check_bounds
 
-        arg = ToolArgument(name="x", description="x", argument_type="integer",
-                           minimum=0, maximum=10)
+        from ai_cli.core.tool_registry import _check_bounds
+        from ai_cli.tools.base import ToolArgument
+
+        arg = ToolArgument(
+            name="x", description="x", argument_type="integer", minimum=0, maximum=10
+        )
         arg.minimum = "bad"  # type: ignore[assignment]
 
         with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
@@ -520,71 +524,96 @@ class TestBoundsValidation:
 class TestToolArgumentBoundsValidation:
     def test_valid_integer_bounds_accepted(self):
         from ai_cli.tools.base import ToolArgument
-        arg = ToolArgument(name="n", description="n", argument_type="integer",
-                           minimum=0, maximum=100)
+
+        arg = ToolArgument(
+            name="n", description="n", argument_type="integer", minimum=0, maximum=100
+        )
         assert arg.minimum == 0
         assert arg.maximum == 100
 
     def test_valid_number_bounds_accepted(self):
         from ai_cli.tools.base import ToolArgument
-        arg = ToolArgument(name="r", description="r", argument_type="number",
-                           minimum=0.0, maximum=1.0)
+
+        arg = ToolArgument(
+            name="r", description="r", argument_type="number", minimum=0.0, maximum=1.0
+        )
         assert arg.minimum == 0.0
         assert arg.maximum == 1.0
 
     def test_minimum_only_accepted(self):
         from ai_cli.tools.base import ToolArgument
-        arg = ToolArgument(name="n", description="n", argument_type="integer",
-                           minimum=1)
+
+        arg = ToolArgument(
+            name="n", description="n", argument_type="integer", minimum=1
+        )
         assert arg.minimum == 1
         assert arg.maximum is None
 
     def test_maximum_only_accepted(self):
         from ai_cli.tools.base import ToolArgument
-        arg = ToolArgument(name="n", description="n", argument_type="integer",
-                           maximum=10)
+
+        arg = ToolArgument(
+            name="n", description="n", argument_type="integer", maximum=10
+        )
         assert arg.minimum is None
         assert arg.maximum == 10
 
     def test_bounds_on_string_type_raises(self):
         import pytest
+
         from ai_cli.tools.base import ToolArgument
+
         with pytest.raises(ValueError, match="integer.*number"):
-            ToolArgument(name="s", description="s", argument_type="string",
-                         minimum=0)
+            ToolArgument(name="s", description="s", argument_type="string", minimum=0)
 
     def test_bounds_on_boolean_type_raises(self):
         import pytest
+
         from ai_cli.tools.base import ToolArgument
+
         with pytest.raises(ValueError, match="integer.*number"):
-            ToolArgument(name="b", description="b", argument_type="boolean",
-                         maximum=1)
+            ToolArgument(name="b", description="b", argument_type="boolean", maximum=1)
 
     def test_non_numeric_minimum_raises(self):
         import pytest
+
         from ai_cli.tools.base import ToolArgument
+
         with pytest.raises(ValueError, match="numeric"):
-            ToolArgument(name="n", description="n", argument_type="integer",
-                         minimum="zero")  # type: ignore[arg-type]
+            ToolArgument(
+                name="n", description="n", argument_type="integer", minimum="zero"
+            )  # type: ignore[arg-type]
 
     def test_bool_minimum_raises(self):
         import pytest
+
         from ai_cli.tools.base import ToolArgument
+
         with pytest.raises(ValueError, match="numeric"):
-            ToolArgument(name="n", description="n", argument_type="integer",
-                         minimum=True)  # type: ignore[arg-type]
+            ToolArgument(
+                name="n", description="n", argument_type="integer", minimum=True
+            )  # type: ignore[arg-type]
 
     def test_inverted_bounds_raises(self):
         import pytest
+
         from ai_cli.tools.base import ToolArgument
+
         with pytest.raises(ValueError, match="minimum.*maximum|<="):
-            ToolArgument(name="n", description="n", argument_type="integer",
-                         minimum=10, maximum=5)
+            ToolArgument(
+                name="n",
+                description="n",
+                argument_type="integer",
+                minimum=10,
+                maximum=5,
+            )
 
     def test_equal_bounds_accepted(self):
         from ai_cli.tools.base import ToolArgument
-        arg = ToolArgument(name="n", description="n", argument_type="integer",
-                           minimum=5, maximum=5)
+
+        arg = ToolArgument(
+            name="n", description="n", argument_type="integer", minimum=5, maximum=5
+        )
         assert arg.minimum == 5
         assert arg.maximum == 5
 
@@ -597,13 +626,18 @@ class TestToolArgumentBoundsValidation:
             def definition(self) -> ToolSchema:
                 # Will raise ValueError in ToolArgument.__init__
                 from ai_cli.tools.base import ToolArgument
+
                 return ToolSchema(
                     name=self.name,
                     description=self.description,
                     arguments=[
-                        ToolArgument(name="x", description="x",
-                                     argument_type="integer",
-                                     minimum=100, maximum=1),
+                        ToolArgument(
+                            name="x",
+                            description="x",
+                            argument_type="integer",
+                            minimum=100,
+                            maximum=1,
+                        ),
                     ],
                 )
 

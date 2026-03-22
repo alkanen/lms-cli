@@ -7,7 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai_cli.core.llm_client import LLMClient, LLMError, OpenAIClient, create_llm_client
+from ai_cli.core.llm_client import (
+    LLMClient,
+    LLMError,
+    OpenAIClient,
+    _ThinkTagParser,
+    create_llm_client,
+)
 
 # ---------------------------------------------------------------------------
 # Stub exceptions — used to patch ai_cli.core.llm_client.* so tests don't
@@ -53,6 +59,7 @@ def _make_chunk(
     choice.finish_reason = finish_reason
     choice.delta.content = content
     choice.delta.tool_calls = tool_calls
+    choice.delta.reasoning_content = None  # explicit None avoids MagicMock truthy trap
     chunk.choices = [choice]
     return chunk
 
@@ -115,6 +122,34 @@ def _make_tc_full(call_id: str, name: str, arguments: str) -> MagicMock:
     tc.function.name = name
     tc.function.arguments = arguments
     return tc
+
+
+def _make_chunk_with_reasoning(
+    reasoning: str | None = None,
+    content: str | None = None,
+    finish_reason: str | None = None,
+    usage: Any = None,
+) -> MagicMock:
+    """Build a fake streaming chunk with an explicit reasoning_content field."""
+    chunk = _make_chunk(content=content, finish_reason=finish_reason, usage=usage)
+    if chunk.choices:
+        chunk.choices[0].delta.reasoning_content = reasoning
+    return chunk
+
+
+def _make_client_with_think_tags(chunks: list, model: str = "gpt-4o") -> OpenAIClient:
+    """Return an OpenAIClient with extract_think_tags=True."""
+    config = {
+        "model": model,
+        "api_key": "test-key",
+        "context_window": 128000,
+        "max_response_tokens": 4096,
+        "extract_think_tags": True,
+    }
+    with patch("ai_cli.core.llm_client.OpenAI"):
+        client = OpenAIClient(config)
+    client._client.chat.completions.create.return_value = iter(chunks)
+    return client
 
 
 def _make_client_nonstream(response: Any, model: str = "gpt-4o") -> OpenAIClient:
@@ -591,3 +626,198 @@ class TestCreateLLMClient:
         config_manager.get_backend.return_value = "anthropic"
         with pytest.raises(LLMError, match="Unknown backend"):
             create_llm_client(config_manager)
+
+
+# ---------------------------------------------------------------------------
+# _ThinkTagParser
+# ---------------------------------------------------------------------------
+
+
+class TestThinkTagParser:
+    def test_plain_text_no_tags(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("hello world") + p.flush()
+        assert chunks == [{"type": "text", "delta": "hello world"}]
+
+    def test_basic_think_tag(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("<think>reasoning</think>answer") + p.flush()
+        types = {c["type"] for c in chunks}
+        assert "reasoning" in types
+        assert "text" in types
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        assert "reasoning" in reasoning
+        assert "answer" in text
+
+    def test_tag_split_across_chunks(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("hello <th")
+        chunks += p.feed("ink>inner</think>done")
+        chunks += p.flush()
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        assert "hello" in text
+        assert "done" in text
+        assert "inner" in reasoning
+
+    def test_close_tag_split_across_chunks(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("<think>thinking</")
+        chunks += p.feed("think>after")
+        chunks += p.flush()
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        assert "thinking" in reasoning
+        assert "after" in text
+
+    def test_only_reasoning_content(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("<think>all thinking</think>") + p.flush()
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        assert "all thinking" in reasoning
+        assert not any(c["type"] == "text" for c in chunks)
+
+    def test_empty_input(self):
+        p = _ThinkTagParser()
+        assert p.feed("") == []
+        assert p.flush() == []
+
+    def test_flush_emits_buffered_text(self):
+        p = _ThinkTagParser()
+        # feed() emits the safe prefix ("hello ") and buffers the "<"
+        chunks = p.feed("hello <")
+        # flush() emits whatever was held back (the "<")
+        chunks += p.flush()
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        assert "hello" in text
+        assert "<" in text
+
+    def test_flush_emits_buffered_reasoning_when_inside(self):
+        p = _ThinkTagParser()
+        # feed() emits "partial reasoning" but buffers the trailing "</" prefix
+        chunks = p.feed("<think>partial reasoning</")  # no closing tag
+        # flush() emits whatever was held back (the "</")
+        chunks += p.flush()
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        assert "partial reasoning" in reasoning
+
+    def test_no_false_positive_on_similar_text(self):
+        # "<thinking>" is not the same as "<think>"
+        p = _ThinkTagParser()
+        chunks = p.feed("<thinking>not reasoning</thinking>") + p.flush()
+        # All content should be text since <thinking> != <think>
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        assert "thinking" in text
+        assert not any(c["type"] == "reasoning" for c in chunks)
+
+    def test_multiple_think_blocks(self):
+        p = _ThinkTagParser()
+        chunks = p.feed("<think>r1</think>t1<think>r2</think>t2") + p.flush()
+        reasoning = "".join(c["delta"] for c in chunks if c["type"] == "reasoning")
+        text = "".join(c["delta"] for c in chunks if c["type"] == "text")
+        assert "r1" in reasoning
+        assert "r2" in reasoning
+        assert "t1" in text
+        assert "t2" in text
+
+
+# ---------------------------------------------------------------------------
+# OpenAIClient — reasoning_content field and extract_think_tags
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIClientReasoning:
+    def test_reasoning_content_field_emits_reasoning_chunk(self):
+        chunks = [
+            _make_chunk_with_reasoning(reasoning="thinking step"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client(chunks)
+        results = list(client.send([], []))
+        reasoning_chunks = [c for c in results if c["type"] == "reasoning"]
+        assert len(reasoning_chunks) == 1
+        assert reasoning_chunks[0]["delta"] == "thinking step"
+
+    def test_reasoning_content_none_emits_no_reasoning_chunk(self):
+        chunks = [
+            _make_chunk_with_reasoning(reasoning=None, content="text"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client(chunks)
+        results = list(client.send([], []))
+        assert not any(c["type"] == "reasoning" for c in results)
+
+    def test_reasoning_content_and_text_both_emitted(self):
+        chunks = [
+            _make_chunk_with_reasoning(reasoning="inner thought", content="visible"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client(chunks)
+        results = list(client.send([], []))
+        assert any(
+            c["type"] == "reasoning" and "inner thought" in c["delta"] for c in results
+        )
+        assert any(c["type"] == "text" and "visible" in c["delta"] for c in results)
+
+    def test_reasoning_content_emitted_before_text_in_same_delta(self):
+        chunks = [
+            _make_chunk_with_reasoning(reasoning="think", content="answer"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client(chunks)
+        results = list(client.send([], []))
+        types = [c["type"] for c in results if c["type"] in ("text", "reasoning")]
+        assert types.index("reasoning") < types.index("text")
+
+    def test_reasoning_content_emitted_before_text_nonstreaming(self):
+        response = _make_response(content="answer", usage=_make_usage())
+        response.choices[0].message.reasoning_content = "think"
+        client = _make_client_nonstream(response)
+        results = list(client.send([], [], stream=False))
+        types = [c["type"] for c in results if c["type"] in ("text", "reasoning")]
+        assert types.index("reasoning") < types.index("text")
+
+    def test_extract_think_tags_off_by_default(self):
+        chunks = [
+            _make_chunk(content="<think>inner</think>answer"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client(chunks)
+        results = list(client.send([], []))
+        assert not any(c["type"] == "reasoning" for c in results)
+        text = "".join(c["delta"] for c in results if c["type"] == "text")
+        assert "<think>" in text  # raw tags pass through
+
+    def test_extract_think_tags_splits_reasoning_from_text(self):
+        chunks = [
+            _make_chunk(content="<think>inner</think>answer"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client_with_think_tags(chunks)
+        results = list(client.send([], []))
+        reasoning_chunks = [c for c in results if c["type"] == "reasoning"]
+        text_chunks = [c for c in results if c["type"] == "text"]
+        assert any("inner" in c["delta"] for c in reasoning_chunks)
+        assert any("answer" in c["delta"] for c in text_chunks)
+
+    def test_extract_think_tags_across_streaming_chunks(self):
+        chunks = [
+            _make_chunk(content="before <th"),
+            _make_chunk(content="ink>reason</think>after"),
+            _make_chunk(finish_reason="stop"),
+            _make_chunk(usage=_make_usage()),
+        ]
+        client = _make_client_with_think_tags(chunks)
+        results = list(client.send([], []))
+        text = "".join(c["delta"] for c in results if c["type"] == "text")
+        reasoning = "".join(c["delta"] for c in results if c["type"] == "reasoning")
+        assert "before" in text
+        assert "after" in text
+        assert "reason" in reasoning

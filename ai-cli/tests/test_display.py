@@ -10,6 +10,8 @@ import pytest
 from ai_cli.cli.display import _UNIVERSAL_OPTIONS, Display, PlainDisplay, create_display
 from ai_cli.core.session_manager import SessionMeta
 
+_PAGER_PATCH = "ai_cli.cli.display.pydoc.pager"
+
 _PATCH = "ai_cli.cli.display.pt_prompt"
 
 
@@ -508,6 +510,206 @@ class TestPlainDisplayToolInfo:
         out = capsys.readouterr().out
         assert "required" in out
         assert "not required" not in out
+
+
+# ---------------------------------------------------------------------------
+# PlainDisplay — stream_reasoning
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayReasoning:
+    def test_reasoning_silent_in_summary_mode(self, capsys):
+        d = _plain(verbose=False)
+        d.begin_assistant_turn()
+        d.stream_reasoning("thinking...")
+        assert capsys.readouterr().out == ""
+
+    def test_reasoning_shown_in_verbose_mode(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("step 1")
+        out = capsys.readouterr().out
+        assert "step 1" in out
+
+    def test_reasoning_prefix_on_first_call(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("step 1")
+        out = capsys.readouterr().out
+        assert "[thinking]" in out
+
+    def test_reasoning_no_prefix_on_second_call(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("step 1")
+        capsys.readouterr()  # clear
+        d.stream_reasoning("step 2")
+        out = capsys.readouterr().out
+        assert "[thinking]" not in out
+        assert "step 2" in out
+
+    def test_reasoning_flag_reset_between_turns(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("turn 1 reasoning")
+        capsys.readouterr()
+        d.begin_assistant_turn()  # new turn resets the flag
+        d.stream_reasoning("turn 2 reasoning")
+        out = capsys.readouterr().out
+        assert "[thinking]" in out  # prefix shown again for the new turn
+
+    def test_reasoning_closed_before_text(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("inner step")
+        d.stream_text("answer")
+        out = capsys.readouterr().out
+        assert "[/thinking]" in out
+        assert out.index("[/thinking]") < out.index("answer")
+
+    def test_reasoning_closed_at_end_of_turn_when_no_text(self, capsys):
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("inner step")
+        d.end_assistant_turn()
+        out = capsys.readouterr().out
+        assert "[/thinking]" in out
+
+    def test_reasoning_not_closed_twice(self, capsys):
+        # If stream_text closes reasoning, end_assistant_turn must not close again.
+        d = _plain(verbose=True)
+        d.begin_assistant_turn()
+        d.stream_reasoning("r")
+        d.stream_text("t")
+        d.end_assistant_turn()
+        out = capsys.readouterr().out
+        assert out.count("[/thinking]") == 1
+
+    def test_reasoning_close_not_shown_in_summary_mode(self, capsys):
+        d = _plain(verbose=False)
+        d.begin_assistant_turn()
+        d.stream_reasoning("inner")
+        d.stream_text("answer")
+        d.end_assistant_turn()
+        out = capsys.readouterr().out
+        assert "[/thinking]" not in out
+        assert "answer" in out
+
+
+# ---------------------------------------------------------------------------
+# PlainDisplay — update_usage
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayUpdateUsage:
+    def test_update_usage_does_not_raise(self):
+        d = _plain()
+        d.update_usage({"prompt_tokens": 100, "completion_tokens": 50}, 128000)
+
+
+# ---------------------------------------------------------------------------
+# PlainDisplay — show_history
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayHistory:
+    def test_show_history_calls_pager(self):
+        d = _plain()
+        messages = [
+            {"role": "user", "content": "Hello there"},
+            {"role": "assistant", "content": "Hi!"},
+        ]
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history(messages)
+        mock_pager.assert_called_once()
+
+    def test_show_history_includes_role_and_content(self):
+        d = _plain()
+        messages = [{"role": "user", "content": "Hello"}]
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history(messages)
+        text = mock_pager.call_args[0][0]
+        assert "user" in text
+        assert "Hello" in text
+
+    def test_show_history_handles_block_content(self):
+        d = _plain()
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "block text here"}],
+            }
+        ]
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history(messages)
+        text = mock_pager.call_args[0][0]
+        assert "block text here" in text
+
+    def test_show_history_non_string_text_block_skipped(self):
+        # A block with text=None or text=<non-str> must not raise TypeError in join()
+        d = _plain()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": None},
+                    {"type": "text", "text": 42},
+                    {"type": "text", "text": "valid"},
+                ],
+            }
+        ]
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history(messages)
+        text = mock_pager.call_args[0][0]
+        assert "valid" in text
+
+    def test_show_history_none_content_does_not_render_literally(self):
+        # assistant tool-call messages have content=None; must not appear as "None"
+        d = _plain()
+        messages = [{"role": "assistant", "content": None}]
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history(messages)
+        text = mock_pager.call_args[0][0]
+        assert "None" not in text
+
+    def test_show_history_empty_list(self):
+        d = _plain()
+        with patch(_PAGER_PATCH) as mock_pager:
+            d.show_history([])
+        mock_pager.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# PlainDisplay — show_tool_result with display_str
+# ---------------------------------------------------------------------------
+
+
+class TestPlainDisplayToolResultDisplayStr:
+    def test_display_str_shown_in_verbose_mode(self, capsys):
+        d = _plain(verbose=True)
+        d.show_tool_result("read_file", {"status": "success"}, display_str="custom")
+        out = capsys.readouterr().out
+        assert "custom" in out
+
+    def test_display_str_overrides_json_in_verbose_mode(self, capsys):
+        d = _plain(verbose=True)
+        d.show_tool_result(
+            "read_file", {"status": "success"}, display_str="custom display"
+        )
+        out = capsys.readouterr().out
+        assert "custom display" in out
+        assert '{"status"' not in out  # JSON not shown when display_str provided
+
+    def test_display_str_silent_in_summary_mode(self, capsys):
+        d = _plain(verbose=False)
+        d.show_tool_result("read_file", {"status": "success"}, display_str="custom")
+        assert capsys.readouterr().out == ""
+
+    def test_none_display_str_falls_back_to_json(self, capsys):
+        d = _plain(verbose=True)
+        d.show_tool_result("read_file", {"status": "success"}, display_str=None)
+        out = capsys.readouterr().out
+        assert "success" in out
 
 
 # ---------------------------------------------------------------------------

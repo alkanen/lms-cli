@@ -975,3 +975,177 @@ class TestSessionSubcommand:
         repl._handle_slash_command("session frobnicate")
         display.show_error.assert_called_once()
         assert "frobnicate" in display.show_error.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# /history command
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryCommand:
+    def test_history_calls_show_history(self):
+        session = MagicMock()
+        messages = [{"role": "user", "content": "hi"}]
+        session.get_messages.return_value = messages
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("history")
+        display.show_history.assert_called_once_with(messages)
+
+    def test_history_session_error_shows_error(self):
+        session = MagicMock()
+        session.get_messages.side_effect = SessionError("disk full")
+        display = MagicMock()
+        repl = _make_repl(session=session, display=display)
+        repl._handle_slash_command("history")
+        display.show_error.assert_called_once()
+        display.show_history.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# REPL reasoning chunk routing and update_usage
+# ---------------------------------------------------------------------------
+
+
+class TestREPLReasoningAndUsage:
+    def test_reasoning_chunk_routed_to_stream_reasoning(self):
+        session = MagicMock()
+        session.should_compact.return_value = False
+        display = MagicMock()
+        llm = _make_llm(
+            [
+                {"type": "reasoning", "delta": "thinking..."},
+                {"type": "text", "delta": "answer"},
+                {"type": "done", "stop_reason": "stop", "usage": {}},
+            ]
+        )
+        repl = _make_repl(session=session, llm=llm, display=display)
+        repl._send_to_llm("hello")
+        display.stream_reasoning.assert_called_once_with("thinking...")
+
+    def test_text_chunk_not_routed_to_stream_reasoning(self):
+        session = MagicMock()
+        session.should_compact.return_value = False
+        display = MagicMock()
+        llm = _make_llm(
+            [
+                {"type": "text", "delta": "answer"},
+                {"type": "done", "stop_reason": "stop", "usage": {}},
+            ]
+        )
+        repl = _make_repl(session=session, llm=llm, display=display)
+        repl._send_to_llm("hello")
+        display.stream_reasoning.assert_not_called()
+
+    def test_update_usage_called_on_done_chunk(self):
+        session = MagicMock()
+        session.should_compact.return_value = False
+        display = MagicMock()
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        llm = _make_llm(
+            [
+                {"type": "text", "delta": "Hi"},
+                {"type": "done", "stop_reason": "stop", "usage": usage},
+            ]
+        )
+        repl = _make_repl(session=session, llm=llm, display=display)
+        repl._send_to_llm("hello")
+        display.update_usage.assert_called_once()
+        call_usage = display.update_usage.call_args[0][0]
+        assert call_usage == usage
+
+
+# ---------------------------------------------------------------------------
+# REPL format_display plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestREPLFormatDisplay:
+    def _make_tool_call_round(self, display_str):
+        """LLM calls read_file once, tool returns success; tool.format_display returns display_str."""
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+        tool_obj = MagicMock()
+        tool_obj.format_display.return_value = display_str
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = tool_obj
+
+        llm = MagicMock()
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "1",
+                        "arguments": {"path": "foo.py"},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter([{"type": "done", "stop_reason": "stop", "usage": {}}]),
+        ]
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+        return repl, display, tool_obj
+
+    def test_format_display_called_with_args_and_result(self):
+        repl, display, tool_obj = self._make_tool_call_round("formatted")
+        repl._send_to_llm("read foo.py")
+        tool_obj.format_display.assert_called_once_with(
+            args={"path": "foo.py"}, result={"status": "success", "data": {}}
+        )
+
+    def test_format_display_result_passed_to_show_tool_result(self):
+        repl, display, _ = self._make_tool_call_round("my custom string")
+        repl._send_to_llm("read foo.py")
+        display.show_tool_result.assert_called_once_with(
+            "read_file", {"status": "success", "data": {}}, "my custom string"
+        )
+
+    def test_format_display_none_passed_when_returns_none(self):
+        repl, display, _ = self._make_tool_call_round(None)
+        repl._send_to_llm("read foo.py")
+        display.show_tool_result.assert_called_once_with(
+            "read_file", {"status": "success", "data": {}}, None
+        )
+
+    def test_format_display_exception_does_not_propagate(self):
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+        tool_obj = MagicMock()
+        tool_obj.format_display.side_effect = RuntimeError("crash")
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = tool_obj
+
+        llm = MagicMock()
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "1",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter([{"type": "done", "stop_reason": "stop", "usage": {}}]),
+        ]
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+        repl._send_to_llm("go")  # should not raise
+        display.show_tool_result.assert_called_once_with(
+            "read_file", {"status": "success", "data": {}}, None
+        )
