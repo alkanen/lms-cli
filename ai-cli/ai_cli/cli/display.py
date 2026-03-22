@@ -1,5 +1,5 @@
 """
-display.py — Abstract Display interface and PlainDisplay implementation.
+display.py — Abstract Display interface, PlainDisplay, and RichDisplay.
 
 All user-facing output and interactive prompts are routed through a Display
 instance.  The REPL holds one Display and calls its methods; it never writes
@@ -14,9 +14,20 @@ import logging
 import pydoc
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Generator
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import prompt as pt_prompt
+from rich.console import Console, ConsoleOptions, Group, RenderableType
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.rule import Rule
+from rich.segment import Segment
+from rich.style import Style
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
 
 if TYPE_CHECKING:
     from ai_cli.core.config_manager import ConfigManager
@@ -60,6 +71,16 @@ class Display(ABC):
     def toggle_markdown(self) -> None:
         """Switch between Markdown rendering and raw text output."""
         self._markdown_enabled = not self._markdown_enabled
+
+    def prompt_session_kwargs(self) -> dict:
+        """
+        Return extra kwargs to pass to the REPL's ``PromptSession`` constructor.
+
+        ``PlainDisplay`` returns an empty dict (no toolbar).  ``RichDisplay``
+        returns ``{"bottom_toolbar": …, "refresh_interval": 1}`` so the REPL's
+        ``PromptSession`` shows a live context/timer bar.
+        """
+        return {}
 
     # ------------------------------------------------------------------
     # Streaming assistant output
@@ -120,8 +141,11 @@ class Display(ABC):
         """
         Show the outcome of a tool call.
 
-        Summary mode: silent (the LLM incorporates the result in its reply).
-        Verbose mode: *display_str* if provided (may contain ANSI codes),
+        *display_str* is an optional ANSI-capable string returned by
+        ``tool.format_display(args, result)``.  Whether it is shown in summary
+        mode is left to each backend — backends may choose to always render it,
+        show it only in verbose mode, or remain silent.  The default contract
+        is: summary mode silent, verbose mode shows *display_str* (if provided)
         otherwise the full pretty-printed *result* dict.
         """
 
@@ -463,6 +487,434 @@ class PlainDisplay(Display):
 
 
 # ---------------------------------------------------------------------------
+# RichDisplay helpers
+# ---------------------------------------------------------------------------
+
+
+class _LeftBorderRenderable:
+    """
+    Wraps any Rich renderable with a coloured vertical bar on the left edge.
+
+    Produces output like::
+
+        │ first line
+        │ second line
+
+    without adding blank top/bottom borders (unlike Panel with a custom Box).
+    """
+
+    def __init__(self, renderable: RenderableType, style: str = "bold") -> None:
+        self._renderable = renderable
+        self._style = style
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> Generator[Segment, None, None]:
+        bar_style = Style.parse(self._style)
+        inner_opts = options.update(width=max(1, options.max_width - 2))
+        for line in console.render_lines(self._renderable, inner_opts):
+            yield Segment("│ ", bar_style)
+            yield from line
+            yield Segment("\n")
+
+
+# ---------------------------------------------------------------------------
+# RichDisplay
+# ---------------------------------------------------------------------------
+
+
+class RichDisplay(Display):
+    """
+    Rich-backed display using scrolling output + prompt_toolkit input.
+
+    Uses ``rich.live.Live(transient=True)`` while the LLM is streaming so
+    raw text updates appear in place.  At ``end_assistant_turn()`` the live
+    area is erased and the fully formatted turn is printed permanently.
+
+    A bottom toolbar (token counter + timers + last status) is wired into the
+    REPL's ``PromptSession`` via :meth:`prompt_session_kwargs`.
+    """
+
+    def __init__(self, *, verbose: bool = False, markdown_enabled: bool = True) -> None:
+        super().__init__(verbose=verbose, markdown_enabled=markdown_enabled)
+        self._console = Console(highlight=False, markup=False)
+        self._stderr_console = Console(highlight=False, markup=False, stderr=True)
+        # Streaming state
+        self._live: Live | None = None
+        self._text_acc: str = ""
+        self._reasoning_acc: str = ""
+        # Timing
+        self._turn_start_time: datetime | None = None
+        self._last_turn_duration: float | None = None
+        # Usage / toolbar
+        self._prompt_tokens: int = 0
+        self._context_window: int = 0
+        self._last_status: str = ""
+
+    # ------------------------------------------------------------------
+    # Bottom toolbar (injected into PromptSession)
+    # ------------------------------------------------------------------
+
+    def prompt_session_kwargs(self) -> dict:
+        return {"bottom_toolbar": self._build_toolbar, "refresh_interval": 1}
+
+    def _build_toolbar(self) -> str:
+        now = datetime.now()
+        parts: list[str] = []
+
+        if self._context_window > 0:
+            ratio = min(self._prompt_tokens / self._context_window, 1.0)
+            filled = int(ratio * 20)
+            bar = "█" * filled + "░" * (20 - filled)
+            pct = int(ratio * 100)
+            parts.append(f"[ctx: {bar} {pct}%]")
+
+        if self._turn_start_time is not None:
+            # Turn is active — show a live elapsed timer.
+            elapsed = (now - self._turn_start_time).total_seconds()
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            parts.append(f"⏱ {mins:02d}:{secs:02d}")
+        elif self._last_turn_duration is not None:
+            # Turn finished — show the fixed duration of the last completed turn.
+            mins = int(self._last_turn_duration // 60)
+            secs = int(self._last_turn_duration % 60)
+            parts.append(f"⏱ {mins:02d}:{secs:02d}")
+
+        if self._last_status:
+            parts.append(self._last_status)
+
+        return "  ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Streaming assistant output
+    # ------------------------------------------------------------------
+
+    def begin_assistant_turn(self) -> None:
+        self._text_acc = ""
+        self._reasoning_acc = ""
+        self._turn_start_time = datetime.now()
+        self._console.print(Rule("Assistant", style="bold cyan", align="left"))
+        if self._live is not None:
+            self._live.stop()
+        self._live = Live(transient=True, console=self._console, refresh_per_second=10)
+        self._live.start()
+
+    def stream_text(self, delta: str) -> None:
+        self._text_acc += delta
+        if self._live is not None:
+            self._live.update(self._build_live_renderable())
+
+    def stream_reasoning(self, delta: str) -> None:
+        self._reasoning_acc += delta
+        if self._live is not None:
+            self._live.update(self._build_live_renderable())
+
+    def _build_live_renderable(self) -> RenderableType:
+        parts: list[RenderableType] = []
+        if self._reasoning_acc:
+            preview = self._reasoning_acc[-200:]
+            parts.append(Text(f"⟨thinking…⟩ {preview}", style="dim italic"))
+        if self._text_acc:
+            parts.append(Text(self._text_acc))
+        if not parts:
+            return Text("")
+        return Group(*parts)
+
+    def end_assistant_turn(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        if self._turn_start_time is not None:
+            self._last_turn_duration = (
+                datetime.now() - self._turn_start_time
+            ).total_seconds()
+            self._turn_start_time = None
+
+        reasoning_text = self._reasoning_acc
+        response_text = self._text_acc
+
+        if self._verbose and reasoning_text:
+            self._console.print(Rule("Reasoning", style="dim", align="left"))
+            self._console.print(
+                _LeftBorderRenderable(
+                    Text(reasoning_text, style="dim italic"), style="dim"
+                )
+            )
+
+        if response_text:
+            if self._verbose and reasoning_text:
+                self._console.print(Rule("Response", style="dim cyan", align="left"))
+            content: RenderableType = (
+                Markdown(response_text)
+                if self._markdown_enabled
+                else Text(response_text)
+            )
+            self._console.print(_LeftBorderRenderable(content, style="bold cyan"))
+
+    def update_usage(self, usage: dict, context_window: int) -> None:
+        self._prompt_tokens = usage.get("prompt_tokens", 0)
+        self._context_window = context_window
+
+    # ------------------------------------------------------------------
+    # Tool activity
+    # ------------------------------------------------------------------
+
+    def show_tool_call(self, name: str, args: dict) -> None:
+        if self._verbose:
+            self._console.print(
+                Rule(f"Tool: {name}", style="bold yellow", align="left")
+            )
+            if args:
+                table = Table(show_header=False, box=None, padding=(0, 1))
+                table.add_column("key", style="bold yellow")
+                table.add_column("value")
+                for k, v in args.items():
+                    val_str = str(v)
+                    if len(val_str) > 80:
+                        val_str = val_str[:77] + "…"
+                    table.add_row(k, val_str)
+                self._console.print(_LeftBorderRenderable(table, style="bold yellow"))
+        else:
+            summary = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            self._console.print(f"▶ {name}({summary})")
+
+    def show_tool_result(
+        self, name: str, result: dict, display_str: str | None = None
+    ) -> None:
+        if self._verbose:
+            if display_str is not None:
+                self._console.print(
+                    _LeftBorderRenderable(
+                        Text.from_ansi(display_str), style="bold yellow"
+                    )
+                )
+            else:
+                json_str = json.dumps(result, indent=2, default=str)
+                self._console.print(
+                    _LeftBorderRenderable(
+                        Syntax(json_str, "json", theme="monokai"), style="bold yellow"
+                    )
+                )
+        # summary mode: silent
+
+    # ------------------------------------------------------------------
+    # Status and errors
+    # ------------------------------------------------------------------
+
+    def show_status(self, message: str) -> None:
+        self._last_status = message
+        self._console.print(f"  {message}", style="green")
+
+    def show_error(self, message: str) -> None:
+        self._last_status = f"✗ {message}"
+        self._stderr_console.print(f"  ✗ {message}", style="bold red")
+
+    # ------------------------------------------------------------------
+    # Slash-command output
+    # ------------------------------------------------------------------
+
+    def show_help(self, commands: list[tuple[str, str]]) -> None:
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("cmd", style="bold cyan")
+        table.add_column("desc")
+        for cmd, desc in commands:
+            table.add_row(cmd, desc)
+        self._console.print("\nAvailable commands:")
+        self._console.print(table)
+
+    def show_tool_list(self, tools: list[Tool]) -> None:
+        if not tools:
+            self._console.print("No tools currently enabled.")
+            return
+        table = Table(show_header=True)
+        table.add_column("Tool", style="bold")
+        table.add_column("Description")
+        for tool in tools:
+            table.add_row(tool.name, tool.description)
+        self._console.print("\nEnabled tools:")
+        self._console.print(table)
+
+    def show_session_info(self, session: Session) -> None:
+        meta = session.get_meta()
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("key", style="bold")
+        table.add_column("value")
+        table.add_row("Session", session.session_id)
+        if meta.get("name"):
+            table.add_row("Name", str(meta["name"]))
+        table.add_row("Started", str(meta.get("started_at", "unknown")))
+        table.add_row("Messages", str(meta.get("message_count", 0)))
+        self._console.print(table)
+
+    def show_tool_list_all(self, tools_info: list[dict]) -> None:
+        if not tools_info:
+            self._console.print("No tools registered.")
+            return
+        table = Table(show_header=True)
+        table.add_column("Name", style="bold")
+        table.add_column("Status")
+        table.add_column("Tier")
+        table.add_column("Description")
+        for info in tools_info:
+            if not info.get("allowed", True):
+                status = "disallowed"
+                status_style = "dim red"
+            elif info.get("enabled", False):
+                status = "enabled"
+                status_style = "green"
+            else:
+                status = "disabled"
+                status_style = "dim"
+            if info.get("permission_required", False):
+                status += ", perm"
+            desc = info.get("description", "")[:50]
+            table.add_row(
+                info["name"],
+                Text(status, style=status_style),
+                info.get("tier", ""),
+                desc,
+            )
+        self._console.print("\nAll tools:")
+        self._console.print(table)
+
+    def show_tool_info(self, tool_info: dict) -> None:
+        name = tool_info.get("name", "")
+        self._console.print(f"\nTool: {name}", style="bold")
+        if not tool_info.get("allowed", True):
+            status = "disallowed"
+        elif tool_info.get("enabled", False):
+            status = "enabled"
+        else:
+            status = "disabled"
+        perm = "required" if tool_info.get("permission_required") else "not required"
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("key", style="bold")
+        table.add_column("value")
+        table.add_row("Description", tool_info.get("description", ""))
+        table.add_row("Tier", tool_info.get("tier", "unknown"))
+        table.add_row("Status", status)
+        table.add_row("Permission", perm)
+        self._console.print(table)
+        params = tool_info.get("parameters", {})
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        required = params.get("required", []) if isinstance(params, dict) else []
+        if props:
+            self._console.print("  Parameters:", style="bold")
+            for pname, pdef in props.items():
+                req = " (required)" if pname in required else ""
+                ptype = pdef.get("type", "") if isinstance(pdef, dict) else ""
+                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
+                self._console.print(f"    {pname}: {ptype}{req} — {pdesc}")
+
+    def show_history(self, messages: list[dict]) -> None:
+        with self._console.pager(styles=True):
+            for msg in messages:
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if role == "user":
+                    rule_style = "bold green"
+                    border_style = "bold green"
+                elif role == "assistant":
+                    rule_style = "bold cyan"
+                    border_style = "bold cyan"
+                else:
+                    rule_style = "bold yellow"
+                    border_style = "bold yellow"
+                self._console.print(
+                    Rule(role.capitalize(), style=rule_style, align="left")
+                )
+                if isinstance(content, list):
+                    text_parts: list[str] = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if isinstance(text, str):
+                                text_parts.append(text)
+                    content = " ".join(text_parts)
+                if not isinstance(content, str):
+                    content = ""
+                if content:
+                    renderable: RenderableType
+                    if role == "assistant" and self._markdown_enabled:
+                        renderable = Markdown(content)
+                    else:
+                        renderable = Text(content)
+                    self._console.print(
+                        _LeftBorderRenderable(renderable, style=border_style)
+                    )
+
+    # ------------------------------------------------------------------
+    # Interactive prompts
+    # ------------------------------------------------------------------
+
+    def show_permission_prompt(
+        self,
+        question: str,
+        extra_options: list[str],
+    ) -> tuple[str, str]:
+        self._console.print(f"\n{question}", style="bold")
+        for key, _, label in _UNIVERSAL_OPTIONS:
+            self._console.print(f"  [{key}] {label}")
+        for i, opt in enumerate(extra_options):
+            self._console.print(f"  [{i}] {opt}")
+
+        while True:
+            try:
+                raw = pt_prompt("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return ("no", "")
+            for key, choice, _ in _UNIVERSAL_OPTIONS:
+                if raw in (key, choice):
+                    if choice == "custom":
+                        try:
+                            user_text = pt_prompt("Message: ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            return ("no", "")
+                        return ("custom", user_text)
+                    return (choice, "")
+            try:
+                idx = int(raw)
+                if 0 <= idx < len(extra_options):
+                    return (extra_options[idx], "")
+            except ValueError:
+                pass
+            self._console.print("Invalid choice, please try again.", style="dim red")
+
+    def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
+        if not sessions:
+            return None
+        table = Table(show_header=True)
+        table.add_column("#", style="bold")
+        table.add_column("Started")
+        table.add_column("Session ID")
+        table.add_column("Preview")
+        table.add_column("Msgs", justify="right")
+        for i, s in enumerate(sessions):
+            ts = s.started_at.strftime("%Y-%m-%d %H:%M UTC")
+            preview = s.first_user_message[:60] or "(no messages)"
+            table.add_row(str(i), ts, s.session_id, preview, str(s.message_count))
+        self._console.print("\nResumable sessions:")
+        self._console.print(table)
+        self._console.print("  [q] Start a new session")
+
+        while True:
+            try:
+                raw = pt_prompt("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if raw in ("q", ""):
+                return None
+            try:
+                idx = int(raw)
+                if 0 <= idx < len(sessions):
+                    return sessions[idx]
+            except ValueError:
+                pass
+            self._console.print("Invalid choice, please try again.", style="dim red")
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -471,21 +923,18 @@ def create_display(config: ConfigManager, *, verbose: bool = False) -> Display:
     """
     Instantiate and return the configured :class:`Display` backend.
 
-    Reads ``display_backend`` (default ``'plain'``) and ``display_markdown``
+    Reads ``display_backend`` (default ``'rich'``) and ``display_markdown``
     (default ``True``) from *config* via ``config.get()``.  An unknown backend
     name logs a warning and falls back to ``PlainDisplay``.
     """
-    backend: str = config.get("display_backend", "plain")
+    backend: str = config.get("display_backend", "rich")
     markdown_enabled: bool = config.get("display_markdown", True)
 
     if backend == "plain":
         return PlainDisplay(verbose=verbose, markdown_enabled=markdown_enabled)
 
     if backend == "rich":
-        logger.warning(
-            "RichDisplay is not yet implemented; falling back to PlainDisplay."
-        )
-        return PlainDisplay(verbose=verbose, markdown_enabled=markdown_enabled)
+        return RichDisplay(verbose=verbose, markdown_enabled=markdown_enabled)
 
     logger.warning("Unknown display_backend %r; falling back to PlainDisplay.", backend)
     return PlainDisplay(verbose=verbose, markdown_enabled=markdown_enabled)

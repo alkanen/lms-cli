@@ -543,7 +543,7 @@ styles are applied per element instead.
 ```python
 def create_display(config: ConfigManager, verbose: bool = False) -> Display:
     """
-    Read 'display_backend' from config (default 'plain') and return the
+    Read 'display_backend' from config (default 'rich') and return the
     appropriate Display implementation.
 
     Recognised values: 'plain', 'rich'.

@@ -120,7 +120,10 @@ class REPL:
         if _prompt_session is None:
             history_path = get_global_dir() / "history"
             history_path.parent.mkdir(parents=True, exist_ok=True)
-            _prompt_session = PromptSession(history=FileHistory(str(history_path)))
+            _prompt_session = PromptSession(
+                history=FileHistory(str(history_path)),
+                **self._display.prompt_session_kwargs(),
+            )
 
         while True:
             try:

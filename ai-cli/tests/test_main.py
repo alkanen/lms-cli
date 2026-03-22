@@ -30,7 +30,7 @@ def isolate_global_dir(
     monkeypatch.setattr("ai_cli.__main__.get_global_dir", lambda: fake_global)
     # Prevent the REPL from actually starting in tests that only care about
     # startup/init logic.  Tests that specifically exercise _cmd_repl override this.
-    monkeypatch.setattr("ai_cli.__main__._cmd_repl", lambda *_: sys.exit(1))
+    monkeypatch.setattr("ai_cli.__main__._cmd_repl", lambda *_, **__: sys.exit(1))
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +263,34 @@ class TestParseArgs:
             args = parse_args()
         assert args.continue_ is True
 
+    def test_display_defaults_to_none(self):
+        with patch("sys.argv", ["ai-cli"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.display is None
+
+    def test_display_plain(self):
+        with patch("sys.argv", ["ai-cli", "--display", "plain"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.display == "plain"
+
+    def test_display_rich(self):
+        with patch("sys.argv", ["ai-cli", "--display", "rich"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.display == "rich"
+
+    def test_display_invalid_exits(self):
+        with patch("sys.argv", ["ai-cli", "--display", "curses"]):
+            from ai_cli.__main__ import parse_args
+
+            with pytest.raises(SystemExit):
+                parse_args()
+
 
 # ---------------------------------------------------------------------------
 # _pick_session
@@ -477,3 +505,15 @@ class TestMainRouting:
             run_main(["--resume", "--continue"])
         assert exc_info.value.code == 1
         assert "--resume" in capsys.readouterr().err
+
+    def test_display_plain_passed_to_cmd_repl(self, monkeypatch):
+        kwargs = self._run(["--display", "plain"], monkeypatch)
+        assert kwargs.get("display") == "plain"
+
+    def test_display_rich_passed_to_cmd_repl(self, monkeypatch):
+        kwargs = self._run(["--display", "rich"], monkeypatch)
+        assert kwargs.get("display") == "rich"
+
+    def test_no_display_flag_passes_none(self, monkeypatch):
+        kwargs = self._run([], monkeypatch)
+        assert kwargs.get("display") is None
