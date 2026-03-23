@@ -59,8 +59,12 @@ def _rich(
     buf = io.StringIO()
     err_buf = io.StringIO()
     d = RichDisplay(verbose=verbose, markdown_enabled=markdown_enabled)
-    d._console = Console(file=buf, no_color=True, width=80, highlight=False, markup=False)
-    d._stderr_console = Console(file=err_buf, no_color=True, width=80, highlight=False, markup=False)
+    d._console = Console(
+        file=buf, no_color=True, width=80, highlight=False, markup=False
+    )
+    d._stderr_console = Console(
+        file=err_buf, no_color=True, width=80, highlight=False, markup=False
+    )
     return d, buf, err_buf
 
 

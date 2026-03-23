@@ -68,6 +68,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue the most recent session. Starts a new session if none exists.",
     )
+    def _positive_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not an integer.")
+        if n < 1:
+            raise argparse.ArgumentTypeError(
+                f"must be a positive integer (got {n})."
+            )
+        return n
+
+    parser.add_argument(
+        "--max-tool-rounds",
+        dest="max_tool_rounds",
+        type=_positive_int,
+        metavar="N",
+        help=(
+            "Maximum consecutive tool-call rounds per turn (must be >= 1). "
+            "Default: from config (which itself defaults to 10). "
+            "When provided, overrides 'max_tool_rounds' in config."
+        ),
+    )
     parser.add_argument(
         "--display",
         choices=["plain", "rich"],
@@ -160,13 +182,36 @@ def main() -> None:
         return
 
     if args.resume is _RESUME_PICK:
-        _cmd_repl(start, global_dir, resume_list=True, display=args.display)
+        _cmd_repl(
+            start,
+            global_dir,
+            resume_list=True,
+            display=args.display,
+            max_tool_rounds=args.max_tool_rounds,
+        )
     elif args.resume is not None:
-        _cmd_repl(start, global_dir, resume_id=str(args.resume), display=args.display)
+        _cmd_repl(
+            start,
+            global_dir,
+            resume_id=str(args.resume),
+            display=args.display,
+            max_tool_rounds=args.max_tool_rounds,
+        )
     elif args.continue_:
-        _cmd_repl(start, global_dir, continue_=True, display=args.display)
+        _cmd_repl(
+            start,
+            global_dir,
+            continue_=True,
+            display=args.display,
+            max_tool_rounds=args.max_tool_rounds,
+        )
     else:
-        _cmd_repl(start, global_dir, display=args.display)
+        _cmd_repl(
+            start,
+            global_dir,
+            display=args.display,
+            max_tool_rounds=args.max_tool_rounds,
+        )
 
 
 def _cmd_repl(
@@ -177,6 +222,7 @@ def _cmd_repl(
     resume_list: bool = False,
     continue_: bool = False,
     display: str | None = None,
+    max_tool_rounds: int | None = None,
 ) -> None:
     """Bootstrap all core objects and start the interactive REPL."""
     root = Workspace.find_root(start)
@@ -191,6 +237,8 @@ def _cmd_repl(
     cli_overrides: dict = {}
     if display is not None:
         cli_overrides["display_backend"] = display
+    if max_tool_rounds is not None:
+        cli_overrides["max_tool_rounds"] = max_tool_rounds
     try:
         config = ConfigManager(root, cli_overrides)
         workspace = Workspace(root, config)
@@ -222,7 +270,7 @@ def _cmd_repl(
     if resumed:
         ui.show_status(f"Resuming session {session.session_id}.")
 
-    repl = REPL(session, tool_registry, llm_client, ui, workspace)
+    repl = REPL(session, tool_registry, llm_client, ui, workspace, config)
     repl.run()
 
 

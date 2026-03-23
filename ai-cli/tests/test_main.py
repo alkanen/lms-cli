@@ -291,6 +291,34 @@ class TestParseArgs:
             with pytest.raises(SystemExit):
                 parse_args()
 
+    def test_max_tool_rounds_valid(self):
+        with patch("sys.argv", ["ai-cli", "--max-tool-rounds", "5"]):
+            from ai_cli.__main__ import parse_args
+
+            args = parse_args()
+        assert args.max_tool_rounds == 5
+
+    def test_max_tool_rounds_zero_exits(self):
+        with patch("sys.argv", ["ai-cli", "--max-tool-rounds", "0"]):
+            from ai_cli.__main__ import parse_args
+
+            with pytest.raises(SystemExit):
+                parse_args()
+
+    def test_max_tool_rounds_negative_exits(self):
+        with patch("sys.argv", ["ai-cli", "--max-tool-rounds", "-3"]):
+            from ai_cli.__main__ import parse_args
+
+            with pytest.raises(SystemExit):
+                parse_args()
+
+    def test_max_tool_rounds_non_integer_exits(self):
+        with patch("sys.argv", ["ai-cli", "--max-tool-rounds", "abc"]):
+            from ai_cli.__main__ import parse_args
+
+            with pytest.raises(SystemExit):
+                parse_args()
+
 
 # ---------------------------------------------------------------------------
 # _pick_session
@@ -517,3 +545,11 @@ class TestMainRouting:
     def test_no_display_flag_passes_none(self, monkeypatch):
         kwargs = self._run([], monkeypatch)
         assert kwargs.get("display") is None
+
+    def test_max_tool_rounds_passed_to_cmd_repl(self, monkeypatch):
+        kwargs = self._run(["--max-tool-rounds", "20"], monkeypatch)
+        assert kwargs.get("max_tool_rounds") == 20
+
+    def test_no_max_tool_rounds_flag_passes_none(self, monkeypatch):
+        kwargs = self._run([], monkeypatch)
+        assert kwargs.get("max_tool_rounds") is None
