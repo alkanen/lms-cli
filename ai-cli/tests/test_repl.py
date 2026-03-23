@@ -689,6 +689,300 @@ class TestREPLAtReferences:
         assert "content_b" in result
 
 
+class TestREPLAtReferencesImages:
+    @staticmethod
+    def _valid_png() -> bytes:
+        import io as _io
+
+        from PIL import Image as _PILImage
+
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (1, 1)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _make_image_workspace(self, img_bytes: bytes | None = None):
+        if img_bytes is None:
+            img_bytes = self._valid_png()
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = img_bytes
+        workspace.resolve.return_value = resolved
+        return workspace
+
+    def test_image_returns_content_block_list(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("Look at @diagram.png")
+        assert isinstance(result, list)
+
+    def test_image_block_has_correct_structure(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("@shot.png")
+        assert isinstance(result, list)
+        img_block = next(b for b in result if b.get("type") == "image_url")
+        assert img_block["image_url"]["url"].startswith("data:image/png;base64,")
+        assert img_block["image_url"]["detail"] == "auto"
+
+    def test_image_text_preserved_as_text_block(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("Describe this @photo.jpg please")
+        assert isinstance(result, list)
+        all_text = " ".join(b["text"] for b in result if b.get("type") == "text")
+        assert "Describe this" in all_text
+        assert "please" in all_text
+
+    def test_image_token_removed_from_text_block(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("See @pic.webp")
+        assert isinstance(result, list)
+        # Token itself should not appear in any text block
+        for block in result:
+            if block.get("type") == "text":
+                assert "@pic.webp" not in block["text"]
+
+    def test_image_only_no_text_block(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("@only.gif")
+        assert isinstance(result, list)
+        assert not any(b.get("type") == "text" for b in result)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_supported_extensions(self):
+        for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            repl = _make_repl(workspace=self._make_image_workspace())
+            result = repl._preprocess_at_references(f"@img{ext}")
+            assert isinstance(result, list), f"Expected list for {ext}"
+
+    def test_image_mime_type_jpeg(self):
+        repl = _make_repl(workspace=self._make_image_workspace())
+        result = repl._preprocess_at_references("@photo.jpg")
+        assert isinstance(result, list)
+        img_block = next(b for b in result if b.get("type") == "image_url")
+        assert "image/jpeg" in img_block["image_url"]["url"]
+
+    def test_image_bypasses_ignore_rules(self):
+        workspace = self._make_image_workspace()
+        repl = _make_repl(workspace=workspace)
+        repl._preprocess_at_references("@secret.png")
+        workspace.file_exists.assert_not_called()
+
+    def test_image_bang_also_works(self):
+        workspace = self._make_image_workspace()
+        repl = _make_repl(workspace=workspace)
+        result = repl._preprocess_at_references("@!diagram.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_image_read_error_leaves_token(self):
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.side_effect = OSError("not found")
+        workspace.resolve.return_value = resolved
+        display = MagicMock()
+        repl = _make_repl(workspace=workspace, display=display)
+        result = repl._preprocess_at_references("@bad.png")
+        assert isinstance(result, str)
+        assert "@bad.png" in result
+        display.show_error.assert_called_once()
+
+    def test_mixed_text_and_image(self):
+        workspace = MagicMock()
+        resolved_img = MagicMock()
+        resolved_img.read_bytes.return_value = self._valid_png()
+        workspace.resolve.return_value = resolved_img
+        workspace.file_exists.return_value = True
+        workspace.read_file.return_value = "def foo(): pass\n"
+        repl = _make_repl(workspace=workspace)
+        result = repl._preprocess_at_references("code @src.py image @shot.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "text" for b in result)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_interleaved_ordering_preserved(self):
+        """text @img text @img should produce text→image→text→image blocks."""
+        workspace = MagicMock()
+        resolved_img = MagicMock()
+        resolved_img.read_bytes.return_value = self._valid_png()
+        workspace.resolve.return_value = resolved_img
+        repl = _make_repl(workspace=workspace)
+        result = repl._preprocess_at_references("before @a.png middle @b.png after")
+        assert isinstance(result, list)
+        types = [b.get("type") for b in result]
+        assert types.count("image_url") == 2
+        # text before first image, image, text between, image, text after
+        first_img = types.index("image_url")
+        second_img = types.index("image_url", first_img + 1)
+        assert any(t == "text" for t in types[:first_img])
+        assert any(t == "text" for t in types[first_img + 1 : second_img])
+        assert any(t == "text" for t in types[second_img + 1 :])
+
+    def test_image_size_limit_exceeded(self):
+        """Images exceeding max_pixels_per_image are rejected."""
+        import io as _io
+
+        from PIL import Image as _PILImage
+
+        # Create a 100×100 PNG in memory
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (100, 100)).save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = img_bytes
+        workspace.resolve.return_value = resolved
+        display = MagicMock()
+
+        config = MagicMock()
+        # Set limit below 100×100 = 10000 pixels
+        config.get.side_effect = lambda key, default=None: (
+            50 * 50 if key == "max_pixels_per_image" else default
+        )
+
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=display,
+            workspace=workspace,
+            config=config,
+        )
+        result = repl._preprocess_at_references("@large.png")
+        assert isinstance(result, str)
+        assert "@large.png" in result
+        display.show_error.assert_called_once()
+
+    def test_image_within_size_limit_accepted(self):
+        """Images within max_pixels_per_image are accepted."""
+        import io as _io
+
+        from PIL import Image as _PILImage
+
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = img_bytes
+        workspace.resolve.return_value = resolved
+
+        repl = _make_repl(workspace=workspace)
+        result = repl._preprocess_at_references("@small.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_image_corrupt_leaves_token_and_shows_error(self):
+        """Pillow decode failure is a user-facing error, not a silent warning."""
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = b"not an image"
+        workspace.resolve.return_value = resolved
+        display = MagicMock()
+        repl = _make_repl(workspace=workspace, display=display)
+        result = repl._preprocess_at_references("@corrupt.png")
+        assert isinstance(result, str)
+        assert "@corrupt.png" in result
+        display.show_error.assert_called_once()
+
+    def test_max_pixels_zero_falls_back_to_default(self):
+        """A zero max_pixels_per_image in config falls back to the default."""
+        import io as _io
+
+        from PIL import Image as _PILImage
+
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = img_bytes
+        workspace.resolve.return_value = resolved
+
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            0 if key == "max_pixels_per_image" else default
+        )
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=workspace,
+            config=config,
+        )
+        # A 10×10 image (100 px) is well within the default limit (2,073,600),
+        # so it should be accepted even though max_pixels=0 was configured.
+        result = repl._preprocess_at_references("@small.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_max_pixels_invalid_string_falls_back_to_default(self):
+        """A non-numeric max_pixels_per_image falls back to the default."""
+        import io as _io
+
+        from PIL import Image as _PILImage
+
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        workspace = MagicMock()
+        resolved = MagicMock()
+        resolved.read_bytes.return_value = img_bytes
+        workspace.resolve.return_value = resolved
+
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            "bad" if key == "max_pixels_per_image" else default
+        )
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=workspace,
+            config=config,
+        )
+        result = repl._preprocess_at_references("@small.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_max_pixels_bool_falls_back_to_default(self):
+        """A boolean max_pixels_per_image (e.g. YAML true/false) falls back to default."""
+        workspace = self._make_image_workspace()
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            True if key == "max_pixels_per_image" else default
+        )
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=workspace,
+            config=config,
+        )
+        # True as int would be 1 pixel, rejecting almost everything.
+        # With the bool guard the default limit applies, so a 1×1 image passes.
+        result = repl._preprocess_at_references("@img.png")
+        assert isinstance(result, list)
+        assert any(b.get("type") == "image_url" for b in result)
+
+    def test_send_to_llm_uses_add_raw_message_for_image(self):
+        workspace = self._make_image_workspace()
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        llm = _make_llm()
+        repl = _make_repl(workspace=workspace, session=session, llm=llm)
+        repl._handle_input("Look @diagram.png")
+        session.add_raw_message.assert_called_once()
+        call_arg = session.add_raw_message.call_args[0][0]
+        assert call_arg["role"] == "user"
+        assert isinstance(call_arg["content"], list)
+
+
 # ---------------------------------------------------------------------------
 # REPL._check_compaction()
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ description = "AI-powered CLI assistant"
 requires-python = ">=3.10"
 dependencies = [
     "openai",
+    "pillow",
     "pyyaml",
     "prompt_toolkit",
     "python-dotenv",
