@@ -68,15 +68,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue the most recent session. Starts a new session if none exists.",
     )
+
     def _positive_int(value: str) -> int:
         try:
             n = int(value)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"{value!r} is not an integer.")
+        except ValueError as err:
+            raise argparse.ArgumentTypeError(f"{value!r} is not an integer.") from err
         if n < 1:
-            raise argparse.ArgumentTypeError(
-                f"must be a positive integer (got {n})."
-            )
+            raise argparse.ArgumentTypeError(f"must be a positive integer (got {n}).")
         return n
 
     parser.add_argument(

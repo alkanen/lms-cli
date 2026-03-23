@@ -1,4 +1,5 @@
 openai
+pillow
 pyyaml
 prompt_toolkit
 python-dotenv

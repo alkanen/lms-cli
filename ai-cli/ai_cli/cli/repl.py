@@ -8,13 +8,17 @@ coordinates Session, ToolRegistry, LLMClient, and Display.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 import json
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+from PIL import Image as _PILImage
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 
@@ -32,10 +36,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Default pixel limit for images attached via @path (width × height).
+# Equivalent to one full-HD video frame (1920×1080).
+_DEFAULT_MAX_PIXELS: int = 1920 * 1080
+
 # Default maximum number of consecutive tool-call rounds per user turn.
 # Overridable via config key ``max_tool_rounds``, ``--max-tool-rounds`` CLI
 # flag, or the ``/rounds`` slash command.
 _DEFAULT_MAX_TOOL_ROUNDS = 10
+
+# MIME types for recognised image extensions.  Files with these extensions are
+# base64-encoded and sent as image_url content blocks instead of text.
+_IMAGE_MIME_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 # Matches @path and @!path references in user input.
 # Excludes characters that commonly appear as trailing punctuation in prose
@@ -414,9 +432,7 @@ class REPL:
         try:
             if config_path.is_file():
                 data: dict = (
-                    yaml.safe_load(
-                        config_path.read_text(encoding="utf-8")
-                    ) or {}
+                    yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
                 )
                 if not isinstance(data, dict):
                     data = {}
@@ -436,17 +452,126 @@ class REPL:
     # @ file reference expansion
     # ------------------------------------------------------------------
 
-    def _preprocess_at_references(self, text: str) -> str:
+    def _preprocess_at_references(self, text: str) -> str | list[dict]:
         """
-        Replace ``@path`` and ``@!path`` tokens with the file's content.
+        Replace ``@path`` and ``@!path`` tokens with file content.
 
-        ``@path`` respects ignore rules; ``@!path`` bypasses them.
+        Text files: the token is replaced inline with a ``[file: …]`` block;
+        the return value remains a plain ``str``.
+
+        Image files (``.png``, ``.jpg``/``.jpeg``, ``.gif``, ``.webp``): the
+        token is removed from the text and the file is base64-encoded into an
+        ``image_url`` content block.  When at least one image is present the
+        method returns a ``list[dict]`` (OpenAI ``chat/completions`` content
+        block array) in the original interleaved order rather than a ``str``.
+
+        ``@path`` respects ignore rules for text files; images bypass ignore
+        rules because the user is explicitly attaching them.  ``@!path``
+        bypasses ignore rules for text files too (unchanged behaviour).
+
+        Image dimensions are checked against ``max_pixels_per_image`` (config,
+        default ``1920 × 1080``).  Oversized images produce an error and leave
+        the token in place.
+
         On any error the token is left in place and an error is shown.
         """
+        max_pixels: int = _DEFAULT_MAX_PIXELS
+        if self._config is not None:
+            raw_max = self._config.get("max_pixels_per_image", _DEFAULT_MAX_PIXELS)
+            if isinstance(raw_max, bool):
+                logger.warning(
+                    "Boolean 'max_pixels_per_image' config value %r is invalid; "
+                    "using default %d.",
+                    raw_max,
+                    _DEFAULT_MAX_PIXELS,
+                )
+            else:
+                try:
+                    parsed_max = int(raw_max)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid 'max_pixels_per_image' config value %r; using default %d.",
+                        raw_max,
+                        _DEFAULT_MAX_PIXELS,
+                    )
+                else:
+                    if parsed_max <= 0:
+                        logger.warning(
+                            "Non-positive 'max_pixels_per_image' value %d; using default %d.",
+                            parsed_max,
+                            _DEFAULT_MAX_PIXELS,
+                        )
+                    else:
+                        max_pixels = parsed_max
 
-        def replace(match: re.Match[str]) -> str:
+        # We scan matches manually so we can interleave text segments and
+        # image blocks in their original order.
+        result_blocks: list[dict] = []  # built only when images are present
+        current_text_parts: list[str] = []  # text accumulated since last image
+        full_text_parts: list[str] = []  # all text (for the no-image path)
+        any_images = False
+        last_end = 0
+
+        def _flush_text() -> None:
+            """Emit accumulated text as a content block (if non-empty)."""
+            if not current_text_parts:
+                return
+            combined = "".join(current_text_parts)
+            current_text_parts.clear()
+            if combined.strip():
+                result_blocks.append({"type": "text", "text": combined})
+
+        def _handle_match(match: re.Match[str]) -> str:
+            """Process one @ref token; return the text replacement."""
+            nonlocal any_images
             bypass_ignore = bool(match.group(1))
             path = match.group(2)
+            mime = _IMAGE_MIME_TYPES.get(Path(path).suffix.lower())
+
+            if mime is not None:
+                # Image: bypass ignore rules, read bytes, check size, encode.
+                try:
+                    resolved = self._workspace.resolve(path)
+                    raw_bytes = resolved.read_bytes()
+                except (WorkspaceError, OSError) as exc:
+                    self._display.show_error(f"@{path}: {exc}")
+                    return str(match.group(0))
+
+                try:
+                    with _PILImage.open(io.BytesIO(raw_bytes)) as img:
+                        w, h = img.size
+                        if w * h > max_pixels:
+                            self._display.show_error(
+                                f"@{path}: image too large "
+                                f"({w}×{h} = {w * h:,} pixels; "
+                                f"limit is {max_pixels:,}). "
+                                "Set max_pixels_per_image in config to raise the limit."
+                            )
+                            return str(match.group(0))
+                except Exception as exc:
+                    logger.warning(
+                        "Could not open image %s to check dimensions: %s", path, exc
+                    )
+                    self._display.show_error(
+                        f"@{path}: could not open image file — {exc}"
+                    )
+                    return str(match.group(0))
+
+                b64 = base64.b64encode(raw_bytes).decode("ascii")
+                _flush_text()
+                result_blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{b64}",
+                            "detail": "auto",
+                        },
+                    }
+                )
+                any_images = True
+                return ""  # remove token from surrounding text
+
+            # Text file
             try:
                 if bypass_ignore:
                     resolved = self._workspace.resolve(path)
@@ -463,15 +588,43 @@ class REPL:
                 return str(match.group(0))
             return f"[file: {path}]\n{content}\n[/file]"
 
-        return _AT_RE.sub(replace, text)
+        for match in _AT_RE.finditer(text):
+            prefix = text[last_end : match.start()]
+            if prefix:
+                current_text_parts.append(prefix)
+                full_text_parts.append(prefix)
+
+            replacement = _handle_match(match)
+
+            if replacement:
+                current_text_parts.append(replacement)
+                full_text_parts.append(replacement)
+
+            last_end = match.end()
+
+        # Trailing text after the last match
+        tail = text[last_end:]
+        if tail:
+            current_text_parts.append(tail)
+            full_text_parts.append(tail)
+
+        if not any_images:
+            return "".join(full_text_parts)
+
+        # Flush any remaining text, then return the interleaved block list.
+        _flush_text()
+        return result_blocks
 
     # ------------------------------------------------------------------
     # LLM streaming and agentic tool loop
     # ------------------------------------------------------------------
 
-    def _send_to_llm(self, user_input: str) -> None:
+    def _send_to_llm(self, user_input: str | list[dict]) -> None:
         try:
-            self._session.add_message("user", user_input)
+            if isinstance(user_input, list):
+                self._session.add_raw_message({"role": "user", "content": user_input})
+            else:
+                self._session.add_message("user", user_input)
         except SessionError as exc:
             self._display.show_error(f"Could not save message: {exc}")
             return
