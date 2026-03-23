@@ -14,15 +14,17 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+import yaml
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import SessionError
-from ai_cli.core.workspace import WorkspaceError, get_global_dir
+from ai_cli.core.workspace import _DOT_AI_CLI, WorkspaceError, get_global_dir
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
+    from ai_cli.core.config_manager import ConfigManager
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.session_manager import Session
     from ai_cli.core.tool_registry import ToolRegistry
@@ -30,8 +32,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of consecutive tool-call rounds per user turn.
-_MAX_TOOL_ROUNDS = 10
+# Default maximum number of consecutive tool-call rounds per user turn.
+# Overridable via config key ``max_tool_rounds``, ``--max-tool-rounds`` CLI
+# flag, or the ``/rounds`` slash command.
+_DEFAULT_MAX_TOOL_ROUNDS = 10
 
 # Matches @path and @!path references in user input.
 # Excludes characters that commonly appear as trailing punctuation in prose
@@ -60,6 +64,10 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/session", "Show information about the current session"),
     ("/session name <name>", "Set a display name for this session"),
     ("/history", "Browse the full conversation history in a scrollable view"),
+    (
+        "/rounds [--session] <N>",
+        "Set the maximum tool-call rounds per turn (omit --session to persist)",
+    ),
 ]
 
 
@@ -79,6 +87,11 @@ class REPL:
         All user-facing output and interactive prompts.
     workspace:
         Used to resolve and read files referenced via ``@path`` syntax.
+    config:
+        Layered configuration manager.  Used to read ``max_tool_rounds`` at
+        startup and to persist runtime changes (e.g. ``/rounds``) to the
+        project config file.  When ``None``, built-in defaults are used and
+        persistence is still attempted via the workspace path.
     """
 
     def __init__(
@@ -88,12 +101,35 @@ class REPL:
         llm_client: LLMClient,
         display: Display,
         workspace: Workspace,
+        config: ConfigManager | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
         self._llm = llm_client
         self._display = display
         self._workspace = workspace
+        self._config = config
+        # Maximum tool-call rounds per user turn — readable from config and
+        # overridable at runtime via /rounds.
+        self._max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS
+        if config is not None:
+            raw = config.get("max_tool_rounds", _DEFAULT_MAX_TOOL_ROUNDS)
+            parsed: int | None = None
+            if isinstance(raw, int) and not isinstance(raw, bool):
+                parsed = raw
+            elif isinstance(raw, str):
+                try:
+                    parsed = int(raw)
+                except ValueError:
+                    parsed = None
+            if isinstance(parsed, int) and parsed >= 1:
+                self._max_tool_rounds = parsed
+            elif raw != _DEFAULT_MAX_TOOL_ROUNDS:
+                logger.warning(
+                    "Invalid max_tool_rounds value %r in config; using default %d.",
+                    raw,
+                    _DEFAULT_MAX_TOOL_ROUNDS,
+                )
         # Schemas injected by tool_manager.enable for the next API call only.
         # Maps tool name → schema so we can both inject the schema into the
         # tools list AND pass allow_transient=True when executing that tool.
@@ -201,6 +237,9 @@ class REPL:
                 self._display.show_error(f"Could not load history: {exc}")
                 return
             self._display.show_history(messages)
+
+        elif cmd == "rounds":
+            self._handle_rounds_subcommand(command[len(cmd) :].strip())
 
         elif cmd == "":
             self._display.show_error(
@@ -320,6 +359,80 @@ class REPL:
         )
 
     # ------------------------------------------------------------------
+    # /rounds subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_rounds_subcommand(self, remainder: str) -> None:
+        """Dispatch /rounds [--session] <N>."""
+        parts = remainder.split()
+        session_flag = "--session" in parts
+        parts = [p for p in parts if p != "--session"]
+
+        if not parts:
+            self._display.show_error("Usage: /rounds [--session] <N>")
+            return
+
+        try:
+            value = int(parts[0])
+        except ValueError:
+            self._display.show_error(
+                f"Invalid value '{parts[0]}': must be a positive integer."
+            )
+            return
+
+        if value < 1:
+            self._display.show_error("max_tool_rounds must be at least 1.")
+            return
+
+        self._max_tool_rounds = value
+        if not session_flag:
+            if self._persist_setting("max_tool_rounds", value):
+                self._display.show_status(
+                    f"Max tool rounds set to {value} (persisted to project config)."
+                )
+            else:
+                self._display.show_error(
+                    f"Max tool rounds set to {value} for this session, "
+                    "but could not persist to project config (see logs)."
+                )
+        else:
+            self._display.show_status(
+                f"Max tool rounds set to {value} for this session."
+            )
+
+    # ------------------------------------------------------------------
+    # Config persistence helper
+    # ------------------------------------------------------------------
+
+    def _persist_setting(self, key: str, value: object) -> bool:
+        """Write a top-level key to the project .ai-cli/config.yaml.
+
+        Returns ``True`` on success, ``False`` if the write failed (the error
+        is logged as a warning in that case).
+        """
+        config_path = self._workspace.root / _DOT_AI_CLI / "config.yaml"
+        try:
+            if config_path.is_file():
+                data: dict = (
+                    yaml.safe_load(
+                        config_path.read_text(encoding="utf-8")
+                    ) or {}
+                )
+                if not isinstance(data, dict):
+                    data = {}
+            else:
+                data = {}
+            data[key] = value
+            config_path.write_text(
+                yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+                encoding="utf-8",
+            )
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+            logger.warning("Could not persist setting '%s': %s", key, exc)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # @ file reference expansion
     # ------------------------------------------------------------------
 
@@ -363,7 +476,7 @@ class REPL:
             self._display.show_error(f"Could not save message: {exc}")
             return
 
-        for _ in range(_MAX_TOOL_ROUNDS):
+        for _ in range(self._max_tool_rounds):
             tool_calls: list[dict] = []
             text_parts: list[str] = []
 
@@ -529,10 +642,10 @@ class REPL:
         else:
             logger.warning(
                 "Tool call limit (%d rounds) reached for session; stopping.",
-                _MAX_TOOL_ROUNDS,
+                self._max_tool_rounds,
             )
             self._display.show_error(
-                f"Tool call limit ({_MAX_TOOL_ROUNDS} rounds) reached. Stopping."
+                f"Tool call limit ({self._max_tool_rounds} rounds) reached. Stopping."
             )
 
         self._check_compaction()

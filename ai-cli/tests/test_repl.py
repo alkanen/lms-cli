@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai_cli.cli.repl import _MAX_TOOL_ROUNDS, _SLASH_COMMANDS, REPL
+from ai_cli.cli.repl import _DEFAULT_MAX_TOOL_ROUNDS, _SLASH_COMMANDS, REPL
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
 
@@ -446,13 +446,13 @@ class TestREPLSendToLLM:
                         {"type": "done", "stop_reason": "tool_calls", "usage": {}},
                     ]
                 )
-                for i in range(_MAX_TOOL_ROUNDS)
+                for i in range(_DEFAULT_MAX_TOOL_ROUNDS)
             ],
         ):
             repl._send_to_llm("loop forever")
 
         display.show_error.assert_called_once()
-        assert str(_MAX_TOOL_ROUNDS) in display.show_error.call_args[0][0]
+        assert str(_DEFAULT_MAX_TOOL_ROUNDS) in display.show_error.call_args[0][0]
 
     def test_empty_text_response_not_saved(self):
         session = MagicMock()
@@ -1149,3 +1149,125 @@ class TestREPLFormatDisplay:
         display.show_tool_result.assert_called_once_with(
             "read_file", {"status": "success", "data": {}}, None
         )
+
+
+# ---------------------------------------------------------------------------
+# /rounds command
+# ---------------------------------------------------------------------------
+
+
+class TestRoundsCommand:
+    def test_rounds_session_updates_attribute(self):
+        repl = _make_repl()
+        repl._handle_input("/rounds --session 5")
+        assert repl._max_tool_rounds == 5
+
+    def test_rounds_session_no_persist(self, tmp_path):
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        repl = _make_repl(workspace=workspace)
+        repl._handle_input("/rounds --session 3")
+        config_path = tmp_path / ".ai-cli" / "config.yaml"
+        assert not config_path.exists()
+
+    def test_rounds_persistent_writes_config(self, tmp_path):
+        import yaml as _yaml
+
+        dot = tmp_path / ".ai-cli"
+        dot.mkdir()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        repl = _make_repl(workspace=workspace)
+        repl._handle_input("/rounds 7")
+        config_path = dot / "config.yaml"
+        assert config_path.exists()
+        data = _yaml.safe_load(config_path.read_text())
+        assert data["max_tool_rounds"] == 7
+
+    def test_rounds_invalid_value(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._handle_input("/rounds abc")
+        display.show_error.assert_called_once()
+        assert repl._max_tool_rounds == _DEFAULT_MAX_TOOL_ROUNDS
+
+    def test_rounds_zero_rejected(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._handle_input("/rounds 0")
+        display.show_error.assert_called_once()
+        assert repl._max_tool_rounds == _DEFAULT_MAX_TOOL_ROUNDS
+
+    def test_rounds_missing_value(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._handle_input("/rounds")
+        display.show_error.assert_called_once()
+
+    def test_rounds_config_initial_value(self):
+        config = MagicMock()
+        config.get.return_value = 25
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=MagicMock(),
+            config=config,
+        )
+        assert repl._max_tool_rounds == 25
+
+    def test_rounds_in_slash_commands(self):
+        cmds = [cmd for cmd, _ in _SLASH_COMMANDS]
+        assert any("rounds" in cmd for cmd in cmds)
+
+    def test_rounds_config_invalid_string_falls_back_to_default(self):
+        config = MagicMock()
+        config.get.return_value = "not-a-number"
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=MagicMock(),
+            config=config,
+        )
+        assert repl._max_tool_rounds == _DEFAULT_MAX_TOOL_ROUNDS
+
+    def test_rounds_config_zero_falls_back_to_default(self):
+        config = MagicMock()
+        config.get.return_value = 0
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=MagicMock(),
+            config=config,
+        )
+        assert repl._max_tool_rounds == _DEFAULT_MAX_TOOL_ROUNDS
+
+    def test_rounds_config_none_falls_back_to_default(self):
+        config = MagicMock()
+        config.get.return_value = None
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=MagicMock(),
+            workspace=MagicMock(),
+            config=config,
+        )
+        assert repl._max_tool_rounds == _DEFAULT_MAX_TOOL_ROUNDS
+
+    def test_rounds_persist_failure_shows_error(self, tmp_path):
+        # Simulate a write failure deterministically by patching write_text.
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        display = MagicMock()
+        repl = _make_repl(workspace=workspace, display=display)
+        with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
+            repl._handle_input("/rounds 4")
+        # Value is still updated in memory even if persist failed.
+        assert repl._max_tool_rounds == 4
+        display.show_error.assert_called_once()
