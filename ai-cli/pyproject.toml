@@ -1,3 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-cli"
+version = "0.1.0"
+description = "AI-powered CLI assistant"
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+    "pyyaml",
+    "prompt_toolkit",
+    "python-dotenv",
+    "rich",
+    "tiktoken",
+    "websockets",
+]
+
+[project.scripts]
+ai-cli = "ai_cli.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "mypy",
+    "pytest",
+    "ruff",
+    "types-PyYAML",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_cli*"]
+exclude = ["env*", "tests*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
