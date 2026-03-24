@@ -22,9 +22,10 @@ from PIL import Image as _PILImage
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 
+from ai_cli.cli.completer import REPLCompleter
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import SessionError
-from ai_cli.core.workspace import _DOT_AI_CLI, WorkspaceError, get_global_dir
+from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
@@ -87,6 +88,12 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "Set the maximum tool-call rounds per turn (omit --session to persist)",
     ),
 ]
+
+# Unique top-level command names (no leading "/", no arguments) derived from
+# _SLASH_COMMANDS.  Used to populate the tab completer.
+_SLASH_COMMAND_NAMES: list[str] = list(
+    dict.fromkeys(cmd.lstrip("/").split()[0] for cmd, _ in _SLASH_COMMANDS)
+)
 
 
 class REPL:
@@ -174,8 +181,20 @@ class REPL:
         if _prompt_session is None:
             history_path = get_global_dir() / "history"
             history_path.parent.mkdir(parents=True, exist_ok=True)
+            repl_cfg = self._config.get("repl_behavior", {}) if self._config else {}
+            cwt = (
+                bool(repl_cfg.get("complete_while_typing", False))
+                if isinstance(repl_cfg, dict)
+                else False
+            )
             _prompt_session = PromptSession(
                 history=FileHistory(str(history_path)),
+                completer=REPLCompleter(
+                    slash_commands=_SLASH_COMMAND_NAMES,
+                    tool_registry=self._tool_registry,
+                    workspace=self._workspace,
+                ),
+                complete_while_typing=cwt,
                 **self._display.prompt_session_kwargs(),
             )
 
@@ -202,6 +221,8 @@ class REPL:
             self._handle_slash_command(raw[1:].strip())
         else:
             user_input = self._preprocess_at_references(raw)
+            if user_input is None:
+                return  # @ reference failed; error already shown, don't send
             self._send_to_llm(user_input)
 
     def _handle_slash_command(self, command: str) -> None:
@@ -452,7 +473,7 @@ class REPL:
     # @ file reference expansion
     # ------------------------------------------------------------------
 
-    def _preprocess_at_references(self, text: str) -> str | list[dict]:
+    def _preprocess_at_references(self, text: str) -> str | list[dict] | None:
         """
         Replace ``@path`` and ``@!path`` tokens with file content.
 
@@ -465,15 +486,22 @@ class REPL:
         method returns a ``list[dict]`` (OpenAI ``chat/completions`` content
         block array) in the original interleaved order rather than a ``str``.
 
-        ``@path`` respects ignore rules for text files; images bypass ignore
-        rules because the user is explicitly attaching them.  ``@!path``
-        bypasses ignore rules for text files too (unchanged behaviour).
+        Paths are resolved relative to the workspace root.  Absolute paths
+        (``@/etc/hosts``) and parent-traversal paths (``@../secret.txt``) are
+        intentionally allowed — the user decides what to share with the model.
+        Access errors (``PermissionError``, missing files) show a user-facing
+        error and return ``None`` to signal that the send should be aborted.
+
+        ``@path`` respects workspace ignore rules for files inside the root.
+        ``@!path`` and any path that escapes the root bypass ignore rules.
+        Images always bypass ignore rules.
 
         Image dimensions are checked against ``max_pixels_per_image`` (config,
-        default ``1920 × 1080``).  Oversized images produce an error and leave
-        the token in place.
+        default ``1920 × 1080``).  Oversized images produce an error and return
+        ``None``.
 
-        On any error the token is left in place and an error is shown.
+        Returns ``None`` if any ``@`` reference fails — the caller should
+        discard the message and return control to the user.
         """
         max_pixels: int = _DEFAULT_MAX_PIXELS
         if self._config is not None:
@@ -510,6 +538,7 @@ class REPL:
         current_text_parts: list[str] = []  # text accumulated since last image
         full_text_parts: list[str] = []  # all text (for the no-image path)
         any_images = False
+        any_errors = False
         last_end = 0
 
         def _flush_text() -> None:
@@ -523,18 +552,28 @@ class REPL:
 
         def _handle_match(match: re.Match[str]) -> str:
             """Process one @ref token; return the text replacement."""
-            nonlocal any_images
+            nonlocal any_images, any_errors
             bypass_ignore = bool(match.group(1))
             path = match.group(2)
             mime = _IMAGE_MIME_TYPES.get(Path(path).suffix.lower())
 
+            # Resolve the path permissively.  Python's pathlib treats a leading
+            # "/" as absolute, so ``workspace.root / "/etc/hosts"`` resolves to
+            # ``/etc/hosts``.  ``..`` traversal is normalised by ``.resolve()``.
+            try:
+                abs_path = (self._workspace.root / path).resolve()
+            except OSError as exc:
+                self._display.show_error(f"@{path}: {exc.strerror or str(exc)}")
+                any_errors = True
+                return str(match.group(0))
+
             if mime is not None:
-                # Image: bypass ignore rules, read bytes, check size, encode.
+                # Images bypass ignore rules; read bytes, check size, encode.
                 try:
-                    resolved = self._workspace.resolve(path)
-                    raw_bytes = resolved.read_bytes()
-                except (WorkspaceError, OSError) as exc:
-                    self._display.show_error(f"@{path}: {exc}")
+                    raw_bytes = abs_path.read_bytes()
+                except OSError as exc:
+                    self._display.show_error(f"@{path}: {exc.strerror or str(exc)}")
+                    any_errors = True
                     return str(match.group(0))
 
                 try:
@@ -547,6 +586,7 @@ class REPL:
                                 f"limit is {max_pixels:,}). "
                                 "Set max_pixels_per_image in config to raise the limit."
                             )
+                            any_errors = True
                             return str(match.group(0))
                 except Exception as exc:
                     logger.warning(
@@ -555,6 +595,7 @@ class REPL:
                     self._display.show_error(
                         f"@{path}: could not open image file — {exc}"
                     )
+                    any_errors = True
                     return str(match.group(0))
 
                 b64 = base64.b64encode(raw_bytes).decode("ascii")
@@ -571,20 +612,26 @@ class REPL:
                 any_images = True
                 return ""  # remove token from surrounding text
 
-            # Text file
+            # Text file: apply ignore rules only for within-workspace paths
+            # unless the user explicitly bypasses them with @!.
+            within_workspace = abs_path.is_relative_to(self._workspace.root)
+            if (
+                not bypass_ignore
+                and within_workspace
+                and self._workspace.is_ignored(abs_path)
+            ):
+                self._display.show_error(
+                    f"@{path}: file not found or excluded by ignore rules"
+                )
+                any_errors = True
+                return str(match.group(0))
+
             try:
-                if bypass_ignore:
-                    resolved = self._workspace.resolve(path)
-                    content: str = resolved.read_text(encoding="utf-8")
-                else:
-                    if not self._workspace.file_exists(path):
-                        self._display.show_error(
-                            f"@{path}: file not found or excluded by ignore rules"
-                        )
-                        return str(match.group(0))
-                    content = self._workspace.read_file(path)
-            except (WorkspaceError, OSError, UnicodeDecodeError) as exc:
-                self._display.show_error(f"@{path}: {exc}")
+                content: str = abs_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                reason = exc.strerror if isinstance(exc, OSError) else str(exc)
+                self._display.show_error(f"@{path}: {reason}")
+                any_errors = True
                 return str(match.group(0))
             return f"[file: {path}]\n{content}\n[/file]"
 
@@ -607,6 +654,9 @@ class REPL:
         if tail:
             current_text_parts.append(tail)
             full_text_parts.append(tail)
+
+        if any_errors:
+            return None
 
         if not any_images:
             return "".join(full_text_parts)

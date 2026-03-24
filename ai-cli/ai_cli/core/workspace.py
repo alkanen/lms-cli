@@ -62,6 +62,9 @@ _INIT_TEMPLATES: dict[str, str] = {
         # api_key_env: OPENAI_API_KEY   # name of the env-var holding the key
         # context_window: 128000
         # max_response_tokens: 4096
+        #
+        # repl_behavior:
+        #   complete_while_typing: false  # true = popup on every keystroke; false = Tab only (default)
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
@@ -90,6 +93,9 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         # api_key_env: OPENAI_API_KEY   # name of the env-var holding the key
         # context_window: 128000
         # max_response_tokens: 4096
+        #
+        # repl_behavior:
+        #   complete_while_typing: false  # true = popup on every keystroke; false = Tab only (default)
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Default system prompt — applied to all projects unless a

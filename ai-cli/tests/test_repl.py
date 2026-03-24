@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ai_cli.cli.completer import REPLCompleter
 from ai_cli.cli.repl import _DEFAULT_MAX_TOOL_ROUNDS, _SLASH_COMMANDS, REPL
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
@@ -150,6 +151,56 @@ class TestREPLRun:
         pt = _make_prompt_session("Hello there")
         repl.run(_prompt_session=pt)
         session.add_message.assert_any_call("user", "Hello there")
+
+    def test_default_session_created_with_completer(self, tmp_path):
+        """When no _prompt_session is injected, PromptSession gets a REPLCompleter."""
+        repl = _make_repl()
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert isinstance(kwargs.get("completer"), REPLCompleter)
+        assert kwargs.get("complete_while_typing") is False
+
+    def test_complete_while_typing_enabled_via_config(self, tmp_path):
+        """repl_behavior.complete_while_typing: true is passed to PromptSession."""
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"complete_while_typing": True} if key == "repl_behavior" else default
+        )
+        repl = _make_repl()
+        repl._config = config
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert kwargs.get("complete_while_typing") is True
+
+    def test_complete_while_typing_bad_repl_cfg_falls_back_to_false(self, tmp_path):
+        """A non-dict repl_behavior value falls back to complete_while_typing=False."""
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            "bad" if key == "repl_behavior" else default
+        )
+        repl = _make_repl()
+        repl._config = config
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert kwargs.get("complete_while_typing") is False
 
 
 # ---------------------------------------------------------------------------
@@ -635,61 +686,88 @@ class TestREPLSendToLLM:
 
 
 class TestREPLAtReferences:
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self._root = tmp_path
+
+    def _make_workspace(self, is_ignored: bool = False, root=None):
+        ws = MagicMock()
+        ws.root = root if root is not None else self._root
+        ws.is_ignored.return_value = is_ignored
+        return ws
+
     def test_no_references_unchanged(self):
         repl = _make_repl()
         assert repl._preprocess_at_references("Hello world") == "Hello world"
 
     def test_at_reference_replaced_with_content(self):
-        workspace = MagicMock()
-        workspace.file_exists.return_value = True
-        workspace.read_file.return_value = "line1\nline2\n"
-        repl = _make_repl(workspace=workspace)
+        (self._root / "src").mkdir()
+        (self._root / "src" / "foo.py").write_text("line1\nline2\n")
+        repl = _make_repl(workspace=self._make_workspace())
         result = repl._preprocess_at_references("Check @src/foo.py please")
         assert "[file: src/foo.py]" in result
         assert "line1" in result
         assert "[/file]" in result
 
-    def test_at_reference_missing_file_left_in_place(self):
-        workspace = MagicMock()
-        workspace.file_exists.return_value = False
+    def test_at_reference_missing_file_aborts(self):
         display = MagicMock()
-        repl = _make_repl(workspace=workspace, display=display)
+        repl = _make_repl(workspace=self._make_workspace(), display=display)
         result = repl._preprocess_at_references("Check @missing.py please")
-        assert "@missing.py" in result
+        assert result is None
         display.show_error.assert_called_once()
+        # Error message should not leak the resolved absolute path.
+        msg = display.show_error.call_args[0][0]
+        assert str(self._root) not in msg
 
     def test_at_bang_bypasses_ignore(self):
-        workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_text.return_value = "secret\n"
-        workspace.resolve.return_value = resolved
-        repl = _make_repl(workspace=workspace)
+        (self._root / "secret.key").write_text("secret\n")
+        repl = _make_repl(workspace=self._make_workspace(is_ignored=True))
         result = repl._preprocess_at_references("See @!secret.key")
         assert "secret" in result
-        workspace.file_exists.assert_not_called()
 
-    def test_workspace_error_leaves_token_in_place(self):
-        from ai_cli.core.workspace import WorkspaceError
-
-        workspace = MagicMock()
-        workspace.file_exists.side_effect = WorkspaceError("outside workspace")
-        display = MagicMock()
-        repl = _make_repl(workspace=workspace, display=display)
+    def test_dotdot_path_reads_from_parent(self):
+        """@../file reads a file outside the workspace root."""
+        workspace_root = self._root / "workspace"
+        workspace_root.mkdir()
+        (self._root / "escape.py").write_text("outside_content\n")
+        repl = _make_repl(workspace=self._make_workspace(root=workspace_root))
         result = repl._preprocess_at_references("@../escape.py")
-        assert "@../escape.py" in result
+        assert "outside_content" in result
+
+    def test_os_error_aborts(self):
+        """A missing file (OSError) returns None and shows an error."""
+        display = MagicMock()
+        repl = _make_repl(workspace=self._make_workspace(), display=display)
+        result = repl._preprocess_at_references("@nonexistent.py")
+        assert result is None
+        display.show_error.assert_called_once()
+        # Error message should use strerror, not the full exception (no resolved path).
+        msg = display.show_error.call_args[0][0]
+        assert str(self._root) not in msg
+
+    def test_resolve_os_error_aborts(self):
+        """resolve() failure (e.g. symlink loop) returns None and shows an error."""
+        display = MagicMock()
+        repl = _make_repl(workspace=self._make_workspace(), display=display)
+        with patch("pathlib.Path.resolve", side_effect=OSError("symlink loop")):
+            result = repl._preprocess_at_references("@loop.py")
+        assert result is None
         display.show_error.assert_called_once()
 
     def test_multiple_references_all_replaced(self):
-        workspace = MagicMock()
-        workspace.file_exists.return_value = True
-        workspace.read_file.side_effect = ["content_a\n", "content_b\n"]
-        repl = _make_repl(workspace=workspace)
+        (self._root / "a.py").write_text("content_a\n")
+        (self._root / "b.py").write_text("content_b\n")
+        repl = _make_repl(workspace=self._make_workspace())
         result = repl._preprocess_at_references("@a.py and @b.py")
         assert "content_a" in result
         assert "content_b" in result
 
 
 class TestREPLAtReferencesImages:
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self._root = tmp_path
+
     @staticmethod
     def _valid_png() -> bytes:
         import io as _io
@@ -704,9 +782,22 @@ class TestREPLAtReferencesImages:
         if img_bytes is None:
             img_bytes = self._valid_png()
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = img_bytes
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
+        for name in [
+            "diagram.png",
+            "shot.png",
+            "photo.jpg",
+            "pic.webp",
+            "only.gif",
+            "img.png",
+            "img.jpg",
+            "img.jpeg",
+            "img.gif",
+            "img.webp",
+            "secret.png",
+        ]:
+            (self._root / name).write_bytes(img_bytes)
         return workspace
 
     def test_image_returns_content_block_list(self):
@@ -772,25 +863,23 @@ class TestREPLAtReferencesImages:
         assert isinstance(result, list)
         assert any(b.get("type") == "image_url" for b in result)
 
-    def test_image_read_error_leaves_token(self):
+    def test_image_read_error_aborts(self):
+        # No file written — read_bytes() raises FileNotFoundError (subclass of OSError)
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.side_effect = OSError("not found")
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
         display = MagicMock()
         repl = _make_repl(workspace=workspace, display=display)
         result = repl._preprocess_at_references("@bad.png")
-        assert isinstance(result, str)
-        assert "@bad.png" in result
+        assert result is None
         display.show_error.assert_called_once()
 
     def test_mixed_text_and_image(self):
+        (self._root / "src.py").write_text("def foo(): pass\n")
+        (self._root / "shot.png").write_bytes(self._valid_png())
         workspace = MagicMock()
-        resolved_img = MagicMock()
-        resolved_img.read_bytes.return_value = self._valid_png()
-        workspace.resolve.return_value = resolved_img
-        workspace.file_exists.return_value = True
-        workspace.read_file.return_value = "def foo(): pass\n"
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
         repl = _make_repl(workspace=workspace)
         result = repl._preprocess_at_references("code @src.py image @shot.png")
         assert isinstance(result, list)
@@ -799,10 +888,12 @@ class TestREPLAtReferencesImages:
 
     def test_interleaved_ordering_preserved(self):
         """text @img text @img should produce text→image→text→image blocks."""
+        png = self._valid_png()
+        (self._root / "a.png").write_bytes(png)
+        (self._root / "b.png").write_bytes(png)
         workspace = MagicMock()
-        resolved_img = MagicMock()
-        resolved_img.read_bytes.return_value = self._valid_png()
-        workspace.resolve.return_value = resolved_img
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
         repl = _make_repl(workspace=workspace)
         result = repl._preprocess_at_references("before @a.png middle @b.png after")
         assert isinstance(result, list)
@@ -821,15 +912,13 @@ class TestREPLAtReferencesImages:
 
         from PIL import Image as _PILImage
 
-        # Create a 100×100 PNG in memory
         buf = _io.BytesIO()
         _PILImage.new("RGB", (100, 100)).save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        (self._root / "large.png").write_bytes(buf.getvalue())
 
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = img_bytes
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
         display = MagicMock()
 
         config = MagicMock()
@@ -847,8 +936,7 @@ class TestREPLAtReferencesImages:
             config=config,
         )
         result = repl._preprocess_at_references("@large.png")
-        assert isinstance(result, str)
-        assert "@large.png" in result
+        assert result is None
         display.show_error.assert_called_once()
 
     def test_image_within_size_limit_accepted(self):
@@ -859,29 +947,27 @@ class TestREPLAtReferencesImages:
 
         buf = _io.BytesIO()
         _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        (self._root / "small.png").write_bytes(buf.getvalue())
 
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = img_bytes
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
 
         repl = _make_repl(workspace=workspace)
         result = repl._preprocess_at_references("@small.png")
         assert isinstance(result, list)
         assert any(b.get("type") == "image_url" for b in result)
 
-    def test_image_corrupt_leaves_token_and_shows_error(self):
-        """Pillow decode failure is a user-facing error, not a silent warning."""
+    def test_image_corrupt_aborts(self):
+        """Pillow decode failure aborts the send."""
+        (self._root / "corrupt.png").write_bytes(b"not an image")
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = b"not an image"
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
         display = MagicMock()
         repl = _make_repl(workspace=workspace, display=display)
         result = repl._preprocess_at_references("@corrupt.png")
-        assert isinstance(result, str)
-        assert "@corrupt.png" in result
+        assert result is None
         display.show_error.assert_called_once()
 
     def test_max_pixels_zero_falls_back_to_default(self):
@@ -892,12 +978,11 @@ class TestREPLAtReferencesImages:
 
         buf = _io.BytesIO()
         _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        (self._root / "small.png").write_bytes(buf.getvalue())
 
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = img_bytes
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
 
         config = MagicMock()
         config.get.side_effect = lambda key, default=None: (
@@ -925,12 +1010,11 @@ class TestREPLAtReferencesImages:
 
         buf = _io.BytesIO()
         _PILImage.new("RGB", (10, 10)).save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        (self._root / "small.png").write_bytes(buf.getvalue())
 
         workspace = MagicMock()
-        resolved = MagicMock()
-        resolved.read_bytes.return_value = img_bytes
-        workspace.resolve.return_value = resolved
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
 
         config = MagicMock()
         config.get.side_effect = lambda key, default=None: (
@@ -981,6 +1065,20 @@ class TestREPLAtReferencesImages:
         call_arg = session.add_raw_message.call_args[0][0]
         assert call_arg["role"] == "user"
         assert isinstance(call_arg["content"], list)
+
+    def test_handle_input_aborts_send_on_image_error(self):
+        """_handle_input does not call _send_to_llm when an @ reference fails."""
+        # No file written — image read will fail.
+        workspace = MagicMock()
+        workspace.root = self._root
+        workspace.is_ignored.return_value = False
+        session = MagicMock()
+        display = MagicMock()
+        repl = _make_repl(workspace=workspace, session=session, display=display)
+        repl._handle_input("See @missing.png")
+        session.add_message.assert_not_called()
+        session.add_raw_message.assert_not_called()
+        display.show_error.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
