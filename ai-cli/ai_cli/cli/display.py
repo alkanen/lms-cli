@@ -14,7 +14,7 @@ import logging
 import pydoc
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.segment import Segment
+from rich.spinner import Spinner
 from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
@@ -519,6 +520,30 @@ class _LeftBorderRenderable:
 
 
 # ---------------------------------------------------------------------------
+# _LiveRenderable
+# ---------------------------------------------------------------------------
+
+
+class _LiveRenderable:
+    """Renderable that re-evaluates its content on every Rich Live refresh.
+
+    Rather than capturing a static snapshot at the moment a chunk arrives,
+    this wrapper calls *build_fn* inside ``__rich_console__``.  Because Rich's
+    ``Live`` calls ``__rich_console__`` on its renderable for every periodic
+    refresh tick (``refresh_per_second``), the toolbar timer and spinner
+    advance smoothly even during long pauses between streaming chunks.
+    """
+
+    def __init__(self, build_fn: Callable[[], RenderableType]) -> None:
+        self._build_fn = build_fn
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> Generator[Segment, None, None]:
+        yield from console.render(self._build_fn(), options)
+
+
+# ---------------------------------------------------------------------------
 # RichDisplay
 # ---------------------------------------------------------------------------
 
@@ -543,6 +568,7 @@ class RichDisplay(Display):
         self._live: Live | None = None
         self._text_acc: str = ""
         self._reasoning_acc: str = ""
+        self._thinking_spinner: Spinner | None = None
         # Timing
         self._turn_start_time: datetime | None = None
         self._last_turn_duration: float | None = None
@@ -594,29 +620,46 @@ class RichDisplay(Display):
         self._text_acc = ""
         self._reasoning_acc = ""
         self._turn_start_time = datetime.now()
+        self._thinking_spinner = Spinner("dots", " Thinking…")
         self._console.print(Rule("Assistant", style="bold cyan", align="left"))
         if self._live is not None:
             self._live.stop()
-        self._live = Live(transient=True, console=self._console, refresh_per_second=10)
+        # _LiveRenderable re-evaluates _build_live_renderable() on every tick
+        # so the toolbar timer advances even between streaming chunks.
+        self._live = Live(
+            _LiveRenderable(self._build_live_renderable),
+            transient=True,
+            console=self._console,
+            refresh_per_second=10,
+        )
         self._live.start()
 
     def stream_text(self, delta: str) -> None:
         self._text_acc += delta
-        if self._live is not None:
-            self._live.update(self._build_live_renderable())
 
     def stream_reasoning(self, delta: str) -> None:
         self._reasoning_acc += delta
-        if self._live is not None:
-            self._live.update(self._build_live_renderable())
 
     def _build_live_renderable(self) -> RenderableType:
         parts: list[RenderableType] = []
-        if self._reasoning_acc:
-            preview = self._reasoning_acc[-200:]
-            parts.append(Text(f"⟨thinking…⟩ {preview}", style="dim italic"))
-        if self._text_acc:
-            parts.append(Text(self._text_acc))
+
+        # Show context bar + elapsed timer above the streaming text so the
+        # user can see how long the model has been thinking.
+        toolbar = self._build_toolbar()
+        if toolbar:
+            parts.append(Text(toolbar, style="dim"))
+
+        if not self._text_acc and not self._reasoning_acc:
+            # Waiting for the first token — show an animated spinner.
+            if self._thinking_spinner is not None:
+                parts.append(self._thinking_spinner)
+        else:
+            if self._reasoning_acc:
+                preview = self._reasoning_acc[-200:]
+                parts.append(Text(f"⟨thinking…⟩ {preview}", style="dim italic"))
+            if self._text_acc:
+                parts.append(Text(self._text_acc))
+
         if not parts:
             return Text("")
         return Group(*parts)

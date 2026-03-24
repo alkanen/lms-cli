@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ai_cli.cli.completer import REPLCompleter
-from ai_cli.cli.repl import _DEFAULT_MAX_TOOL_ROUNDS, _SLASH_COMMANDS, REPL
+from ai_cli.cli.repl import (
+    _DEFAULT_MAX_TOOL_ROUNDS,
+    _SLASH_COMMANDS,
+    REPL,
+    _build_keyboard_shortcuts,
+)
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
 
@@ -141,7 +146,11 @@ class TestREPLRun:
         repl = _make_repl(display=display)
         pt = _make_prompt_session("/help")
         repl.run(_prompt_session=pt)
-        display.show_help.assert_called_once_with(_SLASH_COMMANDS)
+        display.show_help.assert_called_once_with(
+            _SLASH_COMMANDS
+            + [("", "")]
+            + _build_keyboard_shortcuts(enable_suspend=True)
+        )
 
     def test_plain_input_sent_to_llm(self):
         llm = _make_llm()
@@ -202,6 +211,146 @@ class TestREPLRun:
         _, kwargs = mock_cls.call_args
         assert kwargs.get("complete_while_typing") is False
 
+    def test_enable_suspend_default_true(self, tmp_path):
+        """enable_suspend defaults to True when not in config."""
+        repl = _make_repl()
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert kwargs.get("enable_suspend") is True
+
+    def test_enable_suspend_disabled_via_config(self, tmp_path):
+        """repl_behavior.enable_suspend: false is passed to PromptSession."""
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"enable_suspend": False} if key == "repl_behavior" else default
+        )
+        repl = _make_repl()
+        repl._config = config
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert kwargs.get("enable_suspend") is False
+
+    def test_key_bindings_injected(self, tmp_path):
+        """A KeyBindings object is always passed to PromptSession."""
+        from prompt_toolkit.key_binding import KeyBindings
+
+        repl = _make_repl()
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        assert isinstance(kwargs.get("key_bindings"), KeyBindings)
+
+    def test_completion_max_results_passed_to_completer(self, tmp_path):
+        """repl_behavior.completion_max_results is forwarded to REPLCompleter."""
+        from ai_cli.cli.completer import REPLCompleter
+
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"completion_max_results": 42} if key == "repl_behavior" else default
+        )
+        repl = _make_repl()
+        repl._config = config
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        completer = kwargs.get("completer")
+        assert isinstance(completer, REPLCompleter)
+        assert completer._max_path_completions == 42
+
+    def test_completion_max_results_bad_value_uses_default(self, tmp_path):
+        """An invalid completion_max_results falls back to the default."""
+        from ai_cli.cli.completer import DEFAULT_MAX_PATH_COMPLETIONS, REPLCompleter
+
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"completion_max_results": "bad"} if key == "repl_behavior" else default
+        )
+        repl = _make_repl()
+        repl._config = config
+        mock_pt = MagicMock()
+        mock_pt.prompt.side_effect = EOFError()
+        with (
+            patch("ai_cli.cli.repl.PromptSession", return_value=mock_pt) as mock_cls,
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path),
+        ):
+            repl.run()
+        _, kwargs = mock_cls.call_args
+        completer = kwargs.get("completer")
+        assert isinstance(completer, REPLCompleter)
+        assert completer._max_path_completions == DEFAULT_MAX_PATH_COMPLETIONS
+
+    def test_keyboard_interrupt_shows_hint(self):
+        """Ctrl+C at the prompt shows a hint rather than silently re-prompting."""
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        pt = _make_prompt_session(KeyboardInterrupt())
+        repl.run(_prompt_session=pt)
+        display.show_status.assert_called_once()
+        msg = display.show_status.call_args[0][0]
+        assert "/exit" in msg or "Ctrl+D" in msg
+
+    def test_abort_during_streaming_shows_aborted(self):
+        """If abort is signalled mid-stream, 'Aborted.' is shown."""
+        import threading
+
+        abort_event = threading.Event()
+
+        # Chunk iterator that sets the abort event mid-stream.
+        def _chunks():
+            yield {"type": "text", "delta": "Hello"}
+            abort_event.set()
+            yield {"type": "text", "delta": " world"}
+            yield {"type": "done", "stop_reason": "stop", "usage": {}}
+
+        llm = MagicMock()
+        llm.send.return_value = _chunks()
+        session = MagicMock()
+        session.get_messages.return_value = []
+        session.should_compact.return_value = False
+        display = MagicMock()
+        repl = _make_repl(session=session, llm=llm, display=display)
+
+        # Patch _AbortMonitor so the abort_event we control is used.
+        with patch("ai_cli.cli.repl._AbortMonitor") as MockMonitor:
+            instance = MockMonitor.return_value
+            instance.start.side_effect = lambda: abort_event.clear()  # no-op start
+
+            # Inject abort_event by overriding _send_rounds to use our event.
+            original_send_rounds = repl._send_rounds
+
+            def _patched_send_rounds(user_input, abort):
+                # Replace the abort event with our controlled one.
+                return original_send_rounds(user_input, abort_event)
+
+            repl._send_rounds = _patched_send_rounds
+            repl._send_to_llm("Hello")
+
+        # "Aborted." should have been shown.
+        status_calls = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("Aborted" in s for s in status_calls)
+
 
 # ---------------------------------------------------------------------------
 # REPL._handle_slash_command()
@@ -212,8 +361,38 @@ class TestREPLSlashCommands:
     def test_help(self):
         display = MagicMock()
         repl = _make_repl(display=display)
-        repl._handle_slash_command("help")
-        display.show_help.assert_called_once_with(_SLASH_COMMANDS)
+        with (
+            patch("ai_cli.cli.repl._HAS_TTY", True),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = True
+            repl._handle_slash_command("help")
+            expected = (
+                _SLASH_COMMANDS
+                + [("", "")]
+                + _build_keyboard_shortcuts(enable_suspend=True)
+            )
+        display.show_help.assert_called_once_with(expected)
+
+    def test_help_omits_ctrl_z_when_suspend_disabled(self):
+        """Ctrl+Z is not listed even when platform supports it, if disabled in config."""
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"enable_suspend": False} if key == "repl_behavior" else default
+        )
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._config = config
+        # Patch both TTY guards to True so the only reason Ctrl+Z is absent is the
+        # config flag — not an accident of the test environment.
+        with (
+            patch("ai_cli.cli.repl._HAS_TTY", True),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = True
+            repl._handle_slash_command("help")
+        displayed = display.show_help.call_args[0][0]
+        assert not any("Ctrl+Z" in cmd for cmd, _ in displayed)
 
     def test_exit_raises_system_exit(self):
         repl = _make_repl()

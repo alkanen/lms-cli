@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 from prompt_toolkit.document import Document
 
-from ai_cli.cli.completer import _MAX_PATH_COMPLETIONS, REPLCompleter
+from ai_cli.cli.completer import DEFAULT_MAX_PATH_COMPLETIONS, REPLCompleter
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -307,11 +307,37 @@ class TestAtPathCompletion:
         assert completions[0].start_position == -len("al")
 
     def test_completions_capped_at_max(self, tmp_path):
-        for i in range(_MAX_PATH_COMPLETIONS + 10):
+        for i in range(DEFAULT_MAX_PATH_COMPLETIONS + 10):
             (tmp_path / f"file{i:04d}.txt").touch()
         c = _completer(workspace=_make_workspace(tmp_path))
         result = _completions(c, "@")
-        assert len(result) == _MAX_PATH_COMPLETIONS
+        assert len(result) == DEFAULT_MAX_PATH_COMPLETIONS
+
+    def test_custom_max_path_completions(self, tmp_path):
+        """max_path_completions constructor arg overrides the default cap."""
+        for i in range(20):
+            (tmp_path / f"file{i:02d}.txt").touch()
+        c = REPLCompleter(
+            slash_commands=[],
+            workspace=_make_workspace(tmp_path),
+            max_path_completions=5,
+        )
+        result = _completions(c, "@")
+        assert len(result) == 5
+
+    def test_max_path_completions_zero_raises(self):
+        """max_path_completions=0 raises ValueError."""
+        import pytest
+
+        with pytest.raises(ValueError, match="max_path_completions"):
+            REPLCompleter(slash_commands=[], max_path_completions=0)
+
+    def test_max_path_completions_negative_raises(self):
+        """max_path_completions < 0 raises ValueError."""
+        import pytest
+
+        with pytest.raises(ValueError, match="max_path_completions"):
+            REPLCompleter(slash_commands=[], max_path_completions=-1)
 
     def test_nonexistent_subdir_returns_nothing(self, tmp_path):
         c = _completer(workspace=_make_workspace(tmp_path))
