@@ -23,11 +23,12 @@ chunk is always the last item yielded.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
@@ -130,7 +131,7 @@ class LLMClient(ABC):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
-    ) -> Iterator[dict]:
+    ) -> Generator[dict, None, None]:
         """
         Send a conversation turn and yield Chunk dicts.
 
@@ -210,7 +211,7 @@ class OpenAIClient(LLMClient):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
-    ) -> Iterator[dict]:
+    ) -> Generator[dict, None, None]:
         """Stream one conversation turn, retrying on rate-limit errors."""
         for attempt in range(self._MAX_RETRIES):
             try:
@@ -273,7 +274,7 @@ class OpenAIClient(LLMClient):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
-    ) -> Iterator[dict]:
+    ) -> Generator[dict, None, None]:
         """Single attempt — not responsible for retries."""
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -307,55 +308,61 @@ class OpenAIClient(LLMClient):
             _ThinkTagParser() if self._extract_think_tags else None
         )
 
-        for chunk in response:
-            # Usage arrives in the final chunk when include_usage=True.
-            if chunk.usage is not None:
-                usage = {
-                    "prompt_tokens": chunk.usage.prompt_tokens,
-                    "completion_tokens": chunk.usage.completion_tokens,
-                    "total_tokens": chunk.usage.total_tokens,
-                }
+        try:
+            for chunk in response:
+                # Usage arrives in the final chunk when include_usage=True.
+                if chunk.usage is not None:
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
+                    }
 
-            if not chunk.choices:
-                continue
+                if not chunk.choices:
+                    continue
 
-            choice = chunk.choices[0]
+                choice = chunk.choices[0]
 
-            if choice.finish_reason:
-                stop_reason = choice.finish_reason
+                if choice.finish_reason:
+                    stop_reason = choice.finish_reason
 
-            delta = choice.delta
+                delta = choice.delta
 
-            # Yield reasoning_content first so it always precedes text chunks
-            # from the same delta (OpenAI o1/o3 and compatible models).
-            reasoning = getattr(delta, "reasoning_content", None)
-            if isinstance(reasoning, str) and reasoning:
-                yield {"type": "reasoning", "delta": reasoning}
+                # Yield reasoning_content first so it always precedes text chunks
+                # from the same delta (OpenAI o1/o3 and compatible models).
+                reasoning = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning, str) and reasoning:
+                    yield {"type": "reasoning", "delta": reasoning}
 
-            # Yield text content (or split via think-tag parser).
-            if delta.content:
-                if parser is not None:
-                    yield from parser.feed(delta.content)
-                else:
-                    yield {"type": "text", "delta": delta.content}
+                # Yield text content (or split via think-tag parser).
+                if delta.content:
+                    if parser is not None:
+                        yield from parser.feed(delta.content)
+                    else:
+                        yield {"type": "text", "delta": delta.content}
 
-            # Accumulate tool-call argument deltas.
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    if tc.index not in tool_call_bufs:
-                        tool_call_bufs[tc.index] = {
-                            "id": "",
-                            "name": "",
-                            "arguments_buf": "",
-                        }
-                    buf = tool_call_bufs[tc.index]
-                    if tc.id and not buf["id"]:
-                        buf["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name and not buf["name"]:
-                            buf["name"] = tc.function.name
-                        if tc.function.arguments:
-                            buf["arguments_buf"] += tc.function.arguments
+                # Accumulate tool-call argument deltas.
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.index not in tool_call_bufs:
+                            tool_call_bufs[tc.index] = {
+                                "id": "",
+                                "name": "",
+                                "arguments_buf": "",
+                            }
+                        buf = tool_call_bufs[tc.index]
+                        if tc.id and not buf["id"]:
+                            buf["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name and not buf["name"]:
+                                buf["name"] = tc.function.name
+                            if tc.function.arguments:
+                                buf["arguments_buf"] += tc.function.arguments
+        finally:
+            # Release the underlying HTTP connection when the caller stops
+            # iterating early (e.g. user abort via generator.close()).
+            with contextlib.suppress(Exception):
+                response.close()
 
         # Flush any content held back by the think-tag parser.
         if parser is not None:

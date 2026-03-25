@@ -13,19 +13,38 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
+import select
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
 from PIL import Image as _PILImage
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal as _pt_run_in_terminal
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 
-from ai_cli.cli.completer import REPLCompleter
+from ai_cli.cli.completer import DEFAULT_MAX_PATH_COMPLETIONS, REPLCompleter
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
+
+try:
+    import termios
+    import tty as _tty
+
+    _HAS_TTY = True
+except ImportError:  # Windows
+    _HAS_TTY = False
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
@@ -89,11 +108,162 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ),
 ]
 
+
+def _build_keyboard_shortcuts(*, enable_suspend: bool) -> list[tuple[str, str]]:
+    """Return the keyboard-shortcut rows for ``/help``.
+
+    Ctrl+Z is only listed when process suspension is both supported on this
+    platform (Unix/tty required) and enabled in config.
+    """
+    shortcuts: list[tuple[str, str]] = [
+        ("Ctrl+C / Esc", "Abort the current response"),
+    ]
+    if enable_suspend and _HAS_TTY and sys.stdin.isatty():
+        shortcuts.append(("Ctrl+Z", "Suspend to background"))
+    shortcuts += [
+        ("Ctrl+L", "Clear the screen"),
+        ("Ctrl+G", "Open current input in $EDITOR"),
+    ]
+    return shortcuts
+
+
 # Unique top-level command names (no leading "/", no arguments) derived from
 # _SLASH_COMMANDS.  Used to populate the tab completer.
 _SLASH_COMMAND_NAMES: list[str] = list(
     dict.fromkeys(cmd.lstrip("/").split()[0] for cmd, _ in _SLASH_COMMANDS)
 )
+
+
+class _AbortMonitor:
+    """Background thread that signals an event on ESC or Ctrl+C.
+
+    Puts stdin into cbreak mode (individual keypresses without Enter) using a
+    50 ms ``select`` timeout so the ``_stop`` flag is polled quickly without
+    burning CPU.  Terminal settings are always restored in ``finally``.
+
+    Only active on Unix when stdin is a real tty.  The monitor is no-op on
+    Windows or when stdin is a pipe (e.g. during tests).
+    """
+
+    def __init__(self, abort_event: threading.Event) -> None:
+        self._abort_event = abort_event
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the background watcher thread."""
+        self._stop.clear()
+        if _HAS_TTY and sys.stdin.isatty():
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the watcher to stop and wait briefly for it to exit.
+
+        Joining with a short timeout ensures the terminal settings are
+        restored before the caller returns to the next PromptSession prompt.
+        Without this, the monitor's ``finally`` block could run after
+        prompt_toolkit has already set up its own terminal mode and silently
+        clobber it.
+        """
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.1)
+
+    def _run(self) -> None:
+        fd = sys.stdin.fileno()
+        try:
+            old = termios.tcgetattr(fd)
+        except termios.error:
+            return
+        try:
+            _tty.setcbreak(fd)
+            while not self._stop.is_set():
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.05)
+                except (InterruptedError, OSError):
+                    break
+                if ready:
+                    ch = os.read(fd, 1)
+                    if ch == b"\x03":  # Ctrl+C — always abort immediately.
+                        self._abort_event.set()
+                        return
+                    if ch == b"\x1b":
+                        # ESC may be a lone keypress (intended abort) or the
+                        # start of an escape sequence (e.g. arrow keys send
+                        # ESC [ A).  Peek briefly: if more bytes arrive within
+                        # 20 ms it's a sequence — consume them and continue
+                        # watching.  If nothing follows, treat it as a lone
+                        # ESC and abort.
+                        try:
+                            seq_ready, _, _ = select.select([fd], [], [], 0.02)
+                        except (InterruptedError, OSError):
+                            seq_ready = []
+                        if not seq_ready:
+                            self._abort_event.set()
+                            return
+                        # Drain up to 8 bytes of the escape sequence.
+                        with contextlib.suppress(OSError):
+                            os.read(fd, 8)
+                        continue
+                    # Any other byte is consumed and lost.  This is an
+                    # inherent limitation of raw-reading stdin: there is no
+                    # portable POSIX way to "push back" bytes to the terminal
+                    # input queue (TIOCSTI is deprecated in Linux ≥ 6.2).
+                    # In practice users rarely type during LLM streaming, so
+                    # the impact is minor.
+        finally:
+            with contextlib.suppress(termios.error):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _make_key_bindings() -> KeyBindings:
+    """Return prompt_toolkit key bindings added to every REPL PromptSession.
+
+    Ctrl+L — clear the terminal screen.
+    Ctrl+G — open the current prompt buffer in ``$VISUAL`` / ``$EDITOR``.
+    """
+    kb = KeyBindings()
+
+    @kb.add("c-l")
+    def _clear_screen(event: KeyPressEvent) -> None:
+        event.app.renderer.clear()
+
+    @kb.add("c-g")
+    def _open_editor(event: KeyPressEvent) -> None:
+        buf = event.app.current_buffer
+        current_text = buf.text
+        editor_str = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        try:
+            editor_parts = shlex.split(editor_str)
+        except ValueError:
+            editor_parts = [editor_str]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(current_text)
+            fname = f.name
+
+        def _run_editor() -> None:
+            try:
+                subprocess.call([*editor_parts, fname])
+                with open(fname, encoding="utf-8") as fh:
+                    new_text = fh.read()
+                # Strip the trailing newline editors typically append.
+                if new_text.endswith("\n"):
+                    new_text = new_text[:-1]
+                buf.set_document(Document(new_text, len(new_text)))
+            except OSError as exc:
+                print(f"Could not open editor: {exc}", file=sys.stderr)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(fname)
+
+        _pt_run_in_terminal(_run_editor)
+
+    return kb
 
 
 class REPL:
@@ -182,19 +352,35 @@ class REPL:
             history_path = get_global_dir() / "history"
             history_path.parent.mkdir(parents=True, exist_ok=True)
             repl_cfg = self._config.get("repl_behavior", {}) if self._config else {}
-            cwt = (
-                bool(repl_cfg.get("complete_while_typing", False))
-                if isinstance(repl_cfg, dict)
-                else False
+            repl_cfg = repl_cfg if isinstance(repl_cfg, dict) else {}
+            cwt = bool(repl_cfg.get("complete_while_typing", False))
+            suspend = bool(repl_cfg.get("enable_suspend", True))
+            raw_max = repl_cfg.get(
+                "completion_max_results", DEFAULT_MAX_PATH_COMPLETIONS
             )
+            try:
+                max_completions = int(raw_max)
+                if max_completions < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid repl_behavior.completion_max_results value %r; "
+                    "using default %d.",
+                    raw_max,
+                    DEFAULT_MAX_PATH_COMPLETIONS,
+                )
+                max_completions = DEFAULT_MAX_PATH_COMPLETIONS
             _prompt_session = PromptSession(
                 history=FileHistory(str(history_path)),
                 completer=REPLCompleter(
                     slash_commands=_SLASH_COMMAND_NAMES,
                     tool_registry=self._tool_registry,
                     workspace=self._workspace,
+                    max_path_completions=max_completions,
                 ),
                 complete_while_typing=cwt,
+                enable_suspend=suspend,
+                key_bindings=_make_key_bindings(),
                 **self._display.prompt_session_kwargs(),
             )
 
@@ -202,6 +388,9 @@ class REPL:
             try:
                 raw = _prompt_session.prompt("> ")
             except KeyboardInterrupt:
+                self._display.show_status(
+                    "Interrupted. Type /exit or press Ctrl+D to quit."
+                )
                 continue
             except EOFError:
                 break
@@ -229,7 +418,14 @@ class REPL:
         cmd = command.split()[0].lower() if command.strip() else ""
 
         if cmd == "help":
-            self._display.show_help(_SLASH_COMMANDS)
+            repl_cfg = self._config.get("repl_behavior", {}) if self._config else {}
+            repl_cfg = repl_cfg if isinstance(repl_cfg, dict) else {}
+            suspend = bool(repl_cfg.get("enable_suspend", True))
+            self._display.show_help(
+                _SLASH_COMMANDS
+                + [("", "")]
+                + _build_keyboard_shortcuts(enable_suspend=suspend)
+            )
 
         elif cmd == "exit":
             raise SystemExit(0)
@@ -679,7 +875,28 @@ class REPL:
             self._display.show_error(f"Could not save message: {exc}")
             return
 
+        # Single abort event for the entire multi-round exchange.  The
+        # _AbortMonitor background thread sets it on ESC or Ctrl+C; the main
+        # thread sets it on KeyboardInterrupt.
+        abort = threading.Event()
+        monitor = _AbortMonitor(abort)
+        monitor.start()
+
+        try:
+            self._send_rounds(user_input, abort)
+        finally:
+            monitor.stop()
+
+    def _send_rounds(
+        self, user_input: str | list[dict], abort: threading.Event
+    ) -> None:
+        """Inner loop that drives multi-round tool calls.  Separated so that
+        the abort monitor's ``try/finally`` in ``_send_to_llm`` stays clean."""
         for _ in range(self._max_tool_rounds):
+            if abort.is_set():
+                self._display.show_status("Aborted.")
+                return
+
             tool_calls: list[dict] = []
             text_parts: list[str] = []
 
@@ -695,6 +912,7 @@ class REPL:
             self._pending_transients.clear()
 
             self._display.begin_assistant_turn()
+            stream = None
             try:
                 # Build the tools list, de-duplicating by name so that a
                 # transient schema for an already-enabled tool doesn't appear
@@ -712,10 +930,19 @@ class REPL:
                             "Skipping tool schema with missing name: %r", defn
                         )
                 tools_by_name.update(active_transients)
-                for chunk in self._llm.send(
+                stream = self._llm.send(
                     messages,
                     tools=list(tools_by_name.values()),
-                ):
+                )
+                for chunk in stream:
+                    # NOTE: abort is only checked *between* chunks.  If the
+                    # iterator is blocked waiting for the server (e.g. no
+                    # tokens have arrived yet), ESC/Ctrl+C won't interrupt
+                    # the blocking read until the next chunk arrives.  A
+                    # complete fix requires running the stream in a worker
+                    # thread or plumbing a cancel token into LLMClient.send().
+                    if abort.is_set():
+                        break
                     if chunk["type"] == "text":
                         self._display.stream_text(chunk["delta"])
                         text_parts.append(chunk["delta"])
@@ -732,11 +959,22 @@ class REPL:
                             "context_window", 0
                         )
                         self._display.update_usage(usage, context_window)
+            except KeyboardInterrupt:
+                abort.set()
             except LLMError as exc:
-                self._display.end_assistant_turn()
                 self._display.show_error(f"LLM error: {exc}")
                 return
-            self._display.end_assistant_turn()
+            finally:
+                # Explicitly close the stream so the underlying HTTP connection
+                # is released immediately rather than waiting for GC.
+                if stream is not None:
+                    with contextlib.suppress(Exception):
+                        stream.close()
+                self._display.end_assistant_turn()
+
+            if abort.is_set():
+                self._display.show_status("Aborted.")
+                return
 
             full_text = "".join(text_parts)
 
@@ -774,6 +1012,9 @@ class REPL:
                 break
 
             for call in tool_calls:
+                if abort.is_set():
+                    self._display.show_status("Aborted.")
+                    return
                 self._display.show_tool_call(call["name"], call["arguments"])
                 # Transiently-enabled tools must bypass the registry's enabled
                 # check — they were injected into the LLM's tools list for this

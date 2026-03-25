@@ -33,8 +33,9 @@ _TOOLS_NAME_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable", "info
 _TOOLS_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
 _SESSION_SUBCOMMANDS = ["name"]
 
-# Cap on file-path completions to keep the UI responsive.
-_MAX_PATH_COMPLETIONS = 200
+# Default cap on file-path completions to keep the UI responsive.
+# Overridable via ``repl_behavior.completion_max_results`` in config.
+DEFAULT_MAX_PATH_COMPLETIONS = 200
 
 
 class REPLCompleter(Completer):
@@ -51,6 +52,9 @@ class REPLCompleter(Completer):
     workspace:
         Workspace used to resolve and filter file-path completions for
         ``@path`` references.
+    max_path_completions:
+        Maximum number of ``@path`` completions returned per keystroke.
+        Defaults to :data:`DEFAULT_MAX_PATH_COMPLETIONS`.
     """
 
     def __init__(
@@ -58,10 +62,16 @@ class REPLCompleter(Completer):
         slash_commands: list[str],
         tool_registry: ToolRegistry | None = None,
         workspace: Workspace | None = None,
+        max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
+        if max_path_completions < 1:
+            raise ValueError(
+                f"max_path_completions must be >= 1, got {max_path_completions}"
+            )
         self._slash_commands = sorted(slash_commands)
         self._tool_registry = tool_registry
         self._workspace = workspace
+        self._max_path_completions = max_path_completions
 
     # ------------------------------------------------------------------
     # Completer API
@@ -249,7 +259,7 @@ class REPLCompleter(Completer):
                         display=entry.name + suffix,
                     )
                     count += 1
-                    if count >= _MAX_PATH_COMPLETIONS:
+                    if count >= self._max_path_completions:
                         break
         except OSError:
             return
