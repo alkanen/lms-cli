@@ -60,28 +60,17 @@ include:
 
 **Severity:** Low (requires a manually edited or externally corrupted history file)
 
-**Status:** Deferred
+**Status:** ✅ Fixed — `get_messages()` now checks `role not in _VALID_ROLES` and skips
+the entry with a `logger.warning`, consistent with how other malformed entries are handled.
+Both `add_message()` and `add_raw_message()` also validate role on write.
 
-### Description
+### Description (historical)
 
-`get_messages()` validates that `role` and `content` are strings but does not
-check whether `role` is one of the values in `_VALID_ROLES` (`system`, `user`,
+`get_messages()` validated that `role` and `content` were strings but did not
+check whether `role` was one of the values in `_VALID_ROLES` (`system`, `user`,
 `assistant`, `tool`). A history file that was manually edited or written by an
-older version of the code could contain an unexpected role value. This would be
-returned to callers without warning and could cause `LLMClient.send()` to fail
-with an opaque API error during the next turn or during `compact()`.
-
-### Conditions required
-
-- The history file must contain an entry with an unrecognised `role` value.
-- This requires either manual editing of the file or an old/external writer.
-- Normal usage through `add_message()` prevents this (role is validated there).
-
-### Proposed mitigation
-
-In `get_messages()`, after confirming `role` is a string, also check
-`entry["role"] not in _VALID_ROLES` and skip the entry with a `logger.warning`
-if it fails, consistent with how other malformed entries are handled.
+older version of the code could contain an unexpected role value that would
+reach `LLMClient.send()` and cause an opaque API error.
 
 ---
 

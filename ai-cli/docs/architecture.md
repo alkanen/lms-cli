@@ -11,7 +11,7 @@ Legend: ✅ implemented and tested · 🔲 planned
 ```
 ai-cli/
 ├── ai_cli/                       # Python package root
-│   ├── __main__.py               # ✅ Entry point (python -m ai_cli) — --init support only
+│   ├── __main__.py               # ✅ Entry point — --init, --workspace, --resume, --continue
 │   ├── core/
 │   │   ├── config_manager.py     # ✅ Layered YAML config loading
 │   │   ├── workspace.py          # ✅ Workspace root resolution, file ops, ignore rules
@@ -24,15 +24,16 @@ ai-cli/
 │   │   ├── base.py               # ✅ Tool abstract base class
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
-│   │   └── tool_manager.py       # 🔲 Context-saving tool gatekeeper (deferred until after REPL)
-│   ├── cli/                      # ✅ (partial)
-│   │   ├── repl.py               # ✅ Main REPL loop, input handling, slash commands
-│   │   ├── completer.py          # 🔲 Tab completion + @ file picker
-│   │   └── display.py            # ✅ Display ABC + PlainDisplay; RichDisplay 🔲
+│   │   ├── find_files.py         # ✅ Glob-pattern file search with ignore-rule enforcement
+│   │   └── tool_manager.py       # ✅ Context-saving tool gatekeeper
+│   ├── cli/
+│   │   ├── repl.py               # ✅ Main REPL loop, slash commands, keyboard shortcuts, streaming abort
+│   │   ├── completer.py          # ✅ Tab completion for slash commands, tool names, @path references
+│   │   └── display.py            # ✅ Display ABC + PlainDisplay + RichDisplay
 │   └── utils/
 │       ├── ignore_filter.py      # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py      # 🔲 JSONL structured logging
-└── tests/                        # ✅ mirrors ai_cli/ structure
+└── tests/                        # ✅ mirrors ai_cli/ structure (865 tests)
 ```
 
 ---
@@ -326,10 +327,10 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 
 ---
 
-### Bundled Tools ✅ (partial)
+### Bundled Tools ✅
 
 #### `read_file`
-- `PERMISSION_REQUIRED = False`, enabled by default
+- `PERMISSION_REQUIRED = False`, `DISABLED_BY_DEFAULT = True` (enabled by `tool_manager` on demand)
 - Parameters: `path` (required), `start_line` (optional, 1-based), `end_line` (optional, 1-based)
 - Response data: `{content, path, start_line, end_line, lines_returned, total_lines}`
   - For an empty file: `start_line=0, end_line=0, lines_returned=0, total_lines=0`
@@ -339,7 +340,7 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 - `reset_session_state()` clears both allow-lists
 
 #### `write_file`
-- `PERMISSION_REQUIRED = True`, enabled by default
+- `PERMISSION_REQUIRED = True`, `DISABLED_BY_DEFAULT = True`
 - Parameters: `path` (required), `content` (required), `start_line` + `end_line` (both optional, must be provided together)
 - Full write (no line args): creates file and any missing parent directories
 - Partial write (file must exist): two modes:
@@ -350,9 +351,16 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 
 ---
 
-### ToolManager (bundled tool) 🔲
+### ToolManager (bundled tool) ✅
 
-Deferred until after the REPL is implemented. See `project_plan.md` for design.
+A context-saving gatekeeper that prevents the LLM from being overwhelmed by tool schemas. At startup most
+bundled tools are disabled; the LLM calls `tool_manager` to discover and transiently enable tools it needs.
+
+Actions:
+- **`list`** — returns each tool's name, one-line description, and `enabled` flag so the LLM can make informed requests without seeing full schemas.
+- **`enable`** — accepts a `tool_names` array; calls `ToolRegistry.enable_transient()` for each name; the REPL injects those schemas into the immediately following API call only (no persistent state change).
+
+This implements the **transient** enable mode (the weakest of three — see `project_plan.md` Key Features §3).
 
 ---
 
@@ -368,6 +376,10 @@ the model finishes loading. A configurable request timeout on `OpenAIClient` is
 ```python
 # Chunk variants yielded by LLMClient.send():
 #   {"type": "text",      "delta": str}          — streamed text token
+#   {"type": "reasoning", "delta": str}          — reasoning / thinking token
+#                                                   (from reasoning_content field on OpenAI o1/o3,
+#                                                    or from <think>…</think> tags when
+#                                                    extract_think_tags: true in config)
 #   {"type": "tool_call", "name": str,
 #    "call_id": str,      "arguments": dict}      — complete tool invocation
 #   {"type": "done",      "stop_reason": str,
@@ -382,10 +394,11 @@ class LLMClient(ABC):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
-    ) -> Iterator[dict]: ...
+    ) -> Generator[dict, None, None]: ...
     # Yields the same Chunk types regardless of stream=True/False.
     # stream=True (default): text deltas arrive immediately, tool calls assembled from deltas.
     # stream=False: entire response awaited first, same Chunk sequence produced.
+    # Returns Generator (not Iterator) so callers can call .close() to cancel mid-stream.
 
     @abstractmethod
     def get_model_metadata(self) -> dict:
@@ -513,35 +526,76 @@ class REPL:
         Main loop: read input → route → render.
         _prompt_session is injectable for testing (avoids real terminal/filesystem).
         Uses PromptSession with FileHistory at ~/.ai-cli/history by default.
+        Reads repl_behavior config for: complete_while_typing, enable_suspend,
+        completion_max_results.  Injects key bindings and display toolbar kwargs.
         """
 
     def _handle_input(self, raw: str) -> None:
         """Route to _handle_slash_command or _send_to_llm."""
 
     def _handle_slash_command(self, command: str) -> None:
-        """Dispatch /help, /exit, /clear, /verbose, /markdown, /tools, /compact, /session."""
+        """Dispatch /help, /exit, /clear, /verbose, /markdown, /tools,
+        /compact, /session, /history, /rounds."""
 
-    def _preprocess_at_references(self, text: str) -> str:
+    def _preprocess_at_references(self, text: str) -> str | list[dict]:
         """
         Replace @path and @!path tokens with file content wrapped in [file: path]...[/file].
         @path respects ignore rules; @!path bypasses them.
         On any error the token is left in place and an error is shown.
+        Returns list[dict] (content blocks) for image attachments; str otherwise.
         """
 
-    def _send_to_llm(self, user_input: str) -> None:
+    def _send_to_llm(self, user_input: str | list[dict]) -> None:
         """
-        Append user message, stream response, detect tool calls,
-        execute via tool_registry, feed results back, continue streaming.
-        Tool call depth capped at _MAX_TOOL_ROUNDS = 10.
+        Append user message, create abort event + _AbortMonitor, then delegate
+        to _send_rounds().  Monitor is always stopped in a finally block.
+        """
+
+    def _send_rounds(
+        self, user_input: str | list[dict], abort: threading.Event
+    ) -> None:
+        """
+        Inner loop that drives multi-round tool calls (capped at _MAX_TOOL_ROUNDS = 10).
+        Checks abort.is_set() at the start of each round and after each tool call.
+        Explicitly calls stream.close() in a finally block to release the HTTP connection.
         """
 
     def _check_compaction(self) -> None:
         """Called after each exchange. Auto-compact if should_compact()."""
+
+
+class _AbortMonitor:
+    """
+    Background thread that watches stdin for a lone ESC or Ctrl+C and sets a
+    threading.Event to signal the streaming loop to stop.
+
+    Uses tty.setcbreak + select.select for raw single-keypress detection.
+    ESC is disambiguated from arrow-key sequences with a 20 ms peek:
+    if more bytes follow within the window they are drained and iteration
+    continues; only a bare ESC (no following bytes) triggers abort.
+    Only started when _HAS_TTY is True and sys.stdin.isatty() is True.
+    """
+
+
+def _make_key_bindings() -> KeyBindings:
+    """
+    Return prompt_toolkit KeyBindings injected into every PromptSession.
+    Ctrl+L — clears the terminal screen.
+    Ctrl+G — opens the current prompt buffer in $VISUAL / $EDITOR
+             (shlex.split handles arguments; OSError prints to stderr).
+    """
+
+
+def _build_keyboard_shortcuts(*, enable_suspend: bool) -> list[tuple[str, str]]:
+    """
+    Return the keyboard-shortcut rows used by /help.
+    Ctrl+Z row is only included when enable_suspend=True AND _HAS_TTY AND isatty().
+    """
 ```
 
 ---
 
-### Display ✅ (PlainDisplay only; RichDisplay 🔲)
+### Display ✅ (PlainDisplay + RichDisplay)
 
 ```python
 class Display(ABC):
@@ -566,8 +620,11 @@ class Display(ABC):
     def show_tool_call(self, name: str, args: dict) -> None:
         """Summary mode: one line. Verbose: full JSON args."""
     @abstractmethod
-    def show_tool_result(self, name: str, result: dict) -> None:
-        """Summary mode: hidden. Verbose: full output."""
+    def show_tool_result(
+        self, name: str, result: dict, *, display_str: str | None = None
+    ) -> None:
+        """Summary mode: ✓/✗ one-liner. Verbose: Syntax JSON.
+        display_str, if provided, is always shown regardless of verbose mode."""
 
     # Informational
     @abstractmethod
@@ -602,10 +659,31 @@ class Display(ABC):
         """Render interactive resume picker, return chosen session or None."""
 
 
+    # Non-abstract with default {} — RichDisplay overrides to add toolbar kwargs:
+    def prompt_session_kwargs(self) -> dict: ...
+
+    def stream_reasoning(self, delta: str) -> None: ...          # no-op default
+    def update_usage(self, usage: dict, context_window: int) -> None: ...  # no-op default
+
+    @abstractmethod
+    def show_history(self, messages: list[dict]) -> None: ...
+
+
 def create_display(config: ConfigManager, *, verbose: bool = False) -> Display:
     """
     Factory: reads display_backend (default 'rich') and display_markdown from config.
     'plain' → PlainDisplay, 'rich' → RichDisplay. Unknown backends warn and fall back to PlainDisplay.
+    """
+
+
+class RichDisplay(Display):
+    """
+    Rich-based display using Live(transient=True) during streaming.
+    _LiveRenderable re-invokes its build function on every refresh tick so the
+    spinner and toolbar animate even when no LLM chunks are arriving.
+    _LeftBorderRenderable adds '│ ' to each rendered line without blank padding.
+    Console(highlight=False) prevents unintended auto-highlighting.
+    Bottom toolbar provided via prompt_session_kwargs() → {"bottom_toolbar": ..., "refresh_interval": 1}.
     """
 ```
 
@@ -648,52 +726,58 @@ MCP tools are wrapped in a thin `MCPTool(Tool)` subclass that forwards `execute(
 
 ---
 
-### Completer 🔲
+### REPLCompleter ✅
 
 ```python
-class Completer:
+DEFAULT_MAX_PATH_COMPLETIONS = 200
+
+class REPLCompleter(Completer):
+    """prompt_toolkit Completer for the ai-cli REPL."""
+
     def __init__(
         self,
-        workspace: Workspace,
-        tool_registry: ToolRegistry,
+        slash_commands: list[str],
+        tool_registry: ToolRegistry | None = None,
+        workspace: Workspace | None = None,
+        max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ): ...
+    # max_path_completions must be >= 1; raises ValueError otherwise.
 
-    def get_completions(self, document: Document) -> list[Completion]:
+    def get_completions(self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
         """
-        Called by prompt_toolkit on every keystroke.
-        Routes to appropriate completer based on context.
+        Dispatches to path completion when the cursor is after an @ token,
+        otherwise to slash-command completion when the line starts with /.
+        @-detection runs first so @/path does not trigger slash completion.
         """
 
-    def _complete_slash_command(self, text: str) -> list[Completion]:
-        """Complete /help, /exit, /tools etc."""
+    # Slash command routing:
+    # /tools  → subcommands (list/info/enable/disable/allow/disallow) + tool names + --session flag
+    # /session → 'name' subcommand
+    # /rounds  → --session flag only (numeric arg is free-form)
+    # All other commands: prefix-match against slash_commands list (case-insensitive)
 
-    def _complete_file_path(self, text: str) -> list[Completion]:
-        """Standard tab completion for file paths."""
-
-    def _complete_at_picker(
-        self,
-        text: str,
-        explicit: bool,  # True if triggered by @!
-    ) -> list[Completion]:
-        """
-        Popup file picker. Filters via workspace.is_ignored()
-        unless explicit=True.
-        """
+    # @ path completion:
+    # Regex _AT_PARTIAL_RE matches an @ token at end of text before cursor.
+    # Group 1: '!' (bypass-ignore flag); Group 2: partial path.
+    # Supports workspace-relative, '../', and absolute '/' paths.
+    # Paths inside workspace root filtered via workspace.is_ignored() unless bypass=True.
+    # Paths outside workspace root are never filtered.
+    # Results capped at max_path_completions; directories get trailing '/'.
+    # OSError during scan skips the entry rather than crashing.
 ```
 
-Built on `prompt_toolkit`. Detects `@` / `@!` by inspecting the current word in the `Document`.
+Built on `prompt_toolkit`. The `@`-detection regex runs before slash-command detection so that `@/abs/path` is correctly treated as a file reference, not a slash command.
 
 ---
 
-## Entry Point and Startup Sequence 🔲
-
-Currently `__main__.py` only handles `--init`. The full startup sequence below is planned:
+## Entry Point and Startup Sequence ✅
 
 ```python
 # __main__.py
 def main():
     args = parse_args()
-    # args: --init, --workspace, --backend, --resume, --continue, --session-id
+    # args: --init, --workspace, --resume, --resume <id>, --continue
 
     # 1. Resolve workspace
     start = Path(args.workspace) if args.workspace else Path.cwd()
@@ -707,28 +791,28 @@ def main():
         root = prompt_init_or_exit(start)
 
     # 2. Bootstrap core objects
-    config = ConfigManager(root, cli_overrides_from(args))
+    config = ConfigManager(root, cli_overrides={})
     workspace = Workspace(root, config)
-    permission_manager = PermissionManager(prompt_fn=...)
+    display = create_display(config)
+    permission_manager = PermissionManager(prompt_fn=display.show_permission_prompt)
     tool_registry = ToolRegistry(workspace, config, permission_manager)
     llm_client = create_llm_client(config)
     session_manager = SessionManager(workspace, llm_client, SESSIONS_DIR)
-    mcp_manager = MCPManager(tool_registry, config)
 
-    # 3. Load tools and MCP servers
+    # 3. Load tools
     tool_registry.load()
-    mcp_manager.connect_all()
 
-    # 4. Resolve session
-    session = resolve_session(args, session_manager, workspace)
+    # 4. Resolve session (--resume / --resume <id> / --continue / new)
+    session = _pick_session(args, session_manager, workspace, display)
 
     # 5. Start REPL
-    display = create_display(config)
     repl = REPL(session, tool_registry, llm_client, display, workspace)
     repl.run()
-
-    # 6. Cleanup
-    mcp_manager.disconnect_all()
 ```
 
-`resolve_session()` handles `--resume` / `--resume <id>` / `--continue` / new session logic, including the last-message role check and permission reset.
+`_pick_session()` handles `--resume` (interactive picker via `display.show_session_list()`),
+`--resume <id>` (direct load), `--continue` (most recent or new), and bare start (new session).
+On resume, `permission_manager.reset()` and `tool_registry.reset_session_overrides()` are called
+to clear all session-scoped state.
+
+MCP support (`mcp_manager.connect_all()` / `disconnect_all()`) is 🔲 planned and will be inserted at step 3.

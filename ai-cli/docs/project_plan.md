@@ -112,13 +112,13 @@ ai-cli/
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
 │   │   └── tool_manager.py         # ✅ Context-saving tool gatekeeper
 │   ├── cli/                        # CLI interface and user-facing components
-│   │   ├── repl.py                 # ✅ REPL loop; slash commands ⚠️ (subset implemented — see Phase 3)
-│   │   ├── display.py              # ⚠️ Display ABC + PlainDisplay ✅; RichDisplay 🔲
-│   │   └── completer.py            # 🔲 Tab completion + interactive @ file picker
+│   │   ├── repl.py                 # ✅ REPL loop; all slash commands; keyboard shortcuts; streaming abort
+│   │   ├── display.py              # ✅ Display ABC + PlainDisplay + RichDisplay
+│   │   └── completer.py            # ✅ Tab completion for slash commands, tool names, and @path references
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # 🔲 JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (865 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -128,6 +128,12 @@ ai-cli/
 │   ├── test_read_file.py
 │   ├── test_write_file.py
 │   ├── test_find_files.py
+│   ├── test_tool_manager.py
+│   ├── test_llm_client.py
+│   ├── test_session_manager.py
+│   ├── test_repl.py
+│   ├── test_display.py
+│   ├── test_completer.py
 │   └── test_main.py
 └── docs/                           # Documentation
     ├── project_plan.md             # This file
@@ -209,7 +215,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - File tools (`read_file`, `write_file`) additionally manage session-scoped file/dir allow-lists at the tool level via `extra_permission_options()` / `on_permission_granted()` / `reset_session_state()`, which are cleared by `ToolRegistry.reset_session_overrides()`.
    - The universal four options (yes/no/always/custom) are always rendered by the prompt implementation. `PermissionManager` passes only tool-specific extras to `prompt_fn`; the prompt handles the universal set itself.
 
-3. **Bundled Tools** ⚠️ (partial)
+3. **Bundled Tools** ✅
    - `read_file` ✅ — workspace-scoped, no permission by default, disabled by default, session allow-list, line-range support.
    - `write_file` ✅ — workspace-scoped, permission required by default, disabled by default, session allow-list, full and partial writes.
    - `find_files` ✅ — glob-pattern search across the workspace, disabled by default. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
@@ -247,22 +253,26 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - `/history` command: call `display.show_history(session.get_messages())`.
      - After each tool execute, call `tool.format_display(args, result)` and pass result to `display.show_tool_result(..., display_str=...)`.  See `docs/design_display.md` — Tool call display.
 
-4. **Display** ⚠️ (partial)
+4. **Display** ✅
    - `Display` ABC with full interface defined.
    - `PlainDisplay` ✅ — `print()`-based output, `prompt_toolkit` for interactive prompts.
-   - `RichDisplay` 🔲 — design complete (see `docs/design_display.md`); currently falls back to `PlainDisplay`. Key design points:
+   - `RichDisplay` ✅ — fully implemented (see `docs/design_display.md`). Key design points:
      - Scrolling output model (no fixed TUI panels); TUI layout deferred as future `TUIDisplay`.
-     - `Live(transient=True)` during streaming → formatted Markdown on turn end.
+     - `_LeftBorderRenderable` helper: custom `__rich_console__` adds `│ ` prefix to each rendered line.
+     - `Live(transient=True)` with `_LiveRenderable` (re-calls build function on every refresh tick) during streaming → formatted Markdown on turn end.
+     - Animated `Spinner("dots", " Thinking…")` shown before first text/reasoning arrives.
      - Reasoning preview (dim, truncated) live during stream; full block in verbose mode only.
      - Turn separators: coloured `Rule` + left-bordered `Panel`; user=green, assistant=cyan, tool=yellow.
      - Bottom toolbar via `prompt_toolkit` `refresh_interval=1`: context bar + two elapsed timers + last status.
-     - Permission prompt: `prompt_toolkit.application.Application` with arrow-key navigation and hotkeys.
+     - Permission prompt: `prompt_toolkit` radio-list style prompt (arrow-key navigation with hotkeys is 🔲 planned).
      - `/history`: `Console.pager()` for screen/tmux-safe scrollable history view.
      - `tool.format_display(args, result) -> str | None` on Tool base class for ANSI-capable custom tool output.
-   - New ABC methods added (all non-abstract with defaults except `show_history`):
+     - `Console(highlight=False)` — no auto syntax highlighting in streamed text.
+   - ABC methods added (all non-abstract with defaults except `show_history`):
      - `stream_reasoning(delta)` — reasoning/thinking content; no-op default
      - `update_usage(usage, context_window)` — token counts for toolbar; no-op default
      - `show_history(messages)` — pageable history viewer; abstract
+     - `prompt_session_kwargs()` — concrete method returning `{}` by default; `RichDisplay` returns `{"bottom_toolbar": ..., "refresh_interval": 1}`
 
 5. **Remaining CLI completions** ✅ (all implemented and tested)
    - **`--resume` / `--resume <id>` / `--continue` CLI flags** ✅ in `__main__.py`.
@@ -272,9 +282,21 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - **allowed / disallowed** (hard gate): controls whether the tool is visible to the agent at all. A `disallowed` tool is not listed by `tool_manager` and cannot be transiently enabled — the agent has no way to know it exists. Only changeable via `/tools allow`/`disallow` or by editing config and restarting. `allow_transient=True` in `ToolRegistry.execute()` must respect this gate (i.e. must not execute a `disallowed` tool).
    - **`/compact [instructions]`** ✅ — instructions string forwarded to `session.compact()`.
    - **`/session name "<name>"`** ✅ — calls `session.set_name()`.
-   - **`completer.py`** 🔲 — tab completion for slash commands, tool names, and file paths. Interactive `@` popup/picker (vs. the current text-substitution approach). Image files shown in the `@` picker are attached as base64 content blocks rather than text.
+   - **`completer.py`** ✅ — tab completion for slash commands (with subcommand/flag completion), tool names, and `@path` / `@!path` file references. Completions are workspace-aware, respect ignore rules, cap at `repl_behavior.completion_max_results` (default 200). Interactive `@` popup/picker and image-file attachments are 🔲 planned.
 
-6. **Logging** 🔲
+6. **UX and keyboard improvements** ✅
+   - **Streaming abort** ✅ — `_AbortMonitor` background thread watches stdin for lone ESC or Ctrl+C and sets a `threading.Event`; the streaming loop checks it between chunks. Uses `tty.setcbreak` + `select.select` with a 20 ms ESC-disambiguation peek (to distinguish bare ESC from arrow-key sequences). Only active when `_HAS_TTY` and `sys.stdin.isatty()`.
+   - **Keyboard shortcuts** ✅ — injected via `prompt_toolkit.KeyBindings`:
+     - **Ctrl+C / ESC**: abort current LLM response (or abort tool execution mid-round).
+     - **Ctrl+Z**: suspend to background (Unix/TTY only; controlled by `repl_behavior.enable_suspend`, default `true`).
+     - **Ctrl+L**: clear the terminal screen.
+     - **Ctrl+G**: open the current prompt buffer in `$VISUAL` / `$EDITOR` (uses `shlex.split` to support arguments in the env var; catches `OSError` and prints to stderr if the editor is not found).
+   - **`repl_behavior` config section** ✅:
+     - `complete_while_typing` (default `false`) — enable prompt_toolkit auto-complete as you type.
+     - `enable_suspend` (default `true`) — include Ctrl+Z binding and show it in `/help`.
+     - `completion_max_results` (default `200`) — cap on `@path` tab completions per keystroke; must be ≥ 1.
+
+7. **Logging** 🔲
    - `logging_utils.py` — JSONL structured logging to session-specific folders.
 
 ### Phase 4: Advanced Features 🔲
@@ -329,10 +351,12 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **`RichDisplay`** — design complete; implement (see `docs/design_display.md`). Requires parallel work on LLMClient (`reasoning` chunk type + `<think>` tag parser) and REPL (`stream_reasoning`, `update_usage`, `/history`, `format_display` plumbing).
-2. **`completer.py`** — tab completion and interactive `@` file picker (image files shown as attachments).
-3. **`logging_utils.py`** — JSONL structured logging.
-4. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry`.
+1. **`logging_utils.py`** — JSONL structured logging to session-specific folders.
+2. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
+3. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
+4. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
+5. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
+6. **`/tools allow` REPL command** — calls `ToolRegistry.set_permission_required()`; writes `user_confirmed: true` to project config.
 
 ## Dependencies
 - Python 3.10+
