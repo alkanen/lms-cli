@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai_cli.__main__ import _RESUME_PICK, _pick_session
+from ai_cli.__main__ import _RESUME_PICK, _pick_session, _show_resume_context
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
@@ -250,11 +250,12 @@ class TestParseArgs:
         assert args.resume is _RESUME_PICK
 
     def test_resume_with_session_id(self):
-        with patch("sys.argv", ["ai-cli", "--resume", "20260319T120000-abcd1234"]):
+        sid = "lms-cli__2026-03-19T12h00m00.000s"
+        with patch("sys.argv", ["ai-cli", "--resume", sid]):
             from ai_cli.__main__ import parse_args
 
             args = parse_args()
-        assert args.resume == "20260319T120000-abcd1234"
+        assert args.resume == sid
 
     def test_continue_flag(self):
         with patch("sys.argv", ["ai-cli", "--continue"]):
@@ -490,6 +491,75 @@ class TestPickSession:
         sm.new.assert_called_once()
         assert session is new_sess
         assert resumed is False
+
+
+# ---------------------------------------------------------------------------
+# _show_resume_context
+# ---------------------------------------------------------------------------
+
+
+class TestShowResumeContext:
+    def _session(self, messages=None, error=False):
+        s = MagicMock()
+        s.session_id = "proj__2024-01-01T00h00m00.001s"
+        if error:
+            from ai_cli.core.session_manager import SessionError as _SE
+
+            s.get_messages.side_effect = _SE("boom")
+        else:
+            s.get_messages.return_value = messages or []
+        return s
+
+    def _display(self):
+        return MagicMock()
+
+    def test_shows_session_id(self):
+        ui = self._display()
+        _show_resume_context(self._session(), ui)
+        ui.show_status.assert_called()
+        assert any(
+            "proj__2024-01-01T00h00m00.001s" in str(c)
+            for c in ui.show_status.call_args_list
+        )
+
+    def test_empty_history_no_turn_display(self):
+        ui = self._display()
+        _show_resume_context(self._session(messages=[]), ui)
+        ui.begin_assistant_turn.assert_not_called()
+
+    def test_get_messages_error_is_silenced(self):
+        ui = self._display()
+        _show_resume_context(self._session(error=True), ui)
+        ui.begin_assistant_turn.assert_not_called()
+
+    def test_last_assistant_message_replayed(self):
+        msgs = [{"role": "assistant", "content": "Here is the answer."}]
+        ui = self._display()
+        _show_resume_context(self._session(messages=msgs), ui)
+        ui.begin_assistant_turn.assert_called_once()
+        ui.stream_text.assert_called_once_with("Here is the answer.")
+        ui.end_assistant_turn.assert_called_once()
+
+    def test_last_user_message_shows_status(self):
+        msgs = [{"role": "user", "content": "What is 2+2?"}]
+        ui = self._display()
+        _show_resume_context(self._session(messages=msgs), ui)
+        ui.begin_assistant_turn.assert_not_called()
+        # A status message mentioning the unanswered state should be shown.
+        combined = " ".join(str(c) for c in ui.show_status.call_args_list)
+        assert "not yet answered" in combined or "What is 2+2?" in combined
+
+    def test_non_string_assistant_content_not_replayed(self):
+        msgs = [{"role": "assistant", "content": None}]
+        ui = self._display()
+        _show_resume_context(self._session(messages=msgs), ui)
+        ui.begin_assistant_turn.assert_not_called()
+
+    def test_tool_message_shows_only_session_id(self):
+        msgs = [{"role": "tool", "content": "result", "tool_call_id": "x"}]
+        ui = self._display()
+        _show_resume_context(self._session(messages=msgs), ui)
+        ui.begin_assistant_turn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

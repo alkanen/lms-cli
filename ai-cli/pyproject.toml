@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "openai",
     "pillow",
+    "python-slugify",
     "pyyaml",
     "prompt_toolkit",
     "python-dotenv",
