@@ -31,9 +31,18 @@ from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_gl
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
 
+_PREVIEW_LEN = 120  # max chars shown in the "unanswered message" notice
+
 # Sentinel stored by argparse when --resume is given with no SESSION_ID argument.
 # Using an object() ensures it cannot be confused with a real session-ID string.
 _RESUME_PICK: object = object()
+
+
+def _truncate(text: str) -> str:
+    """Return *text* truncated to _PREVIEW_LEN chars with a trailing ellipsis."""
+    if len(text) <= _PREVIEW_LEN:
+        return text
+    return text[: _PREVIEW_LEN - 1] + "…"
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +222,40 @@ def main() -> None:
         )
 
 
+def _show_resume_context(session: Session, ui: Display) -> None:
+    """Display context from the resumed session so the user knows where they left off.
+
+    * If the last message was from the **assistant**: replay it through the
+      display layer so it receives full formatting (Markdown, turn border, etc.).
+    * If the last message was from the **user**: show a notice that it was never
+      answered along with a truncated preview, so the user can decide to resend it.
+    * Any other case (empty history, tool messages, errors): show only the
+      session ID line.
+    """
+    ui.show_status(f"Resuming session {session.session_id}.")
+    try:
+        messages = session.get_messages()
+    except SessionError:
+        return
+
+    if not messages:
+        return
+
+    last = messages[-1]
+    role = last.get("role", "")
+    content = last.get("content")
+
+    if role == "assistant" and isinstance(content, str) and content.strip():
+        ui.begin_assistant_turn()
+        ui.stream_text(content)
+        ui.end_assistant_turn()
+    elif role == "user" and isinstance(content, str) and content.strip():
+        ui.show_status(
+            "Note: your last message was not answered — resend it to continue:"
+        )
+        ui.show_status(_truncate(content))
+
+
 def _cmd_repl(
     start: Path,
     global_dir: Path,
@@ -267,7 +310,7 @@ def _cmd_repl(
         sys.exit(1)
 
     if resumed:
-        ui.show_status(f"Resuming session {session.session_id}.")
+        _show_resume_context(session, ui)
 
     repl = REPL(session, tool_registry, llm_client, ui, workspace, config)
     repl.run()

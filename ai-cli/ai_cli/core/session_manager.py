@@ -18,13 +18,14 @@ import json
 import logging
 import re
 import tempfile
-import uuid
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+from slugify import slugify as _slugify
 
 from ai_cli.core.llm_client import LLMError
 
@@ -34,8 +35,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Strict session ID format produced by _generate_session_id(): YYYYMMDDTHHMMSS-<8 hex>
-_SESSION_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
+# Strict session ID format produced by _generate_session_id():
+#   {workspace-slug}__{YYYY-MM-DDTHHhMMmSS.mmms}
+# e.g. "mnt-d-git-lms-cli__2026-03-25T12h08m11.628s"
+_SESSION_ID_RE = re.compile(
+    r"^[a-z0-9][a-z0-9-]{0,199}__\d{4}-\d{2}-\d{2}T\d{2}h\d{2}m\d{2}\.\d{3}s$"
+)
 
 # Valid message roles accepted by the LLM API.
 _VALID_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -607,13 +612,13 @@ class SessionManager:
     def new(self) -> Session:
         """Create a fresh session, persist its metadata, and return it."""
         for _ in range(3):
-            session_id = _generate_session_id()
+            session_id = _generate_session_id(self._workspace.root)
             session_dir = self._sessions_dir / session_id
             try:
                 session_dir.mkdir(parents=False, exist_ok=False)
                 break
             except FileExistsError:
-                continue  # extremely unlikely UUID collision — retry
+                time.sleep(0.05)  # wait for the clock to advance before retry
             except OSError as exc:
                 raise SessionError(
                     f"Could not create session directory {session_dir}: {exc}"
@@ -731,10 +736,22 @@ def _truncate(text: str) -> str:
     return text[: _PREVIEW_LEN - 1] + "…"
 
 
-def _generate_session_id() -> str:
-    """Return a unique, time-sortable session ID."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    return f"{timestamp}-{uuid.uuid4().hex[:8]}"
+def _generate_session_id(workspace_path: Path) -> str:
+    """Return a timestamp-based, human-readable session ID.
+
+    Format: ``{workspace-slug}__{YYYY-MM-DDTHHhMMmSS.mmms}`` (UTC).
+
+    The workspace slug is derived from the workspace root path via
+    ``python-slugify`` (max 200 chars; falls back to ``"root"`` for paths
+    that produce an empty slug such as ``/``).  The millisecond-precision
+    timestamp keeps the directory name readable while reducing the likelihood
+    of collisions for typical usage.
+
+    Example: ``mnt-d-git-lms-cli__2026-03-25T12h08m11.628s``
+    """
+    slug = _slugify(str(workspace_path), max_length=200) or "root"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%Hh%Mm%S.%f")[:-3] + "s"
+    return f"{slug}__{ts}"
 
 
 def _parse_session_meta(data: dict) -> SessionMeta:

@@ -32,6 +32,7 @@ from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
+
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 
 if TYPE_CHECKING:

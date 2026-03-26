@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -92,19 +93,35 @@ class TestTruncate:
 
 
 class TestGenerateSessionId:
+    _WS = Path("/mnt/d/git/lms-cli")
+
     def test_returns_string(self):
-        assert isinstance(_generate_session_id(), str)
+        assert isinstance(_generate_session_id(self._WS), str)
 
-    def test_contains_timestamp_prefix(self):
-        sid = _generate_session_id()
-        # Format: YYYYMMDDTHHMMSS-<8hex>
-        assert len(sid) == 15 + 1 + 8  # "20240101T120000-a1b2c3d4"
-        assert sid[8] == "T"
-        assert sid[15] == "-"
+    def test_format(self):
+        sid = _generate_session_id(self._WS)
+        # Format: {slug}__{YYYY-MM-DDTHHhMMmSS.mmms}
+        # e.g. "mnt-d-git-lms-cli__2026-03-25T12h08m11.628s"
+        assert "__" in sid
+        slug, ts = sid.split("__", 1)
+        assert re.match(r"^[a-z0-9][a-z0-9-]*$", slug)
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}h\d{2}m\d{2}\.\d{3}s$", ts)
 
-    def test_unique_ids(self):
-        ids = {_generate_session_id() for _ in range(50)}
-        assert len(ids) == 50
+    def test_slug_derived_from_workspace(self):
+        sid = _generate_session_id(Path("/mnt/d/git/lms-cli"))
+        assert sid.startswith("mnt-d-git-lms-cli__")
+
+    def test_root_path_falls_back_to_root_slug(self):
+        sid = _generate_session_id(Path("/"))
+        assert sid.startswith("root__")
+
+    def test_different_workspaces_produce_different_slugs(self):
+        """Two different workspaces produce IDs with different slug prefixes."""
+        sid_a = _generate_session_id(Path("/home/user/project-a"))
+        sid_b = _generate_session_id(Path("/home/user/project-b"))
+        slug_a = sid_a.split("__")[0]
+        slug_b = sid_b.split("__")[0]
+        assert slug_a != slug_b
 
 
 # ---------------------------------------------------------------------------
@@ -725,10 +742,29 @@ class TestSessionManagerNew:
         assert Path(meta["workspace_path"]) == proj
 
     def test_new_sessions_have_unique_ids(self, tmp_path):
+        """Verifies the collision-retry loop: same timestamp → retry → unique ID."""
         ws = _make_workspace(tmp_path / "proj")
         sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
-        ids = {sm.new().session_id for _ in range(10)}
-        assert len(ids) == 10
+        # Simulate two sessions sharing a millisecond timestamp.
+        # First session gets .001s on first try.
+        # Second session collides (.001s exists), retries, and gets .002s.
+        calls = iter(
+            [
+                "proj__2024-01-01T00h00m00.001s",
+                "proj__2024-01-01T00h00m00.001s",  # collision → retry
+                "proj__2024-01-01T00h00m00.002s",
+                "proj__2024-01-01T00h00m00.003s",
+            ]
+        )
+        with patch(
+            "ai_cli.core.session_manager._generate_session_id",
+            side_effect=lambda _: next(calls),
+        ):
+            s1 = sm.new()
+            s2 = sm.new()
+        assert s1.session_id == "proj__2024-01-01T00h00m00.001s"
+        assert s2.session_id == "proj__2024-01-01T00h00m00.002s"
+        assert s1.session_id != s2.session_id
 
 
 class TestSessionManagerLoad:
@@ -739,40 +775,45 @@ class TestSessionManagerLoad:
         loaded = sm.load(created.session_id)
         assert loaded.session_id == created.session_id
 
+    # Helper: a valid-format ID that does not exist as a directory.
+    _VALID_NONEXISTENT = "proj__2024-01-01T00h00m00.001s"
+
     def test_load_raises_for_unknown_id(self, tmp_path):
         ws = _make_workspace(tmp_path / "proj")
         sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
         with pytest.raises(SessionError, match="not found"):
-            sm.load("20240101T000000-ffffffff")
+            sm.load(self._VALID_NONEXISTENT)
 
     def test_load_raises_when_metadata_missing(self, tmp_path):
         ws = _make_workspace(tmp_path / "proj")
         sessions_dir = tmp_path / "sessions"
         sm = SessionManager(ws, _make_llm(), sessions_dir)
         # Create directory without metadata
-        (sessions_dir / "20240101T000000-00000001").mkdir(parents=True)
+        (sessions_dir / self._VALID_NONEXISTENT).mkdir(parents=True)
         with pytest.raises(SessionError, match="metadata missing"):
-            sm.load("20240101T000000-00000001")
+            sm.load(self._VALID_NONEXISTENT)
 
     def test_load_raises_on_corrupt_metadata(self, tmp_path):
         ws = _make_workspace(tmp_path / "proj")
         sessions_dir = tmp_path / "sessions"
         sm = SessionManager(ws, _make_llm(), sessions_dir)
-        bad_dir = sessions_dir / "20240101T000000-badc0de1"
+        bad_id = "proj__2024-01-01T00h00m01.001s"
+        bad_dir = sessions_dir / bad_id
         bad_dir.mkdir(parents=True)
         (bad_dir / "metadata.yaml").write_text(": ][invalid yaml\n")
         with pytest.raises(SessionError):
-            sm.load("20240101T000000-badc0de1")
+            sm.load(bad_id)
 
     def test_load_raises_on_non_mapping_metadata(self, tmp_path):
         ws = _make_workspace(tmp_path / "proj")
         sessions_dir = tmp_path / "sessions"
         sm = SessionManager(ws, _make_llm(), sessions_dir)
-        bad_dir = sessions_dir / "20240101T000000-badc0de2"
+        bad_id = "proj__2024-01-01T00h00m02.001s"
+        bad_dir = sessions_dir / bad_id
         bad_dir.mkdir(parents=True)
         (bad_dir / "metadata.yaml").write_text("- item1\n- item2\n")
         with pytest.raises(SessionError, match="not a YAML mapping"):
-            sm.load("20240101T000000-badc0de2")
+            sm.load(bad_id)
 
     def test_load_rejects_invalid_session_id_formats(self, tmp_path):
         ws = _make_workspace(tmp_path / "proj")
@@ -782,12 +823,15 @@ class TestSessionManagerLoad:
             "../evil",  # path traversal
             "a/b",  # contains slash
             "a\\b",  # contains backslash
-            "..",  # dots
-            "nonexistent-id",  # wrong format
+            "..",  # dots only
             "C:foo",  # Windows drive prefix
-            "20240101T000000-FFFFFFFF",  # uppercase hex not allowed
-            "20240101T000000-fffe",  # too short
-            "20240101X000000-ffffffff",  # wrong separator
+            "nonexistent-id",  # no __ separator
+            "20240101T000000-ffffffff",  # old format
+            "__2024-01-01T00h00m00.001s",  # missing slug (starts with __)
+            "PROJ__2024-01-01T00h00m00.001s",  # uppercase slug
+            "proj__2024-01-01T00H00m00.001s",  # uppercase H in timestamp
+            "proj__2024-01-01T00h00m00.001",  # missing trailing 's'
+            "proj__not-a-timestamp",  # malformed timestamp
         ]
         for bad_id in bad_ids:
             with pytest.raises(SessionError, match="[Ii]nvalid"):
@@ -821,8 +865,15 @@ class TestSessionManagerList:
     def test_list_sorted_newest_first(self, tmp_path):
         proj = tmp_path / "proj"
         sm = SessionManager(_make_workspace(proj), _make_llm(), tmp_path / "sessions")
-        s1 = sm.new()
-        s2 = sm.new()
+        ids_iter = iter(
+            ["proj__2024-01-01T00h00m00.001s", "proj__2024-01-02T00h00m00.001s"]
+        )
+        with patch(
+            "ai_cli.core.session_manager._generate_session_id",
+            side_effect=lambda _: next(ids_iter),
+        ):
+            s1 = sm.new()
+            s2 = sm.new()
         # Pin distinct timestamps so sort order is deterministic regardless of
         # clock resolution.
         m1 = s1._read_meta()
@@ -838,8 +889,16 @@ class TestSessionManagerList:
     def test_list_sorted_uses_session_id_as_tiebreaker(self, tmp_path):
         proj = tmp_path / "proj"
         sm = SessionManager(_make_workspace(proj), _make_llm(), tmp_path / "sessions")
-        s1 = sm.new()
-        s2 = sm.new()
+        # Use distinct IDs to avoid same-millisecond collisions exhausting the retry loop.
+        ids_iter = iter(
+            ["proj__2024-06-15T12h00m00.001s", "proj__2024-06-15T12h00m00.002s"]
+        )
+        with patch(
+            "ai_cli.core.session_manager._generate_session_id",
+            side_effect=lambda _: next(ids_iter),
+        ):
+            s1 = sm.new()
+            s2 = sm.new()
         # Give both sessions the same timestamp so the tie-breaker kicks in.
         same_ts = "2024-06-15T12:00:00+00:00"
         m1 = s1._read_meta()
