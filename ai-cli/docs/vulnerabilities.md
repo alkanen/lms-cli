@@ -205,6 +205,43 @@ workspace root.
 
 ---
 
+## VULN-008 — `_args_summary()` may log short string argument values verbatim
+
+**Component:** `ai_cli/core/tool_registry.py` — `_args_summary()`
+
+**Severity:** Low (only affects the local session log; no network exposure)
+
+**Status:** Deferred — no sensitive arguments exist in current tools
+
+### Description
+
+`_args_summary()` is the fallback log summary used when a tool does not
+override `execute_log()`.  It logs string argument values verbatim whenever
+their length is at or below `_LOG_STR_LIMIT` (currently 80 chars).  For
+tools whose arguments may contain file content, prompts, or other
+user-supplied text (e.g. a future tool that accepts passwords or tokens),
+short values would appear in plain text in `session.log`.
+
+Tools that handle potentially sensitive arguments should override
+`execute_log()` to emit only safe metadata (e.g. path + byte count) and
+never the raw value.  The `write_file` tool already does this.
+
+### Conditions required
+
+- A tool must accept a string argument whose value could be sensitive.
+- The value must be ≤ 80 characters (longer values are already redacted).
+- The attacker must have read access to `session.log` in the session
+  directory (typically `~/.ai-cli/sessions/<id>/session.log`).
+
+### Proposed mitigation
+
+Either (a) always redact known-sensitive argument names (e.g. `content`,
+`prompt`, `messages`) in `_args_summary()` regardless of length, or (b)
+change the default to never log raw string values and rely entirely on
+per-tool `execute_log()` overrides for safe detail.
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`

@@ -10,6 +10,7 @@ Provides completions for:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Iterable
@@ -17,6 +18,8 @@ from typing import TYPE_CHECKING
 
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.tool_registry import ToolRegistry
@@ -80,6 +83,12 @@ class REPLCompleter(Completer):
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Iterable[Completion]:
+        try:
+            yield from self._get_completions(document)
+        except Exception:
+            logger.warning("Unexpected error during tab completion", exc_info=True)
+
+    def _get_completions(self, document: Document) -> Iterable[Completion]:
         text = document.text_before_cursor
 
         # Check for a partial @ reference at the cursor position first, so

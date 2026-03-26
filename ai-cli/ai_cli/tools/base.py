@@ -18,8 +18,11 @@ don't have to construct them by hand.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -254,6 +257,19 @@ class Tool(ABC):
         """
         ...
 
+    def execute_log(self, **kwargs: Any) -> str | None:
+        """Return a log-safe summary string for this tool call, or ``None``.
+
+        Called by the registry before ``execute()`` to produce a DEBUG log
+        entry.  Override this to emit a compact, secret-free description of
+        the call (e.g. the file path and line range for ``read_file``, but
+        *not* the file content for ``write_file``).
+
+        When ``None`` is returned the registry falls back to a generic
+        ``name=<type:size>`` summary that avoids logging large string values.
+        """
+        return None
+
     def format_display(self, *, args: dict, result: dict) -> str | None:
         """
         Return a human-readable summary of this tool call for display purposes.
@@ -313,6 +329,9 @@ class Tool(ABC):
             for the full description of the second element.
         """
         if not self.permission_required:
+            logger.debug(
+                "Permission not required for '%s' — bypassing prompt", self.name
+            )
             return True, ""
 
         extra = self.extra_permission_options(**kwargs)

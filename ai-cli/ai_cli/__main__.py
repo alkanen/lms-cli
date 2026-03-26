@@ -27,6 +27,7 @@ from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
 from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
+from ai_cli.utils.logging_utils import setup_logging
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
@@ -293,7 +294,6 @@ def _cmd_repl(
     ui = create_display(config)
     permission_manager = PermissionManager(prompt_fn=ui.show_permission_prompt)
     tool_registry = ToolRegistry(workspace, config, permission_manager)
-    tool_registry.load()
 
     try:
         session_manager = SessionManager(workspace, llm_client, sessions_dir)
@@ -308,6 +308,10 @@ def _cmd_repl(
     except SessionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Set up logging before tool loading so all subsequent activity is captured.
+    setup_logging(config, session.session_dir)
+    tool_registry.load()
 
     if resumed:
         _show_resume_context(session, ui)

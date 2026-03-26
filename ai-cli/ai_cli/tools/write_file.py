@@ -8,11 +8,14 @@ file level or at any ancestor directory level up to the workspace root.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.workspace import WorkspaceError
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -125,6 +128,22 @@ class WriteFileTool(Tool):
             self._session_allowed_dirs.add(resolved)
 
     # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def execute_log(self, **kwargs: Any) -> str | None:
+        path = kwargs.get("path", "?")
+        content = kwargs.get("content", "")
+        start_line = kwargs.get("start_line")
+        end_line = kwargs.get("end_line")
+        size = f"{len(content)} chars"
+        if start_line is not None and end_line is not None:
+            range_info = f"lines {start_line}–{end_line}"
+        else:
+            range_info = "full write"
+        return f"'{path}' — {range_info}, {size}"
+
+    # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
 
@@ -193,6 +212,13 @@ class WriteFileTool(Tool):
         start_line: int | None = None,
         end_line: int | None = None,
     ) -> dict:
+        logger.debug(
+            "write_file: '%s' (%s)",
+            path,
+            f"lines {start_line}–{end_line}"
+            if start_line is not None
+            else "full write",
+        )
         # Reject supplying only one of the pair.
         if (start_line is None) != (end_line is None):
             return self._err(
@@ -226,6 +252,9 @@ class WriteFileTool(Tool):
             return self._err("write_error", str(exc), 400)
 
         lines_written = len(content.splitlines()) if content else 0
+        logger.info(
+            "write_file: wrote %d line(s) to '%s' (%s)", lines_written, path, summary
+        )
         return self._ok(
             {
                 "path": path,

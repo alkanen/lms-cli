@@ -92,6 +92,32 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_ATTRS = ("NAME", "DESCRIPTION", "PERMISSION_REQUIRED")
 
+# Maximum length of a string value shown verbatim in debug logs.
+# Longer strings are replaced with a ``<str:Nch>`` placeholder to avoid
+# leaking file contents or other secrets into session.log.
+_LOG_STR_LIMIT = 80
+
+
+def _args_summary(kwargs: dict) -> str:
+    """Return a compact, secret-safe summary of tool call arguments.
+
+    Short scalar values (numbers, booleans, short strings) are shown
+    verbatim.  Long strings are replaced with ``<str:Nch>`` and
+    collections with ``<list:N>`` / ``<dict:N>`` so that large file
+    contents and prompt text are never written to the log.
+    """
+    parts = []
+    for k, v in kwargs.items():
+        if isinstance(v, str) and len(v) > _LOG_STR_LIMIT:
+            parts.append(f"{k}=<str:{len(v)}ch>")
+        elif isinstance(v, list):
+            parts.append(f"{k}=<list:{len(v)}>")
+        elif isinstance(v, dict):
+            parts.append(f"{k}=<dict:{len(v)}>")
+        else:
+            parts.append(f"{k}={v!r}")
+    return ", ".join(parts) if parts else "(no args)"
+
 
 def _validate_tool_definition(defn: object, expected_name: str | None = None) -> str:
     """
@@ -334,6 +360,11 @@ class ToolRegistry:
             self._load_from_directory(project_tools, tier="project")
 
         self._apply_config()
+        logger.info(
+            "Tool registry loaded: %d tool(s) registered (%s)",
+            len(self._tools),
+            ", ".join(sorted(self._tools)),
+        )
 
     def _load_bundled(self, directory: Path) -> None:
         """Load bundled tools via normal package imports (``ai_cli.tools.<name>``).
@@ -448,9 +479,17 @@ class ToolRegistry:
 
         self._tools[name] = tool
         self._schemas[name] = tool_schema
-        self._enabled[name] = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
+        enabled = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
+        self._enabled[name] = enabled
         self._allowed[name] = True
         self._tiers[name] = tier
+        logger.debug(
+            "Registered tool '%s' from %s tier (enabled=%s, permission_required=%s)",
+            name,
+            tier,
+            enabled,
+            tool.permission_required,
+        )
         # Allow tools that need registry access (e.g. tool_manager) to receive
         # a back-reference after construction.  Guard carefully: the attribute
         # may exist on user-supplied tools with a different shape, and any
@@ -675,13 +714,12 @@ class ToolRegistry:
         if arg_error is not None:
             return arg_error
 
+        def _fmt(v: object, limit: int = 60) -> str:
+            s = repr(v)
+            return s if len(s) <= limit else s[:limit] + "…"
+
         choice = ""
         if tool.permission_required:
-
-            def _fmt(v: object, limit: int = 60) -> str:
-                s = repr(v)
-                return s if len(s) <= limit else s[:limit] + "…"
-
             allowed, choice = tool.request_permission(
                 f"Execute {name}({', '.join(f'{k}={_fmt(v)}' for k, v in kwargs.items())})",
                 **kwargs,
@@ -694,9 +732,29 @@ class ToolRegistry:
         try:
             if choice:
                 tool.on_permission_granted(choice, **kwargs)
-            return tool.execute(**kwargs)
+            try:
+                log_summary = tool.execute_log(**kwargs)
+            except Exception:
+                logger.debug(
+                    "execute_log raised for '%s' — falling back to summary",
+                    name,
+                    exc_info=True,
+                )
+                log_summary = None
+            if log_summary is None:
+                log_summary = _args_summary(kwargs)
+            logger.debug("Executing tool '%s' — %s", name, log_summary)
+            result = tool.execute(**kwargs)
+            logger.debug(
+                "Tool '%s' returned status=%r",
+                name,
+                result.get("status") if isinstance(result, dict) else "?",
+            )
+            return result
         except Exception:
-            logger.exception("Error executing tool '%s' with kwargs=%r", name, kwargs)
+            logger.exception(
+                "Error executing tool '%s' — %s", name, _args_summary(kwargs)
+            )
             return Tool._err(
                 "tool_execution_error",
                 f"Tool '{name}' failed during execution. See logs for details.",
@@ -778,6 +836,7 @@ class ToolRegistry:
         self._session_overrides.pop(name, None)
         self._set_enabled(name, enabled=True)
         self._persist_tool_setting(name, "disabled", False)
+        logger.info("Tool '%s' enabled (persisted to config)", name)
 
     def disable(self, name: str) -> None:
         """Disable *name* and persist the change to project .ai-cli/config.yaml.
@@ -790,6 +849,7 @@ class ToolRegistry:
         self._session_overrides.pop(name, None)
         self._set_enabled(name, enabled=False)
         self._persist_tool_setting(name, "disabled", True)
+        logger.info("Tool '%s' disabled (persisted to config)", name)
 
     def _set_enabled(self, name: str, enabled: bool) -> None:
         if name in self._tools:
@@ -803,11 +863,13 @@ class ToolRegistry:
         """Enable *name* for this session only — no config write."""
         if name in self._tools:
             self._session_overrides[name] = True
+            logger.info("Tool '%s' enabled for this session only", name)
 
     def disable_session(self, name: str) -> None:
         """Disable *name* for this session only — no config write."""
         if name in self._tools:
             self._session_overrides[name] = False
+            logger.info("Tool '%s' disabled for this session only", name)
 
     # ------------------------------------------------------------------
     # Allow / disallow (persistent — writes to config)
