@@ -26,7 +26,10 @@ concerns (Rich formatting, keyboard input) out of this module.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
 
 PERM_YES = "yes"
 PERM_NO = "no"
@@ -90,6 +93,7 @@ class PermissionManager:
             * ``"Permission denied."`` on ``no`` or unrecognised input
         """
         if tool_name in self._always_allowed:
+            logger.debug("Permission auto-granted for '%s' (always-allow)", tool_name)
             return True, ""
 
         universal = {PERM_YES, PERM_NO, PERM_ALWAYS, PERM_CUSTOM}
@@ -105,6 +109,7 @@ class PermissionManager:
 
         # PERM_NO always denies, even if it appears in extra_options.
         if choice == PERM_NO:
+            logger.info("Permission denied for '%s'", tool_name)
             return False, "Permission denied."
 
         # Extra options take precedence over the universal allow/custom choices
@@ -114,21 +119,33 @@ class PermissionManager:
                 if opt.lower() == choice:
                     # Return the original (unmodified) option string so callers
                     # can reliably match it against their extra_options list.
+                    logger.info(
+                        "Permission granted for '%s' (choice=%r)", tool_name, opt
+                    )
                     return True, opt
 
         if choice == PERM_YES:
+            logger.info("Permission granted for '%s' (once)", tool_name)
             return True, ""
         if choice == PERM_ALWAYS:
             self.grant_always(tool_name)
+            logger.info("Permission granted for '%s' (always)", tool_name)
             return True, ""
         if choice == PERM_CUSTOM:
+            logger.info(
+                "Permission denied for '%s' (custom suggestion provided)", tool_name
+            )
             return False, user_text
         # anything unrecognised
+        logger.info(
+            "Permission denied for '%s' (unrecognised choice %r)", tool_name, choice
+        )
         return False, "Permission denied."
 
     def grant_always(self, tool_name: str) -> None:
         """Record an in-memory always-allow grant for *tool_name*."""
         self._always_allowed.add(tool_name)
+        logger.debug("Always-allow registered for '%s'", tool_name)
 
     def reset(self) -> None:
         """Clear all grants.  Called on session resume."""

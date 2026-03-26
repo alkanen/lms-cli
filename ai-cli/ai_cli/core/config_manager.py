@@ -16,6 +16,7 @@ it is not yet implemented.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,8 @@ from typing import Any
 import yaml
 
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -82,10 +85,21 @@ class ConfigManager:
         project_root: Path | None,
         cli_overrides: dict,
     ) -> None:
-        global_cfg = _load_yaml(get_global_dir() / "config.yaml")
+        global_path = get_global_dir() / "config.yaml"
+        global_cfg = _load_yaml(global_path)
+        logger.debug(
+            "Global config loaded from %s (%d key(s))", global_path, len(global_cfg)
+        )
+
         project_cfg: dict = {}
         if project_root is not None:
-            project_cfg = _load_yaml(project_root / _DOT_AI_CLI / "config.yaml")
+            project_path = project_root / _DOT_AI_CLI / "config.yaml"
+            project_cfg = _load_yaml(project_path)
+            logger.debug(
+                "Project config loaded from %s (%d key(s))",
+                project_path,
+                len(project_cfg),
+            )
 
         self._project_cfg = project_cfg
 
@@ -95,6 +109,12 @@ class ConfigManager:
             cli_overrides,
         )
         self._project_root = project_root
+        logger.debug(
+            "Config merged: backend=%r, model=%r, cli_overrides=%s",
+            self._config.get("backend"),
+            self._config.get("model"),
+            list(cli_overrides) if cli_overrides else "none",
+        )
 
     def get(self, key: str, default: Any = None) -> Any:
         """Layered lookup: cli_overrides > project config > global config > default."""

@@ -16,11 +16,14 @@ relevant OS primitives directly.
 
 from __future__ import annotations
 
+import logging
 import os
 import textwrap
 from pathlib import Path
 
 from ai_cli.utils.ignore_filter import IgnoreFilter
+
+logger = logging.getLogger(__name__)
 
 # Sentinel directory name used for both global and project config.
 _DOT_AI_CLI = ".ai-cli"
@@ -65,6 +68,12 @@ _INIT_TEMPLATES: dict[str, str] = {
         #
         # repl_behavior:
         #   complete_while_typing: false  # true = popup on every keystroke; false = Tab only (default)
+        #
+        # logging:
+        #   level: WARNING   # ai_cli.* default; DEBUG/INFO for verbose output
+        #   modules:         # per-module overrides (module name → level)
+        #     ai_cli.tools: DEBUG
+        #     ai_cli.core.llm_client: INFO
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
@@ -96,6 +105,12 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         #
         # repl_behavior:
         #   complete_while_typing: false  # true = popup on every keystroke; false = Tab only (default)
+        #
+        # logging:
+        #   level: WARNING   # ai_cli.* default; DEBUG/INFO for verbose output
+        #   modules:         # per-module overrides (module name → level)
+        #     ai_cli.tools: DEBUG
+        #     ai_cli.core.llm_client: INFO
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Default system prompt — applied to all projects unless a
@@ -198,6 +213,7 @@ class Workspace:
             dot = candidate / _DOT_AI_CLI
             # Never treat the global config directory itself as a project root.
             if dot.is_dir() and dot.resolve() != global_dir:
+                logger.debug("Workspace root resolved to: %s", candidate)
                 return candidate
             parent = candidate.parent
             if parent == candidate:

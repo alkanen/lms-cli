@@ -9,11 +9,14 @@ at the file level or at any ancestor directory level up to the workspace root.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.workspace import WorkspaceError
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -177,10 +180,17 @@ class ReadFileTool(Tool):
         start_line: int | None = None,
         end_line: int | None = None,
     ) -> dict:
+        logger.debug(
+            "read_file: '%s' (lines %s–%s)",
+            path,
+            start_line if start_line is not None else "start",
+            end_line if end_line is not None else "end",
+        )
         # Read the full file once; slicing and total_lines are derived here.
         try:
             full_text = self._workspace.read_file(path)
         except WorkspaceError as exc:
+            logger.debug("read_file: error reading '%s': %s", path, exc)
             return self._err("read_error", str(exc), 400)
 
         all_lines = full_text.splitlines(keepends=True)
@@ -232,6 +242,12 @@ class ReadFileTool(Tool):
         hi = end_line if end_line is not None else total_lines
         content = "".join(all_lines[lo:hi])
 
+        logger.debug(
+            "read_file: returned %d/%d lines from '%s'",
+            hi - lo,
+            total_lines,
+            path,
+        )
         return self._ok(
             {
                 "content": content,

@@ -29,9 +29,12 @@ Workflow::
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.tool_registry import ToolRegistry
@@ -121,7 +124,9 @@ class ToolManagerTool(Tool):
     def _do_list(self) -> dict:
         if self._registry is None:
             return self._err("internal_error", "Registry not available.", 500)
-        return self._ok({"tools": self._registry.list_all()})
+        tools = self._registry.list_all()
+        logger.debug("tool_manager: listing %d tool(s)", len(tools))
+        return self._ok({"tools": tools})
 
     def _do_enable(self, tool_names: list[str]) -> dict:
         if not tool_names:
@@ -145,6 +150,10 @@ class ToolManagerTool(Tool):
                 enabled.append(name)
                 transient_schemas.append(schema)
 
+        if enabled:
+            logger.debug("tool_manager: transient-enabled tools: %s", enabled)
+        if unknown:
+            logger.debug("tool_manager: unknown tool names requested: %s", unknown)
         # ``transient_schemas`` is consumed and removed by the REPL before the
         # result is added to conversation history, so the LLM never sees the
         # raw schema JSON.  It only sees the tidy ``enabled``/``unknown`` summary.

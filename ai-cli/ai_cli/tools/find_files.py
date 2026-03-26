@@ -18,10 +18,13 @@ Glob pattern syntax:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
+
+logger = logging.getLogger(__name__)
 
 _MAX_RESULTS = 500
 
@@ -144,6 +147,7 @@ class FindFilesTool(Tool):
         *,
         pattern: str,
     ) -> dict:
+        logger.debug("find_files: pattern=%r", pattern)
         if not pattern:
             return self._err("invalid_input", "'pattern' must not be empty.", 400)
 
@@ -289,6 +293,13 @@ class FindFilesTool(Tool):
                 partial = True
 
         matches.sort()
+        logger.debug(
+            "find_files: %d match(es) for %r (truncated=%s, partial=%s)",
+            len(matches),
+            pattern,
+            truncated,
+            partial,
+        )
         result: dict = {
             "matches": matches,
             "count": len(matches),
