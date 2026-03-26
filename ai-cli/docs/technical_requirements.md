@@ -359,6 +359,79 @@ same streaming loop as `text` chunks.
 
 ---
 
+## Multi-Agent Processing
+
+See `design_agents.md` for the full architecture.  This section covers the
+technical constraints that affect implementation.
+
+- **Sequential execution (default)**:
+  - A single consumer GPU can process one LLM request at a time.  Sub-agent
+    calls block the coordinator until the sub-agent's `Agent.run()` returns.
+  - Parallel execution (`call_agents_parallel`) is opt-in via
+    `agent_settings.allow_parallel: true` and uses `asyncio.gather()`.  Only enable
+    when the backend supports concurrent requests (e.g. remote API, multiple
+    GPUs).
+
+- **Agent isolation**:
+  - Each agent has its own `Session`, `ToolRegistry`, and `Display` instance.
+    Agents share state only through the task file (see Task Storage below) and
+    through the `AgentResult` returned to the coordinator.
+  - Sub-agents use `SubAgentDisplay`, which captures streaming output in a
+    buffer and defaults permission prompts to "no".  Sub-agents must never
+    write to the terminal directly.
+
+- **Context overflow**:
+  - After each LLM turn, `Agent.run()` checks token usage from the `done`
+    chunk against the model's context window.  When usage exceeds
+    `context_limit_threshold` (default 90 %), the loop breaks and returns
+    `AgentResult(status="context_limit", partial=True)`.
+  - No automatic compaction is performed on sub-agent sessions — the
+    coordinator receives the partial result and decides whether to retry with
+    a fresh ephemeral instance, escalate, or accept the partial result.
+
+- **Tool round limits**:
+  - `max_tool_rounds` (default 10) caps the number of tool-call rounds per
+    `Agent.run()` invocation.  Exceeding this limit returns
+    `AgentResult(status="tool_limit", partial=True)`.
+
+---
+
+## Task Storage
+
+See `design_task_system.md` for the full schema and tool definitions.
+
+- **File location**: `<session_dir>/tasks.json`.  One file per CLI session,
+  co-located with session history files.
+
+- **Format**: JSON object with an optional top-level `goal` field and a
+  top-level `tasks` map keyed by task IDs of the form `task_<...>`.  Each
+  entry maps a task ID to a task object with `name`, optional `parent_id`,
+  `subtask_ids`, `status`, `priority`, `next_action`, `description`,
+  `definition_of_done` (string), `notes`, timestamps, and `blockers`.
+
+- **Integrity rules enforced by `TaskManager`**:
+  - `parent_id` must reference an existing task (or be `null`).
+  - Valid status values: `not_started`, `in_progress`, `in_review`, `blocked`,
+    and `done`.  Tasks start in `not_started`, move to `in_progress`, and may
+    transition to `in_review` when ready for validation.  `blocked` can be set
+    from any non-`done` state and transitions back to `in_progress` once
+    blockers are resolved.  Only `tasks_mark_done` may set status to `"done"`.
+  - `tasks_mark_done` validates that all subtasks (if any) are `done` and may
+    require the task to have a non-empty `definition_of_done` string.  The LLM
+    and/or human reviewer is responsible for determining that the
+    natural-language `definition_of_done` criteria are actually satisfied
+    before calling `tasks_mark_done`.
+  - `tasks_update` cannot set `status` to `"done"` — the `tasks_mark_done`
+    tool must be used instead.
+
+- **Concurrent access**: Only one agent runs at a time in sequential mode, so
+  file locking is unnecessary.  If parallel execution is enabled, `TaskManager`
+  must use OS-appropriate file locking (e.g. `fcntl.flock()` on Unix-like
+  systems, or a cross-platform file-locking library / Windows-specific locking
+  API) to prevent write races.  Note that `fcntl` is Unix-only.
+
+---
+
 ## Testing Strategies
 - **Unit Tests**:
   - Test core components (e.g., `ToolRegistry`, `Workspace`, `ConfigManager`).
@@ -371,6 +444,20 @@ same streaming loop as `text` chunks.
 - **Edge Cases**:
   - Test invalid inputs, network errors, and unexpected LLM responses.
   - Ensure graceful degradation when external systems fail.
+
+- **Agent Tests**:
+  - Test `Agent.run()` with mock `LLMClient` and `ToolRegistry` in isolation.
+  - Verify tool registry isolation: tools on different agents are independent
+    instances with separate state.
+  - Test context overflow detection (mock a `done` chunk near the threshold).
+  - Test tool round limit enforcement.
+  - Test `SubAgentDisplay` captures output and denies permission prompts.
+
+- **Task Tests**:
+  - Test `TaskManager` CRUD operations and status transition validation.
+  - Test integrity rules: invalid `parent_id`, illegal transitions,
+    `tasks_mark_done` without meeting DoD criteria.
+  - Test concurrent access guards when parallel execution is enabled.
 
 ---
 
