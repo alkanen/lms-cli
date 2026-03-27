@@ -858,6 +858,144 @@ class TestREPLSendToLLM:
         assert len(read_file_schemas) == 1
         assert read_file_schemas[0]["function"]["description"] == "transient version"
 
+    def test_pause_resume_bracket_permission_prompt_and_fn_restored(self):
+        """pause()/resume() bracket the permission prompt; prompt_fn restored after."""
+        from ai_cli.core.permission_manager import PermissionManager
+
+        call_order: list[str] = []
+        original_prompt_fn = MagicMock(return_value=("yes", ""))
+        pm = PermissionManager(prompt_fn=original_prompt_fn)
+
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = pm
+        tool_registry.definitions.return_value = []
+
+        # Simulate a tool that internally calls pm.prompt_fn (as a real permission
+        # check would).  At execution time pm.prompt_fn is the wrapped version
+        # installed by _send_to_llm, so pause/resume are recorded through it.
+        def _execute_with_permission(name, args, **kwargs):
+            pm.prompt_fn("Allow?", [])
+            return {"status": "success", "data": {}}
+
+        tool_registry.execute.side_effect = _execute_with_permission
+
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        display = MagicMock()
+
+        llm = MagicMock()
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "write_file",
+                        "call_id": "1",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter([{"type": "done", "stop_reason": "stop", "usage": {}}]),
+        ]
+
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+
+        with patch("ai_cli.cli.repl._AbortMonitor") as MockMonitor:
+            monitor_instance = MockMonitor.return_value
+            monitor_instance.pause.side_effect = lambda: call_order.append("pause")
+            monitor_instance.resume.side_effect = lambda: call_order.append("resume")
+            repl._send_to_llm("do something")
+
+        # pause → (original prompt_fn) → resume must appear in that order.
+        assert "pause" in call_order, "monitor.pause() was never called"
+        assert "resume" in call_order, "monitor.resume() was never called"
+        assert call_order.index("pause") < call_order.index("resume")
+        # The original prompt_fn must be invoked (via the wrapper).
+        original_prompt_fn.assert_called_once_with("Allow?", [])
+        # prompt_fn must be restored to the original after _send_to_llm returns.
+        assert pm.prompt_fn is original_prompt_fn
+
+    def test_abort_injects_stub_tool_results_for_unexecuted_calls(self):
+        """On abort after assistant message is saved, stub role:tool msgs are injected."""
+        import json as _json
+        import threading
+
+        abort_event = threading.Event()
+
+        # add_raw_message sets abort after the assistant message is persisted so
+        # that the abort fires at the start of the tool-execution loop.
+        raw_messages: list[dict] = []
+
+        def _add_raw(msg):
+            raw_messages.append(msg)
+            if msg.get("role") == "assistant":
+                abort_event.set()
+
+        session = MagicMock()
+        session.should_compact.return_value = False
+        session.get_messages.return_value = []
+        session.add_raw_message.side_effect = _add_raw
+        display = MagicMock()
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+
+        # Two tool calls in the same response.
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "call_id": "call-A",
+                    "arguments": {},
+                },
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "call_id": "call-B",
+                    "arguments": {},
+                },
+                {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+            ]
+        )
+
+        repl = _make_repl(
+            session=session, tool_registry=tool_registry, llm=llm, display=display
+        )
+
+        with patch("ai_cli.cli.repl._AbortMonitor") as MockMonitor:
+            MockMonitor.return_value.start.side_effect = lambda: None
+
+            # Replace abort in _send_rounds with our controlled event.
+            original_send_rounds = repl._send_rounds
+
+            def _patched_send_rounds(user_input, _abort):
+                return original_send_rounds(user_input, abort_event)
+
+            repl._send_rounds = _patched_send_rounds
+            repl._send_to_llm("write two files")
+
+        # add_raw_message must have been called with stub results for BOTH call_ids.
+        raw_tool_msgs = [m for m in raw_messages if m.get("role") == "tool"]
+        tool_call_ids = {m["tool_call_id"] for m in raw_tool_msgs}
+        assert "call-A" in tool_call_ids
+        assert "call-B" in tool_call_ids
+
+        # Each stub must carry the abort error payload.
+        for msg in raw_tool_msgs:
+            content = _json.loads(msg["content"])
+            assert content["status"] == "error"
+            assert content["error"] == "aborted"
+
+        # User must be shown "Aborted."
+        status_msgs = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("Aborted" in s for s in status_msgs)
+
 
 # ---------------------------------------------------------------------------
 # REPL._preprocess_at_references()
