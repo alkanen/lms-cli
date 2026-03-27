@@ -19,13 +19,19 @@ ai-cli/
 │   │   ├── tool_registry.py      # ✅ Three-tier tool discovery, loading, settings
 │   │   ├── llm_client.py         # ✅ Abstract LLMClient + OpenAI-compatible implementation
 │   │   ├── mcp_manager.py        # 🔲 MCP server connections, tool exposure
-│   │   └── session_manager.py    # ✅ Session create/resume/compact/persist
+│   │   ├── session_manager.py    # ✅ Session create/resume/compact/persist
+│   │   ├── agent.py              # 🔲 Agent, AgentSpec, AgentResult, SubAgentDisplay
+│   │   ├── agent_registry.py     # 🔲 AgentSpec loading from config, instance caching
+│   │   ├── task_manager.py       # 🔲 Task tree persistence, validation, queries
+│   │   └── task_orchestrator.py  # 🔲 Deterministic plan→execute→review loop (/plan)
 │   ├── tools/
 │   │   ├── base.py               # ✅ Tool abstract base class
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py         # ✅ Glob-pattern file search with ignore-rule enforcement
-│   │   └── tool_manager.py       # ✅ Context-saving tool gatekeeper
+│   │   ├── tool_manager.py       # ✅ Context-saving tool gatekeeper
+│   │   ├── call_agent.py         # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
+│   │   └── tasks.py              # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/
 │   │   ├── repl.py               # ✅ Main REPL loop, slash commands, keyboard shortcuts, streaming abort
 │   │   ├── completer.py          # ✅ Tab completion for slash commands, tool names, @path references
@@ -46,12 +52,26 @@ Dependencies are strictly one-way — no circular imports.
 repl → session_manager → llm_client
 repl → tool_registry → permission_manager
 repl → display
+repl → agent_registry
+repl → task_orchestrator
 session_manager → workspace
 tool_registry → workspace
 tool_registry → config_manager
 workspace → config_manager
 workspace → ignore_filter
 mcp_manager → tool_registry
+agent → llm_client
+agent → session_manager
+agent → tool_registry
+agent → display
+agent_registry → config_manager
+agent_registry → agent
+call_agent → agent_registry
+task_manager → session_manager
+task_orchestrator → task_manager
+task_orchestrator → agent_registry
+task_orchestrator → display
+tasks (tools) → task_manager
 ```
 
 ---
@@ -689,6 +709,213 @@ class RichDisplay(Display):
 
 ---
 
+### Agent / AgentSpec / AgentResult 🔲
+
+See `docs/design_agents.md` for full design.
+
+```python
+@dataclass
+class BackendConfig:
+    base_url: str
+    api_key: str = "not-required"
+
+@dataclass
+class AgentSpec:
+    name: str
+    system_message: str
+    tools: list[str]                     # tool names from the global registry
+    model: str
+    max_response_tokens: int
+    persistence: Literal["ephemeral", "session"]
+    backend: BackendConfig | None = None  # None → inherit coordinator's backend
+    tool_permission_overrides: dict[str, bool] = field(default_factory=dict)
+    max_tool_rounds: int = 10
+    context_limit_threshold: float = 0.90
+
+@dataclass
+class AgentResult:
+    text: str
+    status: Literal["ok", "context_limit", "tool_limit", "error"]
+    partial: bool = False
+    error_message: str = ""
+
+class Agent:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        session: Session,
+        llm_client: LLMClient,
+        tool_registry: ToolRegistry,
+        display: Display,
+    ): ...
+
+    async def run(self, prompt: str) -> AgentResult:
+        """Run the full send → tool-call → repeat loop for one prompt.
+        Returns when the LLM issues end_turn or a safety limit is hit."""
+```
+
+The REPL's inner loop (`_send_rounds`) is extracted into `Agent.run()`.
+When no agents are configured, the coordinator `Agent` wraps the REPL's
+existing LLMClient/Session/ToolRegistry/Display — behaviour is identical
+to today.
+
+---
+
+### SubAgentDisplay 🔲
+
+```python
+class SubAgentDisplay(Display):
+    """Non-interactive Display for sub-agents.
+
+    Captures streaming text in a buffer (returned as AgentResult.text).
+    Permission prompts default to 'no'. Tool activity routed to logger.
+    """
+
+    def stream_text(self, delta: str) -> None:
+        self._buffer.append(delta)
+
+    def show_permission_prompt(self, question, extra_options):
+        return ("no", "")
+
+    @property
+    def captured_text(self) -> str:
+        return "".join(self._buffer)
+```
+
+---
+
+### AgentRegistry 🔲
+
+```python
+class AgentRegistry:
+    """Loads AgentSpecs from config; caches session-persistent agent instances."""
+
+    def __init__(self, config_manager: ConfigManager): ...
+
+    def load(self) -> None:
+        """Parse agents: section from config and build AgentSpecs. No instantiation."""
+
+    def has(self, name: str) -> bool: ...
+
+    def get(
+        self,
+        name: str,
+        *,
+        workspace: Workspace,
+        global_tool_registry: ToolRegistry,
+        llm_client: LLMClient,
+        session: Session,
+    ) -> Agent:
+        """Return the named agent, creating it if needed.
+
+        Runtime dependencies (workspace, registries, llm_client, session) are
+        injected here — not at load() time — so that ephemeral agents always
+        receive the current session context, and session-persistent agents are
+        created lazily on first use.  Each call creates a fresh PermissionManager
+        scoped to the agent's SubAgentDisplay for isolation.
+        """
+
+    def specs(self) -> dict[str, AgentSpec]: ...
+```
+
+If `agents:` is absent or empty in config, `has()` always returns `False`
+and `CallAgentTool` is not registered.
+
+---
+
+### TaskManager 🔲
+
+See `docs/design_task_system.md` for full design.
+
+```python
+class TaskManager:
+    """Persistent task tree stored as JSON in the session directory."""
+
+    def __init__(self, session_dir: Path): ...
+
+    def set_goal(self, goal: str) -> None: ...
+    def list_tasks(self, parent_id: str | None = None) -> list[dict]: ...
+    def get_task(self, task_id: str) -> dict: ...
+    def create_task(self, *, name: str, parent_id: str | None = None, **fields) -> dict: ...
+    def update_task(self, task_id: str, **fields) -> dict: ...
+    def add_note(self, task_id: str, note: str) -> dict: ...
+    def mark_done(self, task_id: str) -> dict: ...
+    def find(self, status: str | None = None) -> list[dict]: ...
+    def find_incomplete(self) -> list[dict]: ...
+    def all_tasks(self) -> list[dict]: ...
+```
+
+Enforces: valid parent references, `subtask_ids` integrity, `done` requires
+all subtasks done, `done` only reachable via `mark_done()`.
+
+Storage: `<session_dir>/tasks.json`, created on first use.
+
+---
+
+### TaskOrchestrator 🔲
+
+```python
+class TaskOrchestrator:
+    """Deterministic plan → execute → review loop for /plan mode."""
+
+    def __init__(
+        self,
+        task_manager: TaskManager,
+        agent_registry: AgentRegistry,
+        display: Display,
+    ): ...
+
+    async def run(self, goal: str, max_iterations: int = 50) -> None:
+        """Drive the orchestration loop. Ctrl+C interrupts cleanly."""
+```
+
+Routing decisions (plan/execute/review) are pure Python — no LLM calls
+consumed.  Only the sub-agent work (planner, executor, reviewer) uses the GPU.
+
+---
+
+### CallAgentTool 🔲
+
+```python
+class CallAgentTool(Tool):
+    """Coordinator-side tool for dispatching to sub-agents."""
+    NAME = "call_agent"
+    PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = False  # enabled at registration time by AgentRegistry
+
+    def execute(self, *, agent_type: str, prompt: str) -> dict:
+        """Look up the named agent type and call agent.run(prompt)."""
+```
+
+`CallAgentTool` is only registered on the coordinator's `ToolRegistry` when at
+least one agent is configured (see `AgentRegistry`); it is never added for
+sub-agents.  Because registration is already conditional, `DISABLED_BY_DEFAULT`
+is `False` — the tool is live the moment it is registered.  There is no need
+for the user or the LLM to `/tools enable call_agent`.
+
+`definition()` builds its description dynamically, listing each configured
+agent type with a purpose snippet and tool set.
+
+---
+
+### Task Tools 🔲
+
+Six tools sharing a `TaskManager` instance, all in `tools/tasks.py`:
+
+| Tool | Key args | Notes |
+|---|---|---|
+| `TaskListTool` | `parent_id?` | Returns `task_summary` list |
+| `TaskGetTool` | `task_id` | Returns `task_detail` |
+| `TaskCreateTool` | `name`, `parent_id?`, ... | Covers root + subtask creation |
+| `TaskUpdateTool` | `task_id`, ... | Status, description, blockers, etc. |
+| `TaskAddNoteTool` | `task_id`, `note` | Append-only timestamped notes |
+| `TaskMarkDoneTool` | `task_id` | Validates all subtasks done |
+
+`tasks_update` excludes `"done"` from valid status values — transitioning
+to done must go through `tasks_mark_done` for validation.
+
+---
+
 ### MCPManager 🔲
 
 ```python
@@ -799,20 +1026,53 @@ def main():
     llm_client = create_llm_client(config)
     session_manager = SessionManager(workspace, llm_client, SESSIONS_DIR)
 
-    # 3. Load tools
+    # 3. Resolve session (--resume / --resume <id> / --continue / new)
+    session = _pick_session(args, session_manager, workspace, display)
+    # Session dir is known here; logging and task manager can use it.
+
+    # 4. Load tools
     tool_registry.load()
 
-    # 4. Resolve session (--resume / --resume <id> / --continue / new)
-    session = _pick_session(args, session_manager, workspace, display)
+    # Clear session-scoped state. Must be called after load() so that
+    # reset_session_state() hooks on registered tool instances actually run.
+    # No-ops on freshly loaded instances, but required by technical_requirements.md
+    # so any future in-process session-switching path stays correct.
+    permission_manager.reset()
+    tool_registry.reset_session_overrides()
 
-    # 5. Start REPL
-    repl = REPL(session, tool_registry, llm_client, display, workspace)
+    # 5. Load agent specs from config (🔲 planned)
+    # load() only parses AgentSpecs — no Agent instances are created yet.
+    # Runtime dependencies (workspace, llm_client, session) are injected
+    # lazily via get() so each agent receives the resolved session context.
+    # Per-agent PermissionManagers are also created in get(), not here.
+    agent_registry = AgentRegistry(config)
+    agent_registry.load()
+    # If agents are configured, register CallAgentTool on the coordinator's
+    # tool registry. If agents: is absent/empty, this is a no-op.
+
+    # 6. Initialise task manager for this session (🔲 planned)
+    task_manager = TaskManager(session.session_dir)
+
+    # 7. Start REPL
+    repl = REPL(session, tool_registry, llm_client, display, workspace,
+                agent_registry=agent_registry, task_manager=task_manager)
     repl.run()
 ```
 
 `_pick_session()` handles `--resume` (interactive picker via `display.show_session_list()`),
 `--resume <id>` (direct load), `--continue` (most recent or new), and bare start (new session).
-On resume, `permission_manager.reset()` and `tool_registry.reset_session_overrides()` are called
-to clear all session-scoped state.
+On resume, the CLI always launches a fresh process, so `PermissionManager` and
+`ToolRegistry` are reconstructed from scratch.  The startup sequence still calls
+`permission_manager.reset()` and `tool_registry.reset_session_overrides()` explicitly
+after construction (these are no-ops on fresh instances) to satisfy the contract in
+`docs/technical_requirements.md` and to remain correct for any future in-process
+session-switching path that does not restart the process.
 
-MCP support (`mcp_manager.connect_all()` / `disconnect_all()`) is 🔲 planned and will be inserted at step 3.
+Session resolution happens before tool loading so that logging can be initialised
+with `session.session_dir` and tool activity is captured in the session log.
+`AgentRegistry.load()` parses specs only (no runtime dependencies).  Agent
+instantiation is deferred to `get()`, which injects workspace, llm_client, and
+session lazily so that every agent — ephemeral or session-persistent — receives
+the resolved session context, and each gets its own isolated `PermissionManager`.
+
+MCP support (`mcp_manager.connect_all()` / `disconnect_all()`) is 🔲 planned and will be inserted at step 4.

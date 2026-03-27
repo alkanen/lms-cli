@@ -61,7 +61,7 @@ This project aims to replace the existing `lms_cli` with a more robust, flexible
      3. Project-specific config: `<project>/.ai-cli/config.yaml`.
      4. CLI flag overrides (highest priority).
      - Project config always wins over global config. Global config acts as default values for projects that do not override them.
-     - Persistent runtime mutations (`/tools enable`, `/tools allow`, `set_permission_required`, etc., **without** `--session`) are written to the **project** config so that changes are scoped to the current project and do not affect other projects. Session-scoped variants (`--session`) are held in memory only and are not persisted.
+     - **Intended behavior (planned refactor):** Runtime mutations to tool settings (via `/tools allow`, `set_permission_required`, etc.) should be **in-memory only by default** — applying for the current session without being written to disk. To persist a change, the user must explicitly opt in: `--persist` writes to the project config (scoped to the current project); `--global` writes to `~/.ai-cli/config.yaml` (affects all projects and requires a confirmation step). This is a planned change; the current implementation persists to the project config by default. See the Permission System section below.
      - If no model configuration is found at any level, the CLI exits with a clear error message guiding the user to set one up.
 
 7. **Improved Permission Handling**
@@ -104,13 +104,19 @@ ai-cli/
 │   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, argument validation
 │   │   ├── llm_client.py           # ✅ LLMClient ABC + OpenAIClient (REST/streaming); LMStudio WebSocket 🔲
 │   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist
-│   │   └── mcp_manager.py          # 🔲 MCP server connections, tool exposure
+│   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
+│   │   ├── agent.py               # 🔲 Agent, AgentSpec, AgentResult, SubAgentDisplay
+│   │   ├── agent_registry.py      # 🔲 AgentSpec loading from config, instance caching
+│   │   ├── task_manager.py        # 🔲 Task tree persistence, validation, queries
+│   │   └── task_orchestrator.py   # 🔲 Deterministic plan→execute→review loop (/plan)
 │   ├── tools/                      # Bundled tools
 │   │   ├── base.py                 # ✅ Tool ABC; ToolArgument (with min/max bounds); ToolSchema
 │   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
-│   │   └── tool_manager.py         # ✅ Context-saving tool gatekeeper
+│   │   ├── tool_manager.py         # ✅ Context-saving tool gatekeeper
+│   │   ├── call_agent.py          # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
+│   │   └── tasks.py               # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/                        # CLI interface and user-facing components
 │   │   ├── repl.py                 # ✅ REPL loop; all slash commands; keyboard shortcuts; streaming abort
 │   │   ├── display.py              # ✅ Display ABC + PlainDisplay + RichDisplay
@@ -211,9 +217,10 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 
 2. **Permission System** ✅
    - `PermissionManager` handles in-memory grants (yes/no/always/custom rejection).
-   - `always` grants are stored per tool name. They persist unless `PermissionManager.reset()` is explicitly called — the session manager must call both `PermissionManager.reset()` and `ToolRegistry.reset_session_overrides()` on session resume to clear all session-scoped state.
-   - File tools (`read_file`, `write_file`) additionally manage session-scoped file/dir allow-lists at the tool level via `extra_permission_options()` / `on_permission_granted()` / `reset_session_state()`, which are cleared by `ToolRegistry.reset_session_overrides()`.
+   - `always` grants are stored per tool name for the lifetime of the process. The startup sequence explicitly calls `PermissionManager.reset()` and `ToolRegistry.reset_session_overrides()` on every resume, as required by `technical_requirements.md`. Because `PermissionManager` and `ToolRegistry` are created fresh at process start these calls are no-ops in practice, but they satisfy the contract and ensure correctness for any future in-process session-switching path.
+   - File tools (`read_file`, `write_file`) additionally manage session-scoped file/dir allow-lists at the tool level via `extra_permission_options()` / `on_permission_granted()` / `reset_session_state()`. These are cleared by `ToolRegistry.reset_session_overrides()`, which iterates over all registered tools and calls their `reset_session_state()` hook.
    - The universal four options (yes/no/always/custom) are always rendered by the prompt implementation. `PermissionManager` passes only tool-specific extras to `prompt_fn`; the prompt handles the universal set itself.
+   - **Planned refactor — invert mutation default:** Currently `ToolRegistry.set_permission_required()` persists to the project config by default, with `--session` as the opt-out for temporary changes. The intended design inverts this: mutations are in-memory only by default; `--persist` writes to the project config; `--global` (with a confirmation step, because it affects all projects) writes to `~/.ai-cli/config.yaml`. The underlying `ToolRegistry` API should adopt the same default so callers that need in-memory-only overrides (e.g. `build_agent_tool_registry()`) work naturally without workarounds.
 
 3. **Bundled Tools** ✅
    - `read_file` ✅ — workspace-scoped, no permission by default, disabled by default, session allow-list, line-range support.
@@ -251,12 +258,12 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - Route `{"type": "reasoning", "delta": str}` chunks to `display.stream_reasoning()`.
      - Capture `usage` from `"done"` chunk and call `display.update_usage(usage, context_window)`.
      - `/history` command: call `display.show_history(session.get_messages())`.
-     - After each tool execute, call `tool.format_display(args, result)` and pass result to `display.show_tool_result(..., display_str=...)`.  See `docs/design_display.md` — Tool call display.
+     - After each tool execute, call `tool.format_display(args, result)` and pass result to `display.show_tool_result(..., display_str=...)`.  See [design_display.md](design_display.md) — Tool call display.
 
 4. **Display** ✅
    - `Display` ABC with full interface defined.
    - `PlainDisplay` ✅ — `print()`-based output, `prompt_toolkit` for interactive prompts.
-   - `RichDisplay` ✅ — fully implemented (see `docs/design_display.md`). Key design points:
+   - `RichDisplay` ✅ — fully implemented (see [design_display.md](design_display.md)). Key design points:
      - Scrolling output model (no fixed TUI panels); TUI layout deferred as future `TUIDisplay`.
      - `_LeftBorderRenderable` helper: custom `__rich_console__` adds `│ ` prefix to each rendered line.
      - `Live(transient=True)` with `_LiveRenderable` (re-calls build function on every refresh tick) during streaming → formatted Markdown on turn end.
@@ -301,10 +308,34 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 
 ### Phase 4: Advanced Features 🔲
 
-2. **MCP Server Support**
+1. **Multi-Agent System** 🔲
+   - See [design_agents.md](design_agents.md) for full design.
+   - `agent.py` — `Agent` class (extracted send→tool→loop from REPL), `AgentSpec`, `AgentResult`, `SubAgentDisplay`.
+   - `agent_registry.py` — loads `AgentSpec` entries from the `agents:` config section, caches session-persistent agent instances.
+   - `call_agent.py` — `CallAgentTool` registered on the coordinator when agents are configured. Dynamically builds its tool description from available agent types.
+   - REPL refactor: extract `_send_rounds()` into `Agent.run()`. The REPL constructs a main `Agent` (the coordinator) and delegates to it. Zero behavioural change when `agents:` is absent or empty.
+   - `SubAgentDisplay` captures output in a buffer; permission prompts default to "no".
+   - Per-agent `ToolRegistry` instances with independent tool sets and permission overrides.
+   - Sequential execution by default (single-GPU constraint). Parallel opt-in via `call_agents_parallel` tool gated by `agent_settings.allow_parallel: true`.
+   - Persistence modes: `ephemeral` (fresh context per call) and `session` (context accumulates across calls within the CLI session).
+   - Context overflow: token monitoring → structured `AgentResult(status="context_limit")` → coordinator decides how to proceed.
+
+2. **Task System** 🔲
+   - See [design_task_system.md](design_task_system.md) for full design.
+   - `task_manager.py` — persistent task tree (`<session_dir>/tasks.json`). Enforces status transitions, parent–child integrity, completion validation (all subtasks must be `done`).
+   - Six task tools in `tasks.py`: `tasks_list`, `tasks_get`, `tasks_create`, `tasks_update`, `tasks_add_note`, `tasks_mark_done`. See [design_task_system.md](design_task_system.md) for the canonical per-role tool-access table (planner / executor / reviewer).
+   - Hybrid orchestration:
+     - **Interactive mode** — coordinator LLM uses task tools + `call_agent` during normal conversation. No Python orchestrator involved.
+     - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
+   - `/tasks [task_id]` slash command for viewing the task tree without an LLM call.
+   - Progressive disclosure: `tasks_list` returns ~10 tokens per task; `tasks_get` returns full detail on demand. Keeps agents focused even when context windows are large (90K–262K).
+   - Three agent roles: planner (read-only, creates task structure), executor (reads/writes files, updates tasks), reviewer (optional, validates DoD and marks done).
+   - Reviewer is optional — when not configured, the executor marks tasks done directly via `tasks_mark_done`.
+
+3. **MCP Server Support** 🔲
    - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
 
-3. **LM Studio WebSocket backend**
+4. **LM Studio WebSocket backend** 🔲
    - Optional; LM Studio currently works via its OpenAI-compatible HTTP endpoint.
 
 ---
@@ -320,6 +351,10 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 - **Session resume**: `--resume` (pick from list), `--resume <id>` (direct), `--continue` (most recent or new). Flag routing wired into `__main__.py` via `_pick_session()` ✅. Remaining planned behaviours 🔲: (a) session list displaying name and last-message preview with role indicator (currently shows `first_user_message` only); (b) on resume, prompt to resend if the last message was from the user, or display the last assistant message in full so the user can respond.
 - **Output modes**: Summary (default) and verbose, toggled via `/verbose` slash command (keyboard shortcut binding TBD).
 - **`find_files` directory pruning**: Ignored directories are pruned from `os.walk` for performance. Files inside an ignored directory are never returned even if a negation rule would re-include them — this matches standard Git walk behaviour and is essential for avoiding traversal of `env/`, `.git/`, `node_modules/`, etc.
+- **Multi-agent system**: Sub-agents are independent `Agent` instances with isolated sessions, tool registries, and optionally different models/backends. The coordinator dispatches via `CallAgentTool`. When `agents:` is absent/empty in config, no agent infrastructure is initialised and the CLI behaves identically to today. Sequential by default (single-GPU); parallel is opt-in.
+- **Task system — hybrid orchestration**: Interactive mode (coordinator LLM drives tasks via tools) and autonomous mode (`/plan` command, deterministic Python orchestrator). Both share the same `tasks.json` file and task tools. The orchestrator spends zero LLM calls on routing — only sub-agent work uses the GPU.
+- **Task system — reviewer is optional**: When no reviewer agent is configured, the executor marks tasks done directly. The `in_review` status is only meaningful when a reviewer is active.
+- **Hardware target**: Primary deployment is a single consumer GPU (~24 GiB VRAM, 90K–262K token context depending on model). Sequential agent calls are the norm. Progressive disclosure is for focus, not token budget.
 - **Multimodal `@` references — canonical content block format**: Image files attached via `@ref` are stored in session history using the OpenAI `chat/completions` content block shape (`"type": "text"` / `"type": "image_url"`) as the canonical in-memory and on-disk representation. Backend adapters that target other endpoints (e.g. the OpenAI `responses` API) translate to the required wire format before sending. This keeps the session layer backend-agnostic. See `docs/technical_requirements.md` — Multimodal Messages.
 
 ## Assumptions
@@ -353,10 +388,12 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ## Next Steps (priority order)
 1. **`logging_utils.py`** — JSONL structured logging to session-specific folders.
 2. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
-3. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
-4. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
-5. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
-6. **`/tools allow` REPL command** — calls `ToolRegistry.set_permission_required()`; writes `user_confirmed: true` to project config.
+3. **Multi-agent system** — `agent.py`, `agent_registry.py`, `call_agent.py`, `SubAgentDisplay`. REPL refactor to extract `Agent.run()`. See [design_agents.md](design_agents.md).
+4. **Task system** — `task_manager.py`, `task_orchestrator.py`, `tasks.py`. `/plan` and `/tasks` slash commands. See [design_task_system.md](design_task_system.md).
+5. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
+6. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
+7. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
+8. **`/tools allow` REPL command + permission mutation refactor** — Invert the default persistence of `ToolRegistry.set_permission_required()`: bare invocation is in-memory only for the current session; `--persist` writes to the project config (`user_confirmed: true`); `--global` writes to `~/.ai-cli/config.yaml` (requires a confirmation step because it affects all projects). Update the underlying `ToolRegistry` API to match — temporary by default — so callers that need in-memory overrides (e.g. per-agent `ToolRegistry` factories) do not need to work around the API.
 
 ## Dependencies
 - Python 3.10+
