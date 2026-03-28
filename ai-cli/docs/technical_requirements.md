@@ -479,6 +479,103 @@ See `design_task_system.md` for the full schema and tool definitions.
 
 ---
 
+## Embedding Index and Semantic Search
+
+See `design_embeddings.md` for the full design. This section covers the technical
+constraints that affect implementation choices.
+
+### Runtime Dependencies
+
+The embedding subsystem is optional. Its dependencies are declared under
+`[project.optional-dependencies]` in `pyproject.toml`, not as core
+dependencies, so users who do not enable embeddings incur no additional
+install cost:
+
+```
+pip install ai-cli[embeddings]           # numpy, xxhash, tomli (Python <3.11)
+pip install ai-cli[embeddings,semantic]  # [embeddings] + tree-sitter grammars
+```
+
+- **`numpy>=1.24`** — vectorised float32 dot-product search in
+  `SQLiteVectorStore.search()` and element-wise mean in `EmbeddingIndex`.
+- **`xxhash>=3.0`** — fast non-cryptographic hashing for per-file change
+  detection (`xxhash.xxh64(content).hexdigest()`).
+- **`tomli>=2.0; python_version < '3.11'`** — TOML chunking on Python < 3.11
+  (`tomllib` is stdlib on 3.11+). Included as a conditional marker inside the
+  `[embeddings]` extra so it is ignored when running on 3.11+.
+
+Additionally, `pyyaml` (already a core dependency) is used by the YAML-based
+domain chunkers.
+
+### Storage
+
+- All index data is stored in a single WAL-mode SQLite database at
+  `<project>/.ai-cli/embeddings/index.db`.
+- Vectors are stored as raw `float32` little-endian bytes (numpy `ndarray.tobytes()`).
+  Dimension is stored in the `meta` table and validated on every load.
+- Schema version is stored in `meta`; a version mismatch triggers a full re-index
+  with a clear user-facing message rather than a silent corruption.
+
+### Change Detection
+
+- File identity is tracked by `xxhash64(file_content)` stored as `char_hash`.
+  This is correct across all filesystems and git checkout/merge scenarios
+  where mtime is reset. `xxhash` is a fast non-cryptographic hash with a
+  well-maintained PyPI package.
+- `EmbeddingIndex.index()` calls `VectorStore.all_file_hashes()` once at the
+  start of each run to build the full known-hash map, then scans the filesystem
+  to detect new, changed, and deleted files in a single pass.
+
+### Embedding API
+
+- The `/v1/embeddings` endpoint is called via the `openai` Python client
+  (already a dependency), pointing at whatever `base_url` is configured.
+- Batch size is capped at 96 texts per request — a safe default across Ollama,
+  OpenAI, and LM Studio. Larger lists are split and results concatenated in order.
+- The model's declared dimension is retrieved from the first successful response
+  and stored in `meta.dimension`. Subsequent loads validate that the stored
+  dimension matches the current model config; a mismatch requires a full re-index.
+
+### Tree-Sitter
+
+- `tree-sitter>=0.21` is required; the 0.20→0.21 API is a breaking change.
+- Per-language grammar packages (`tree-sitter-python`, etc.) are separate PyPI
+  packages grouped under the `[semantic]` optional extra in `pyproject.toml`.
+- `TreeSitterChunker.__init__` raises `ImportError` immediately if `tree-sitter`
+  or the requested grammar package is not installed. `make_chunker()` catches
+  this and falls back to `FixedSizeChunker` without logging at warning level
+  (absence of the optional dep is not an error).
+
+### Access Control
+
+- `read_file` and `find_files` call `workspace.embedding_index.is_indexed_path(path)`
+  before falling through to the normal permission-prompt flow.
+- `is_indexed_path()` returns `True` only for paths strictly under a user-added
+  external root (not the workspace root, which is always allowed by `Workspace.contains()`).
+- External roots are persisted in the SQLite `index_roots` table and loaded at
+  `EmbeddingIndex` construction time, so access grants survive process restarts.
+
+### Performance Constraints
+
+- Target: <200 ms search latency for corpora up to 200 k chunks on a
+  mid-range CPU (numpy vectorised cosine similarity; no GPU required).
+- Indexing throughput target: ≥ 50 files/minute on an average SSD, excluding
+  LLM summary API calls. LLM summary calls are inherently limited by the
+  backend's request rate; use async batching where possible.
+- `SQLiteVectorStore` L2-normalises stored vectors row-wise on upsert so
+  cosine similarity reduces to a dot product; no separate norms cache is needed.
+
+### Testing
+
+- All tree-sitter tests must use `pytest.importorskip("tree_sitter")` so they
+  are automatically skipped when the optional dep is absent.
+- SQLite tests must not share a database path across tests — use `tmp_path`
+  fixtures to create an isolated `index.db` per test.
+- Embedding API calls must be mocked in unit tests — no real HTTP requests.
+  Use `unittest.mock.AsyncMock` for `embed()`.
+
+---
+
 ## Additional Considerations
 
 - **Tool class attributes**:

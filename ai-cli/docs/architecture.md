@@ -23,13 +23,18 @@ ai-cli/
 │   │   ├── agent.py              # 🔲 Agent, AgentSpec, AgentResult, SubAgentDisplay
 │   │   ├── agent_registry.py     # 🔲 AgentSpec loading from config, instance caching
 │   │   ├── task_manager.py       # 🔲 Task tree persistence, validation, queries
-│   │   └── task_orchestrator.py  # 🔲 Deterministic plan→execute→review loop (/plan)
+│   │   ├── task_orchestrator.py  # 🔲 Deterministic plan→execute→review loop (/plan)
+│   │   ├── embedding_provider.py # 🔲 EmbeddingProvider ABC + OpenAIEmbeddingProvider
+│   │   ├── vector_store.py       # 🔲 VectorStore ABC + SQLiteVectorStore
+│   │   ├── chunker.py            # 🔲 Chunk dataclass, ChunkStrategy ABC, all chunker impls
+│   │   └── embedding_index.py    # 🔲 IndexRoot, EmbeddingIndex (orchestration + access control)
 │   ├── tools/
 │   │   ├── base.py               # ✅ Tool abstract base class
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py         # ✅ Glob-pattern file search with ignore-rule enforcement
 │   │   ├── tool_manager.py       # ✅ Context-saving tool gatekeeper
+│   │   ├── search_files.py       # 🔲 search_files tool (semantic search over indexed corpus)
 │   │   ├── call_agent.py         # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
 │   │   └── tasks.py              # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/
@@ -54,11 +59,13 @@ repl → tool_registry → permission_manager
 repl → display
 repl → agent_registry
 repl → task_orchestrator
+repl → embedding_index          (via workspace.embedding_index; /index command)
 session_manager → workspace
 tool_registry → workspace
 tool_registry → config_manager
 workspace → config_manager
 workspace → ignore_filter
+workspace → embedding_index     (optional attribute; None when embeddings disabled)
 mcp_manager → tool_registry
 agent → llm_client
 agent → session_manager
@@ -72,6 +79,14 @@ task_orchestrator → task_manager
 task_orchestrator → agent_registry
 task_orchestrator → display
 tasks (tools) → task_manager
+embedding_index → embedding_provider
+embedding_index → vector_store
+embedding_index → chunker
+embedding_index → workspace     (is_ignored(), workspace root path)
+embedding_index → llm_client    (optional; summary strategy only)
+search_files (tool) → embedding_index   (via workspace.embedding_index)
+read_file (tool)    → embedding_index   (via workspace.embedding_index; access control)
+find_files (tool)   → embedding_index   (🔲 planned, via workspace.embedding_index; access control for path parameter)
 ```
 
 ---
@@ -96,6 +111,11 @@ class ConfigManager:
     def get_model_config(self) -> dict:
         """Returns merged model/backend config. Raises ConfigError if none found.
         Resolves api_key_env to the actual key from the environment."""
+
+    def get_embedding_config(self) -> dict | None:
+        """Returns merged embedding config, or None if embeddings.enabled is falsy.
+        Inherits base_url and api_key_env from the LLM config when not set in
+        the embeddings section. Raises ConfigError if enabled but model is missing."""
 ```
 
 Raises `ConfigError` with a helpful message if required config (model/backend) is missing at all levels.
@@ -119,6 +139,9 @@ class Workspace:
     @staticmethod
     def initialise(path: Path) -> None:
         """Create .ai-cli/ scaffold with template files. Called by --init."""
+
+    def contains(self, path: Path) -> bool:
+        """Return True if path is at or below the workspace root."""
 
     def is_ignored(self, path: Path) -> bool:
         """Check path against global + project .ignore rules."""
@@ -347,6 +370,100 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 
 ---
 
+### Embedding Subsystem 🔲
+
+See `design_embeddings.md` for the full design. Interfaces are summarised here.
+
+#### `EmbeddingProvider` ABC
+
+```python
+class EmbeddingProvider(ABC):
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_sync(self, texts: list[str]) -> list[list[float]]: ...
+    @property
+    def dimension(self) -> int: ...
+    @property
+    def model(self) -> str: ...
+```
+
+`embed()` is used by `EmbeddingIndex.index()` (bulk, called with `await` from
+the REPL). `embed_sync()` is used by `EmbeddingIndex.search()` (single query,
+called from synchronous tool `execute()` inside the running event loop — must
+not use `asyncio.run()` internally). Both use the `openai` client; `embed_sync()`
+uses the synchronous client variant.
+
+`OpenAIEmbeddingProvider` hits `/v1/embeddings` via the `openai` client.
+Backend config (base_url, api_key) is resolved by `ConfigManager.get_embedding_config()`
+which falls back to the LLM backend when embedding-specific values are absent.
+
+#### `VectorStore` ABC
+
+```python
+@dataclass
+class SearchResult:
+    id: str
+    score: float        # cosine similarity [-1, 1]
+    metadata: dict
+
+class VectorStore(ABC):
+    def upsert(self, ids, vectors, metadata) -> None: ...
+    def delete_by_file(self, file_path: str) -> None: ...
+    def search(self, query_vector, k=10, chunk_type=None) -> list[SearchResult]: ...
+    def all_file_hashes(self) -> dict[str, str]: ...
+    def clear(self) -> None: ...
+```
+
+`SQLiteVectorStore` stores vectors as float32 blobs in a WAL-mode SQLite
+database at `.ai-cli/embeddings/index.db`. Search loads all vectors into a
+numpy matrix for vectorised cosine similarity. Swap-in path: implement the ABC,
+update the factory — no other changes required.
+
+#### `Chunk` + `ChunkStrategy`
+
+```python
+@dataclass
+class Chunk:
+    start_line: int; end_line: int; text: str
+    symbol_name: str | None; symbol_kind: str | None
+
+class ChunkStrategy(ABC):
+    def chunk(self, text: str, path: Path) -> list[Chunk]: ...
+```
+
+Implementations: `FixedSizeChunker`, `TreeSitterChunker` (optional dep,
+raises `ImportError` gracefully), `MultiDocYamlChunker`, `AnsibleChunker`,
+`ComposeChunker`, `TomlChunker`.
+
+`make_chunker(path, config)` selects the appropriate implementation: domain
+chunkers first, then tree-sitter if available, then fixed-size fallback.
+
+#### `EmbeddingIndex`
+
+```python
+@dataclass
+class IndexRoot:
+    path: Path; label: str | None; added_at: str
+
+class EmbeddingIndex:
+    async def index(self, roots=None, *, incremental=True) -> IndexStats: ...
+    def add_root(self, path: Path, label=None) -> None: ...
+    def remove_root(self, path: Path) -> None: ...
+    @property
+    def roots(self) -> list[IndexRoot]: ...
+    def is_indexed_path(self, path: Path) -> bool: ...
+    def search(self, query, k=10, level="chunk", path_glob=None) -> list[SearchResult]: ...
+```
+
+`Workspace` gains `embedding_index: EmbeddingIndex | None` (set by startup
+sequence when `embeddings.enabled: true`). Tools access it via `workspace.embedding_index`.
+
+Access control: `is_indexed_path()` returns `True` for paths under any
+user-added external root. `read_file` and `find_files` call this to decide
+whether a non-workspace path is accessible without a permission prompt.
+Indexing a path = granting read access to it; removing a root revokes access.
+
+---
+
 ### Bundled Tools ✅
 
 #### `read_file`
@@ -358,6 +475,7 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 - `extra_permission_options()` generates `file:./…` and `dir:./…/` options for each path level up to workspace root
 - `on_permission_granted()` adds the resolved path/dir to `_session_allowed_files` / `_session_allowed_dirs`
 - `reset_session_state()` clears both allow-lists
+- **Extended access** (🔲): also permits paths under `workspace.embedding_index.is_indexed_path()` when embeddings are enabled
 
 #### `write_file`
 - `PERMISSION_REQUIRED = True`, `DISABLED_BY_DEFAULT = True`
@@ -368,6 +486,19 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
   - Append-at-EOF: `start_line == end_line == total_lines + 1` — appends after the last line
 - Response data: `{path, summary, lines_written}`
 - Same session-scoped allow-list pattern as `read_file`
+- **No extended access for indexed paths** — external indexed roots are read-only grants; `write_file` remains workspace-scoped regardless of what is indexed.
+
+#### `find_files` ✅ (extended 🔲)
+- `PERMISSION_REQUIRED = False`, `DISABLED_BY_DEFAULT = True`
+- Parameters: `pattern` (required glob); `path` (🔲 planned: optional, relative to workspace root or an external indexed root)
+- **Extended access** (🔲): planned alongside the `path` parameter — when `path` resolves to an external indexed root, walks that root instead of rejecting it
+
+#### `search_files` 🔲
+- `PERMISSION_REQUIRED = False`, `DISABLED_BY_DEFAULT = True`
+- Only registered when `embeddings.enabled: true`
+- Parameters: `query` (required), `k` (default 5, max 20), `level` ("chunk" | "document" | "both", default "chunk"), `path_glob` (optional)
+- Returns ranked results with `file`, `start_line`, `end_line`, `symbol_name`, `symbol_kind`, `score`, `snippet`
+- `snippet` is read live at query time (not from the index) so it always reflects current file content
 
 ---
 

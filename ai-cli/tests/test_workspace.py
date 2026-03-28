@@ -143,6 +143,42 @@ class TestInitialiseGlobal:
 
 
 # ---------------------------------------------------------------------------
+# contains
+# ---------------------------------------------------------------------------
+
+
+class TestContains:
+    def test_absolute_path_under_root(self, workspace, project):
+        assert workspace.contains(project / "src" / "foo.py")
+
+    def test_root_itself(self, workspace, project):
+        assert workspace.contains(project)
+
+    def test_relative_path_under_root(self, workspace, project):
+        # A relative path is resolved against the workspace root before checking.
+        assert workspace.contains(Path("src/foo.py"))
+
+    def test_absolute_path_outside_root(self, workspace, tmp_path):
+        outside = tmp_path.parent / "other_project" / "file.py"
+        assert not workspace.contains(outside)
+
+    def test_dotdot_escape_returns_false(self, workspace, project):
+        escape = project / ".." / ".." / "etc" / "passwd"
+        assert not workspace.contains(escape)
+
+    @pytest.mark.skipif(
+        not hasattr(Path, "symlink_to"),
+        reason="symlinks not supported on this platform",
+    )
+    def test_symlink_escape_returns_false(self, workspace, project, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside_dir")
+        link = project / "link_to_outside"
+        link.symlink_to(outside)
+        # The symlink itself is under the root, but its resolved target is not.
+        assert not workspace.contains(link / "secret.txt")
+
+
+# ---------------------------------------------------------------------------
 # resolve / path-escape protection
 # ---------------------------------------------------------------------------
 
