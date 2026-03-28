@@ -171,6 +171,20 @@ class _AbortMonitor:
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.1)
 
+    def pause(self) -> None:
+        """Stop the monitor synchronously so stdin is free for an interactive prompt.
+
+        Calls :meth:`stop` and joins the thread so the caller can be certain
+        the monitor is not mid-read when the prompt acquires stdin.  The
+        terminal is restored to its original settings by :meth:`stop`, so
+        ``pt_prompt`` / ``input()`` each configure their own mode.
+        """
+        self.stop()
+
+    def resume(self) -> None:
+        """Restart the monitor after the interactive prompt returns."""
+        self.start()
+
     def _run(self) -> None:
         fd = sys.stdin.fileno()
         try:
@@ -880,12 +894,31 @@ class REPL:
         # thread sets it on KeyboardInterrupt.
         abort = threading.Event()
         monitor = _AbortMonitor(abort)
-        monitor.start()
+
+        # Wrap the permission prompt so the monitor yields stdin while the
+        # user is responding.  Without this, _AbortMonitor races with
+        # pt_prompt for the same fd: it may consume the CPR response
+        # (ESC[...R) as a lone ESC and spuriously set the abort flag, or
+        # swallow the user's keypress entirely.
+        pm = self._tool_registry.permission_manager
+        _orig_prompt_fn = pm.prompt_fn
+
+        def _paused_prompt_fn(question: str, extras: list[str]) -> tuple[str, str]:
+            monitor.pause()
+            try:
+                return _orig_prompt_fn(question, extras)
+            finally:
+                monitor.resume()
 
         try:
-            self._send_rounds(user_input, abort)
+            pm.prompt_fn = _paused_prompt_fn
+            monitor.start()
+            try:
+                self._send_rounds(user_input, abort)
+            finally:
+                monitor.stop()
         finally:
-            monitor.stop()
+            pm.prompt_fn = _orig_prompt_fn
 
     def _send_rounds(
         self, user_input: str | list[dict], abort: threading.Event
@@ -1011,8 +1044,34 @@ class REPL:
             if not tool_calls:
                 break
 
-            for call in tool_calls:
+            for i, call in enumerate(tool_calls):
                 if abort.is_set():
+                    # The assistant message (with tool_calls) was already saved.
+                    # Inject stub results for every unexecuted call so the
+                    # session history stays valid — the API requires a role:tool
+                    # result for every call_id in the preceding assistant turn.
+                    for pending in tool_calls[i:]:
+                        try:
+                            self._session.add_raw_message(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": pending["call_id"],
+                                    "content": json.dumps(
+                                        {
+                                            "status": "error",
+                                            "error": "aborted",
+                                            "message": "Aborted by user.",
+                                            "code": 499,
+                                        }
+                                    ),
+                                }
+                            )
+                        except SessionError as exc:
+                            logger.error(
+                                "Failed to inject abort stub for call_id=%r: %s",
+                                pending["call_id"],
+                                exc,
+                            )
                     self._display.show_status("Aborted.")
                     return
                 self._display.show_tool_call(call["name"], call["arguments"])

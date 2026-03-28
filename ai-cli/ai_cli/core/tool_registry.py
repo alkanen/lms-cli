@@ -328,6 +328,11 @@ class ToolRegistry:
         # name → ToolSchema cached at registration time (for arg validation)
         self._schemas: dict[str, ToolSchema] = {}
 
+    @property
+    def permission_manager(self) -> PermissionManager:
+        """The :class:`PermissionManager` that gates tool execution."""
+        return self._permission_manager
+
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------

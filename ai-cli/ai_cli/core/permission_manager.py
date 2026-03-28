@@ -60,6 +60,14 @@ class PermissionManager:
         self._prompt_fn = prompt_fn
         self._always_allowed: set[str] = set()
 
+    @property
+    def prompt_fn(self) -> PromptFn:
+        return self._prompt_fn
+
+    @prompt_fn.setter
+    def prompt_fn(self, fn: PromptFn) -> None:
+        self._prompt_fn = fn
+
     def request(
         self,
         tool_name: str,
