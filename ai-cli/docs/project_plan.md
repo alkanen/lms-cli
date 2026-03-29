@@ -128,8 +128,8 @@ ai-cli/
 │   │   └── completer.py            # ✅ Tab completion for slash commands, tool names, and @path references
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
-│       └── logging_utils.py        # 🔲 JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (865 tests)
+│       └── logging_utils.py        # ✅ JSONL structured logging
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (911 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -239,10 +239,10 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `find_files` ✅ — glob-pattern search across the workspace, disabled by default. Supports `*`, `**`, `?`, `[ranges]`, `{alternation}`. Respects all ignore rules (global `.ignore`, project `.gitignore`, project `.ai-cli/.ignore`). Prunes ignored directories during traversal for performance (matching standard Git walk behaviour).
    - `tool_manager` ✅ — context-saving tool gatekeeper; `list` and `enable` actions; transient one-call schema injection via `ToolRegistry.enable_transient()`.
 
-4. **Error Handling** ⚠️ (partial)
+4. **Error Handling** ✅
    - Structured error dicts returned by all tool calls. ✅
-   - JSONL logging (`logging_utils.py`) 🔲
-   - Session-specific log folders in `~/.ai-cli/` 🔲
+   - JSONL logging (`logging_utils.py`) ✅ — `JsonlFormatter`, `setup_logging()`, per-module level overrides, idempotent re-call with handler dedup.
+   - Session-specific log file (`<session_dir>/session.log`) ✅ — `setup_logging` called from `__main__.py` after session selection.
 
 ### Phase 3: CLI and User Experience ⚠️ (partial)
 1. **LLMClient** ✅
@@ -314,8 +314,8 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - `enable_suspend` (default `true`) — include Ctrl+Z binding and show it in `/help`.
      - `completion_max_results` (default `200`) — cap on `@path` tab completions per keystroke; must be ≥ 1.
 
-7. **Logging** 🔲
-   - `logging_utils.py` — JSONL structured logging to session-specific folders.
+7. **Logging** ✅
+   - `logging_utils.py` — JSONL structured logging to `<session_dir>/session.log`. Integrated into `__main__.py`.
 
 ### Phase 4: Advanced Features 🔲
 
@@ -418,7 +418,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **`logging_utils.py`** — JSONL structured logging to session-specific folders.
+1. **Embedding Index and Semantic Search** — `chunker.py`, `vector_store.py`, `embedding_provider.py`, `embedding_index.py`, `search_files.py` tool, `/index` slash command. See [design_embeddings.md](design_embeddings.md). Steps 1–3 are independent and can proceed in parallel.
 2. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
 3. **Multi-agent system** — `agent.py`, `agent_registry.py`, `call_agent.py`, `SubAgentDisplay`. REPL refactor to extract `Agent.run()`. See [design_agents.md](design_agents.md).
 4. **Task system** — `task_manager.py`, `task_orchestrator.py`, `tasks.py`. `/plan` and `/tasks` slash commands. See [design_task_system.md](design_task_system.md).
