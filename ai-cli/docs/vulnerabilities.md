@@ -242,6 +242,60 @@ per-tool `execute_log()` overrides for safe detail.
 
 ---
 
+## VULN-009 — `SQLiteVectorStore.search()` loads all matching vectors into memory
+
+**Component:** `ai_cli/core/vector_store.py` — `SQLiteVectorStore.search()`
+
+**Severity:** Low (local single-user tool; no security boundary crossed)
+
+**Status:** Deferred — index sizes are small enough that this is not yet a practical concern
+
+### Description
+
+`search()` fetches all rows matching the `chunk_type`/`path_glob` filters with
+`fetchall()` and deserialises every vector blob before selecting the top-k.
+This is O(N · dim) in memory, where N is the total number of matching chunks
+and dim is the embedding dimension (typically 768–4096 floats).
+
+For a corpus with tens of thousands of chunks the peak allocation can reach
+hundreds of MB per search call.  A sufficiently large index (or a very broad
+`path_glob`) could cause the process to exhaust available memory or become
+noticeably slow.
+
+### Conditions required
+
+- The embedding index must contain a large number of chunks (tens of thousands
+  or more).
+- A search query must match a large fraction of those chunks (no narrow filter).
+
+### Proposed mitigation
+
+Stream rows in batches using `cursor.fetchmany()` and maintain a fixed-size
+min-heap of the top-k candidates so that only k entries are held in memory at
+any time, reducing peak allocation from O(N · dim) to O(k · dim):
+
+```python
+import heapq
+batch_size = max(128, min(4096, k * 4))
+top_k = []
+with self._lock:
+    cursor = self._conn.execute(sql, params)
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            arr = np.frombuffer(row[-1], dtype=np.float32)
+            score = float(np.dot(arr, q))
+            item = (score, row[0], arr.copy(), row[1:-1])
+            if len(top_k) < k:
+                heapq.heappush(top_k, item)
+            elif score > top_k[0][0]:
+                heapq.heapreplace(top_k, item)
+```
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`

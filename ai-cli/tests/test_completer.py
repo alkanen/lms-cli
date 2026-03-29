@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 
 from prompt_toolkit.document import Document
 
-from ai_cli.cli.completer import DEFAULT_MAX_PATH_COMPLETIONS, REPLCompleter
+from ai_cli.cli.completer import (
+    DEFAULT_MAX_PATH_COMPLETIONS,
+    REPLCompleter,
+    _tokenize_command,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -19,6 +23,7 @@ CMDS = [
     "exit",
     "help",
     "history",
+    "index",
     "markdown",
     "rounds",
     "session",
@@ -412,3 +417,160 @@ class TestAtPathCompletion:
             result = _completions(c, "@")
         assert "ok.py" in result
         assert "broken" not in result
+
+    def test_space_in_name_is_backslash_escaped(self, tmp_path):
+        """Completions for filenames with spaces use backslash escaping."""
+        (tmp_path / "my file.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "@")
+        assert r"my\ file.txt" in result
+
+    def test_space_in_name_start_position_covers_raw_partial(self, tmp_path):
+        """start_position covers the raw (escaped) partial, not the decoded one."""
+        (tmp_path / "my file.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        # User has typed "my\ " (4 raw chars) which decodes to "my " (3 chars).
+        raw_partial = r"my\ "
+        doc = Document("@" + raw_partial, cursor_position=1 + len(raw_partial))
+        event = MagicMock()
+        completions = list(c.get_completions(doc, event))
+        assert len(completions) == 1
+        assert completions[0].text == r"my\ file.txt"
+        assert completions[0].start_position == -len(raw_partial)
+
+    def test_escaped_space_in_subdir_is_traversable(self, tmp_path):
+        """@dir\\ with\\ spaces/ completes into the directory contents."""
+        spaced = tmp_path / "my dir"
+        spaced.mkdir()
+        (spaced / "inside.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, r"@my\ dir/")
+        assert r"my\ dir/inside.txt" in result
+
+
+# ---------------------------------------------------------------------------
+# /index completions
+# ---------------------------------------------------------------------------
+
+
+class TestIndexCompletion:
+    def test_index_space_offers_flags_and_path(self, tmp_path):
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index ")
+        assert "--full" in result
+        assert "--file" in result
+        assert "--label" in result
+        assert "--remove" in result
+
+    def test_index_partial_flag_filters(self, tmp_path):
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index --f")
+        assert "--file" in result
+        assert "--full" in result
+        assert "--label" not in result
+        assert "--remove" not in result
+
+    def test_index_file_flag_offers_path(self, tmp_path):
+        (tmp_path / "book.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index --file ")
+        assert "book.txt" in result
+
+    def test_index_file_flag_partial_path(self, tmp_path):
+        (tmp_path / "alpha.txt").touch()
+        (tmp_path / "beta.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index --file a")
+        assert "alpha.txt" in result
+        assert "beta.txt" not in result
+
+    def test_index_label_suppresses_completions(self, tmp_path):
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index --label ")
+        assert result == []
+
+    def test_index_space_in_path_backslash_escaped(self, tmp_path):
+        """Completing a file with a space in its name inserts escaped text."""
+        (tmp_path / "my book.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index --file ")
+        assert r"my\ book.txt" in result
+
+    def test_index_file_with_escaped_partial(self, tmp_path):
+        """Typing a backslash-escaped partial matches and replaces correctly."""
+        (tmp_path / "my book.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        raw_partial = r"my\ b"
+        doc = Document(
+            "/index --file " + raw_partial, cursor_position=14 + len(raw_partial)
+        )
+        event = MagicMock()
+        completions = list(c.get_completions(doc, event))
+        assert len(completions) == 1
+        assert completions[0].text == r"my\ book.txt"
+        assert completions[0].start_position == -len(raw_partial)
+
+    def test_index_positional_path(self, tmp_path):
+        """Without --file, the positional argument also gets path completion."""
+        (tmp_path / "src").mkdir()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        result = _completions(c, "/index ")
+        assert "src/" in result
+
+    def test_index_file_single_quoted_partial(self, tmp_path):
+        """Single-quoted partial: partial_raw excludes the opening quote."""
+        (tmp_path / "my file.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        raw_partial = "'my fil"
+        doc = Document(
+            "/index --file " + raw_partial,
+            cursor_position=14 + len(raw_partial),
+        )
+        completions = list(c.get_completions(doc, MagicMock()))
+        assert len(completions) == 1
+        # The replacement must NOT re-insert the opening quote.
+        assert completions[0].start_position == -(len(raw_partial) - 1)
+
+    def test_index_file_double_quoted_partial(self, tmp_path):
+        """Double-quoted partial: partial_raw excludes the opening quote."""
+        (tmp_path / "my file.txt").touch()
+        c = _completer(workspace=_make_workspace(tmp_path))
+        raw_partial = '"my fil'
+        doc = Document(
+            "/index --file " + raw_partial,
+            cursor_position=14 + len(raw_partial),
+        )
+        completions = list(c.get_completions(doc, MagicMock()))
+        assert len(completions) == 1
+        assert completions[0].start_position == -(len(raw_partial) - 1)
+
+
+# ---------------------------------------------------------------------------
+# _tokenize_command — quote raw_start behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestTokenizeCommandQuotes:
+    def test_single_quoted_partial_raw_excludes_quote(self):
+        """`partial_raw` for a single-quoted token starts after the opening quote."""
+        completed, partial = _tokenize_command("/cmd 'some/path")
+        assert completed == ["/cmd"]
+        assert partial == "some/path"
+
+    def test_double_quoted_partial_raw_excludes_quote(self):
+        completed, partial = _tokenize_command('/cmd "some/path')
+        assert completed == ["/cmd"]
+        assert partial == "some/path"
+
+    def test_mid_token_quote_does_not_shift_raw_start(self):
+        """A quote that opens mid-token does not alter raw_start."""
+        completed, partial = _tokenize_command("/cmd abc'def")
+        assert completed == ["/cmd"]
+        # raw_start was set when whitespace was consumed, not at the quote.
+        assert partial == "abc'def"
+
+    def test_completed_quoted_token(self):
+        """A fully-closed quoted token is decoded correctly."""
+        completed, partial = _tokenize_command("/cmd 'hello world' ")
+        assert completed == ["/cmd", "hello world"]
+        assert partial == ""

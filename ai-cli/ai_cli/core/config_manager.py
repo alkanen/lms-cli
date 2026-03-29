@@ -159,6 +159,62 @@ class ConfigManager:
 
         return cfg
 
+    def get_embedding_config(self) -> dict | None:
+        """Return the merged embedding configuration, or ``None`` if disabled.
+
+        Inherits ``base_url`` and ``api_key_env`` from the top-level LLM config
+        when those keys are absent from the ``embeddings`` section.
+
+        Raises
+        ------
+        ConfigError
+            If ``embeddings.enabled`` is true but ``embeddings.model`` is not
+            set, or if ``api_key_env`` is set but the named variable is absent
+            from the environment.
+        """
+        emb_cfg = self._config.get("embeddings", {})
+        if not isinstance(emb_cfg, dict) or not emb_cfg.get("enabled"):
+            return None
+
+        model = emb_cfg.get("model")
+        if not model:
+            raise ConfigError(
+                "embeddings.enabled is true but embeddings.model is not set. "
+                "Add 'model: <embedding-model-name>' under 'embeddings:' in your config."
+            )
+
+        # Inherit base_url and api_key_env from LLM config when not overridden.
+        llm_base_url = self._config.get("base_url")
+        llm_api_key_env = self._config.get("api_key_env")
+
+        result = dict(emb_cfg)
+        emb_has_own_base_url = bool(result.get("base_url"))
+        if not emb_has_own_base_url and llm_base_url:
+            result["base_url"] = llm_base_url
+
+        # Only inherit api_key_env when the embedding endpoint is the same as
+        # the LLM endpoint.  If embeddings.base_url is set to a different value,
+        # inheriting the LLM key would silently send it to a third-party server.
+        if (
+            not result.get("api_key_env")
+            and llm_api_key_env
+            and not emb_has_own_base_url
+        ):
+            result["api_key_env"] = llm_api_key_env
+
+        # Resolve api_key from environment variable.
+        api_key_env = result.pop("api_key_env", None)
+        if api_key_env:
+            api_key = os.environ.get(api_key_env)
+            if not api_key:
+                raise ConfigError(
+                    f"embeddings.api_key_env is set to '{api_key_env}' but that "
+                    f"environment variable is not set."
+                )
+            result["api_key"] = api_key
+
+        return result
+
     def get_backend(self) -> str:
         """Return the configured backend name ('openai' or 'lmstudio').
 

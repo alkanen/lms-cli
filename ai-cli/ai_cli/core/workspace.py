@@ -20,8 +20,12 @@ import logging
 import os
 import textwrap
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ai_cli.utils.ignore_filter import IgnoreFilter
+
+if TYPE_CHECKING:
+    from ai_cli.core.embedding_index import EmbeddingIndex
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,41 @@ _INIT_TEMPLATES: dict[str, str] = {
         #   modules:         # per-module overrides (module name → level)
         #     ai_cli.tools: DEBUG
         #     ai_cli.core.llm_client: INFO
+        #
+        # ---------------------------------------------------------------------------
+        # Embedding index and semantic search  (pip install ai-cli[embeddings])
+        # ---------------------------------------------------------------------------
+        # embeddings:
+        #   enabled: false              # set to true to activate semantic search
+        #   model: nomic-embed-text     # embedding model served at base_url
+        #   # base_url: ~               # null = inherit from llm base_url above
+        #   # api_key_env: ~            # null = inherit from llm api_key_env above
+        #   # batch_size: 32            # texts per embedding API request
+        #                               # lower values (8-16) help with local servers
+        #                               # that stall on large batches (LM Studio etc.)
+        #   # request_timeout: 120.0    # seconds before an embedding request times out
+        #
+        #   chunking:
+        #     strategy: auto            # "auto" | "fixed" | "semantic"
+        #     chunk_size: 1200          # characters per chunk (fixed/auto)
+        #     chunk_overlap: 200        # character overlap between adjacent chunks
+        #     max_file_chunks: 300      # skip files that would exceed this limit
+        #     min_chunk_chars: 80       # merge tree-sitter nodes smaller than this
+        #     max_chunk_chars: 3000     # split nodes larger than this
+        #
+        #   document_embedding:
+        #     enabled: true
+        #     strategy: auto            # "auto" | "average"
+        #                               # NOTE: "summary" is not yet implemented.
+        #     # The following options are reserved for the future "summary" strategy
+        #     # (LLM-generated document vectors) and have no effect yet:
+        #     prose_extensions:         # file types that will get LLM-summary doc vectors
+        #       - .md
+        #       - .txt
+        #       - .rst
+        #       - .adoc
+        #     summary_model: ~          # null = inherit from llm model above
+        #     summary_max_tokens: 400
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
@@ -111,6 +150,41 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         #   modules:         # per-module overrides (module name → level)
         #     ai_cli.tools: DEBUG
         #     ai_cli.core.llm_client: INFO
+        #
+        # ---------------------------------------------------------------------------
+        # Embedding index and semantic search  (pip install ai-cli[embeddings])
+        # ---------------------------------------------------------------------------
+        # embeddings:
+        #   enabled: false              # set to true to activate semantic search
+        #   model: nomic-embed-text     # embedding model served at base_url
+        #   # base_url: ~               # null = inherit from llm base_url above
+        #   # api_key_env: ~            # null = inherit from llm api_key_env above
+        #   # batch_size: 32            # texts per embedding API request
+        #                               # lower values (8-16) help with local servers
+        #                               # that stall on large batches (LM Studio etc.)
+        #   # request_timeout: 120.0    # seconds before an embedding request times out
+        #
+        #   chunking:
+        #     strategy: auto            # "auto" | "fixed" | "semantic"
+        #     chunk_size: 1200          # characters per chunk (fixed/auto)
+        #     chunk_overlap: 200        # character overlap between adjacent chunks
+        #     max_file_chunks: 300      # skip files that would exceed this limit
+        #     min_chunk_chars: 80       # merge tree-sitter nodes smaller than this
+        #     max_chunk_chars: 3000     # split nodes larger than this
+        #
+        #   document_embedding:
+        #     enabled: true
+        #     strategy: auto            # "auto" | "average"
+        #                               # NOTE: "summary" is not yet implemented.
+        #     # The following options are reserved for the future "summary" strategy
+        #     # (LLM-generated document vectors) and have no effect yet:
+        #     prose_extensions:         # file types that will get LLM-summary doc vectors
+        #       - .md
+        #       - .txt
+        #       - .rst
+        #       - .adoc
+        #     summary_model: ~          # null = inherit from llm model above
+        #     summary_max_tokens: 400
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Default system prompt — applied to all projects unless a
@@ -167,6 +241,10 @@ class Workspace:
             + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
         )
         self._ignore_filter = IgnoreFilter(self._root, combined)
+
+        # Optional embedding index — set by the startup sequence after
+        # EmbeddingIndex is constructed.  None when embeddings are disabled.
+        self.embedding_index: EmbeddingIndex | None = None
 
     # ------------------------------------------------------------------
     # Properties
