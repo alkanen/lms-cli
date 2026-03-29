@@ -301,6 +301,22 @@ class Workspace:
         self._assert_within_root(resolved)
         return resolved
 
+    def contains(self, path: Path) -> bool:
+        """Return ``True`` if *path* is at or below the workspace root.
+
+        Resolves symlinks and normalises relative paths before comparison so
+        that symlink-based escapes are not treated as inside the workspace,
+        matching the security properties of ``resolve()``/``_assert_within_root()``.
+        """
+        candidate = (
+            (self._root / path).resolve() if not path.is_absolute() else path.resolve()
+        )
+        try:
+            candidate.relative_to(self._root)
+            return True
+        except ValueError:
+            return False
+
     def _assert_within_root(self, path: Path) -> None:
         try:
             path.relative_to(self._root)

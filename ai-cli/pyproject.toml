@@ -30,6 +30,26 @@ dev = [
     "ruff",
     "types-PyYAML",
 ]
+# Embedding index and semantic search (embeddings.enabled: true in config).
+# tomli is only needed on Python <3.11; tomllib is stdlib on 3.11+.
+embeddings = [
+    "numpy>=1.24",
+    "xxhash>=3.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+# Language-aware chunking via tree-sitter (chunking.strategy: semantic).
+# Requires [embeddings] — install as: pip install ai-cli[embeddings,semantic]
+semantic = [
+    "tree-sitter>=0.21",
+    "tree-sitter-python",
+    "tree-sitter-cpp",
+    "tree-sitter-rust",
+    "tree-sitter-lua",
+    "tree-sitter-go",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-bash",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
