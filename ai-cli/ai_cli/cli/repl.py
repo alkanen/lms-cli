@@ -745,7 +745,9 @@ class REPL:
         # --file: index a single file directly without root scanning.
         if single_file:
             _sf = Path(single_file)
-            resolved_file = (_sf if _sf.is_absolute() else self._workspace.root / _sf).resolve()
+            resolved_file = (
+                _sf if _sf.is_absolute() else self._workspace.root / _sf
+            ).resolve()
             if not resolved_file.is_file():
                 self._display.show_error(f"Not a regular file: {resolved_file}")
                 return
@@ -755,7 +757,9 @@ class REPL:
         roots_to_index: list[Path] | None = None
         if path:
             _p2 = Path(path)
-            resolved = (_p2 if _p2.is_absolute() else self._workspace.root / _p2).resolve()
+            resolved = (
+                _p2 if _p2.is_absolute() else self._workspace.root / _p2
+            ).resolve()
             if not resolved.is_dir():
                 self._display.show_error(
                     f"Positional path must be a directory. "

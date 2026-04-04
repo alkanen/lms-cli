@@ -82,7 +82,8 @@ embeddings:
       - .rst
       - .adoc
     summary_model: ~            # null = inherit from llm.model
-    summary_max_tokens: 400     # upper bound on summary length in tokens
+    summary_max_tokens: 400     # caps input text chars sent to LLM (~4 chars/token)
+    summary_response_tokens: ~  # word-count hint in prompt; null = chunk_size // 4
 ```
 
 ### Config resolution
@@ -207,12 +208,17 @@ from abc import ABC, abstractmethod
 
 class EmbeddingProvider(ABC):
     @abstractmethod
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        """Async bulk embed — used by EmbeddingIndex.index()."""
+    async def embed(
+        self,
+        texts: list[str],
+        on_batch: Callable[[int, int], None] | None = None,
+    ) -> list[list[float]]:
+        """Async bulk embed — used by EmbeddingIndex.index().
+        on_batch(chunks_done, chunks_total) is called after each batch."""
 
     @abstractmethod
     def embed_sync(self, texts: list[str]) -> list[list[float]]:
-        """Sync single-query embed — used by EmbeddingIndex.search().
+        """Sync single-query embed — used by search() and the summary path.
         Must NOT use asyncio.run() internally; uses the sync openai client."""
 
     @property
@@ -224,17 +230,24 @@ class EmbeddingProvider(ABC):
     @abstractmethod
     def model(self) -> str:
         """Name of the embedding model in use."""
+
+    async def aclose(self) -> None:
+        """Close the async HTTP client. Called after each indexing run so the
+        next run starts with a fresh client bound to the new event loop."""
 ```
 
 `OpenAIEmbeddingProvider` uses the `openai` client library (already a
 dependency) hitting the `/v1/embeddings` endpoint. It reads `base_url`,
-`api_key`, and `model` from the resolved embedding config.
+`api_key`, and `model` from the resolved embedding config. API key resolution
+is the sole responsibility of `ConfigManager`; the provider never reads
+environment variables directly.
 
 Requests are batched according to the configurable `batch_size` parameter
 (default 32; local servers such as LM Studio can stall on large batches, so
 the default is kept conservative). Larger input lists are split and
 concatenated. Callers may increase `batch_size` for cloud APIs that support
-larger batches; a warning is logged when the value exceeds 512.
+larger batches; a warning is logged when the value exceeds 512. A configurable
+`request_timeout` (default 120 s) prevents silent hangs on large batches.
 
 ---
 
@@ -273,6 +286,7 @@ class VectorStore(ABC):
         query_vector: list[float],
         k: int = 10,
         chunk_type: str | None = None,   # None = search all types
+        path_glob: str | None = None,    # SQLite GLOB pattern against file_path
     ) -> list[SearchResult]:
         """Return the k most similar results by cosine similarity."""
 
@@ -284,15 +298,27 @@ class VectorStore(ABC):
     @abstractmethod
     def clear(self) -> None:
         """Delete all rows from the chunks table."""
+
+    def close(self) -> None:
+        """Release resources. No-op on the base class."""
 ```
 
 ### `SQLiteVectorStore`
 
-Stores vectors as `float32` blobs. Stored vectors are L2-normalised row-wise
-on upsert; cosine similarity then reduces to a dot product with the
-L2-normalised query vector. Search loads the full vector matrix into numpy and
-performs the dot product in one vectorised call — fast enough for <200 k chunks
-(sub-100 ms on CPU). No separate norms cache is needed.
+Stores vectors as `float32` blobs. File paths are stored as POSIX strings
+(`path.as_posix()`) for cross-platform consistency. Stored vectors are
+L2-normalised row-wise on upsert; cosine similarity then reduces to a dot
+product with the L2-normalised query vector. Search loads all matching vectors
+into numpy and performs the dot product in one vectorised call — fast enough
+for <200 k chunks (sub-100 ms on CPU). No separate norms cache is needed.
+
+**Thread safety**: all DB operations are protected by a `threading.Lock`.
+The connection is created with `check_same_thread=False`. This ensures the
+store is safe to use across threads, including the background indexing thread
+and the main thread (search / tool calls). `OpenAIEmbeddingProvider` also
+uses a `threading.Lock` to guard lazy client construction and `_dimension`
+writes, since `embed_sync()` can be called concurrently from the main thread
+(search) and from `asyncio.to_thread` (summary embedding during indexing).
 
 Writes use WAL mode (`PRAGMA journal_mode=WAL`) for atomic updates during
 incremental indexing. All upserts for a single file are wrapped in one
@@ -383,8 +409,10 @@ a `hosts` key. Chunks at the **task** level: each item in a play's `tasks`,
 #### `ComposeChunker`
 
 Detects `docker-compose` files by filename pattern. Each entry under
-`services:` is one chunk, labelled with the service name. The file is also
-indexed as a document-level chunk.
+`services:` is one chunk, labelled with the service name. Handles unquoted
+(`web:`), single-quoted (`'web':`), and double-quoted (`"web":`) service keys.
+Falls back to a single services-block chunk when no individual service keys can
+be matched in the source text (e.g. keys using characters outside `[A-Za-z0-9_.-]`).
 
 #### `TomlChunker`
 
@@ -404,7 +432,7 @@ extra). Each section is one chunk.
 ### `make_chunker()` — Factory
 
 ```python
-def make_chunker(path: Path, config: dict) -> ChunkStrategy:
+def make_chunker(path: Path, config: dict, text: str | None = None) -> ChunkStrategy:
     strategy = config.get("strategy", "auto")
 
     if strategy == "fixed":
@@ -459,23 +487,57 @@ useful information.
 
 For prose files and documentation:
 
-1. **Extract skeleton** (code files only): if a code file is being treated as
-   prose (unusual but possible), pass only signatures + docstrings extracted
-   from the tree-sitter parse — not the full content. For actual prose files
-   use the full text.
-2. **LLM summarisation**: call the configured `summary_model` with a prompt
-   asking for a concise (≤ `summary_max_tokens` tokens) thematic summary of the
-   document.
-3. **Embed the summary**: call `EmbeddingProvider.embed([summary])`.
+1. **Truncate input**: the file text is truncated to `summary_max_tokens * 4`
+   characters (approximately 4 chars per token) before being sent to the LLM.
+   This bounds token cost; `summary_max_tokens` defaults to 400 (≈ 1600 chars).
+2. **LLM summarisation**: call `llm_client.send()` with a fixed system prompt
+   and the truncated text, collecting all `"text"` deltas into a single summary
+   string. The user prompt includes a word-count hint derived from
+   `summary_response_tokens` (default: `chunk_size // 4`) so the LLM targets a
+   length that fits within one embedding chunk.
+3. **Embed the summary**: call `EmbeddingProvider.embed_sync([summary])`.
 
-The skeleton optimisation for code applies equally to config files. For
-Ansible, the skeleton is the list of play names + task names (the `name:`
-fields). For Kubernetes manifests, it is `{kind}: {metadata.name}` lines.
-This typically reduces token cost by 10–100x for large files.
+No per-call `max_tokens` cap is set at the API level — the LLM client's
+configured `max_response_tokens` still applies. This avoids starving reasoning
+models of their token budget; the prompt word-count hint provides soft guidance
+instead.
 
-LLM summary calls are made **during `/index`**, not at query time. Failed
-summary calls (e.g. model unavailable) fall back to `average` with a warning
-logged.
+LLM summary calls are made **during `/index`** (dispatched via
+`asyncio.to_thread` to avoid blocking the event loop), not at query time.
+Failed summary calls (e.g. model unavailable, empty response) fall back to
+`average` with a warning logged. If `llm_client` is `None`, a clear warning is
+logged and the strategy falls back to `average` immediately. The `llm_client`
+is the same instance used for the main REPL — no separate client is
+constructed.
+
+Strategy resolution is handled by `_resolve_doc_strategy()`, shared by both
+`_compute_doc_vector()` and `_embed_and_upsert_file()`. The latter uses it to
+decide whether to dispatch to `asyncio.to_thread` — only the `summary` path
+(which makes blocking network calls) gets the thread handoff; the `average`
+path (pure numpy) runs inline.
+
+The document vector is computed **before** `delete_by_file()` so that the
+previous index data stays intact on failure and the window where the file is
+absent from the index is reduced to just the delete + upsert store operations.
+
+**`summary_model`**: if set to a non-null value, a warning is logged and the
+main LLM client is used anyway. Per-call model switching is not supported by
+the `LLMClient` interface; full `summary_model` support would require
+constructing a dedicated client and is deferred.
+
+**`summary_max_tokens`**: controls the input character budget (≈ tokens × 4),
+not the response length.
+
+**`summary_response_tokens`**: controls the word-count hint injected into the
+summary prompt (default: `chunk_size // 4`). This is a soft hint only — no API
+cap is applied. `prose_extensions` entries are normalised to lowercase for
+case-insensitive matching; a bare YAML string is treated as a single-item list.
+Invalid or null `strategy` values default to `"auto"` with a warning.
+
+> **Note:** The "skeleton extraction" optimisation (passing only signatures +
+> docstrings for code files, or structural outlines for config files) described
+> in earlier design iterations was not implemented. All file types receive the
+> full (truncated) text. Skeleton extraction may be added as an enhancement.
 
 ---
 
@@ -496,7 +558,7 @@ class EmbeddingIndex:
         store: VectorStore,
         config: dict,
         workspace: Workspace,                  # provides is_ignored() and workspace root path
-        llm_client: LLMClient | None = None,   # needed only for summary strategy
+        llm_client: LLMClient | None = None,   # needed for summary strategy
     ) -> None: ...
 
     # --- Index lifecycle ---
@@ -506,18 +568,32 @@ class EmbeddingIndex:
         roots: list[Path] | None = None,   # None = all known index_roots
         *,
         incremental: bool = True,           # False = full re-index regardless of hashes
+        on_progress: Callable[[int, int, str], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> IndexStats:
         """
         Walk each root, chunk and embed changed files, delete chunks for
         removed files. Respects the workspace IgnoreFilter for the workspace
         root; no ignore filtering for external roots (the user chose to index them).
+        on_progress(files_done, files_total, current_file) is called after each file.
+        cancelled is checked between embedding batches for cooperative cancellation.
         Returns a summary: files_indexed, files_skipped, files_deleted, chunks_added.
         """
+
+    async def index_file(self, file_path: Path, *, full: bool = False) -> None:
+        """Index a single file directly, bypassing root scanning."""
+
+    async def aclose(self) -> None:
+        """Close the provider's async HTTP client after an indexing run."""
 
     # --- Root management ---
 
     def add_root(self, path: Path, label: str | None = None) -> None:
-        """Register an external directory for indexing. Persists to index_roots table."""
+        """Register an external directory for indexing. Persists to index_roots table.
+        Raises ValueError for the filesystem root or a non-existent path."""
+
+    def update_root_label(self, path: Path, label: str | None) -> None:
+        """Update the label of an existing root without changing added_at."""
 
     def remove_root(self, path: Path) -> None:
         """Unregister a root and delete all its chunks from the index."""
@@ -526,13 +602,18 @@ class EmbeddingIndex:
     def roots(self) -> list[IndexRoot]:
         """All known index roots, loaded from the database."""
 
+    @property
+    def db_path(self) -> Path:
+        """Path to the SQLite database file."""
+
     # --- Access control ---
 
     def is_indexed_path(self, path: Path) -> bool:
         """
         Return True if path is at or below any known index root
         (other than the workspace root — that is handled by Workspace.contains()).
-        Used by read_file and find_files to grant access to external indexed paths.
+        Uses Path.resolve().relative_to() — not string prefix matching.
+        Used by read_file to grant access to external indexed paths.
         """
 
     # --- Search ---
@@ -558,8 +639,10 @@ inside an already-running loop would raise `RuntimeError`. Instead,
 - **`embed()` (async)** — used by `EmbeddingIndex.index()` for bulk indexing;
   called with `await` from the REPL's async context.
 - **`embed_sync()` (sync)** — used by `EmbeddingIndex.search()` for single-query
-  embedding at tool call time; uses the synchronous `openai.Client` (not
-  `openai.AsyncClient`) under the hood.
+  embedding at tool call time, and by the `summary` document-embedding path
+  (dispatched via `asyncio.to_thread` during indexing); uses the synchronous
+  `openai.Client` (not `openai.AsyncClient`) under the hood. Thread-safe via
+  the provider's `threading.Lock`.
 
 Both methods share the same batching and retry logic; `embed_sync()` is not a
 thin `asyncio.run()` wrapper.
@@ -672,17 +755,22 @@ mismatch) with a visual indicator.
 ## `/index` Slash Command
 
 ```
-/index [path] [--label <name>] [--full] [--remove]
+/index [path] [--label <name>] [--file <path>] [--full] [--remove]
 ```
 
 | Form | Effect |
 |---|---|
 | `/index` | Incremental index of all known roots |
-| `/index ./src` | Incremental index of `<workspace>/src` only |
+| `/index src` | Incremental index of `<workspace>/src` (relative paths resolve against workspace root) |
 | `/index /abs/path/to/docs` | Add external root + index it; persists across sessions |
 | `/index /abs/path --label corpus` | As above, with a human-readable label |
+| `/index --label new-name /abs/path` | Update the label of an existing root |
+| `/index --file src/main.py` | Index a single file directly (relative to workspace root) |
 | `/index --full` | Force full re-index (ignore hash cache) of all roots |
-| `/index --remove /abs/path` | Remove external root and delete its chunks |
+| `/index --remove ./src` | Remove a root and delete its chunks |
+
+Relative paths in all forms are resolved against the workspace root, not the
+process working directory. Tab completion is provided for paths and flags.
 
 The command runs `await embedding_index.index(...)` and reports `IndexStats`
 to the display (files indexed / skipped / deleted, time taken).
@@ -793,16 +881,19 @@ the REPL.
 
 ---
 
-## Implementation Order
+## Implementation Status
 
-1. `chunker.py` — no dependencies on the rest of the embedding stack; can be
-   developed and tested in isolation.
-2. `vector_store.py` — depends only on numpy and sqlite3 (stdlib).
-3. `embedding_provider.py` — depends only on the `openai` client.
-4. `embedding_index.py` — depends on the above three; add `Workspace.embedding_index`.
-5. Update `read_file` and `find_files` access control checks.
-6. `search_files.py` tool.
-7. `/index` slash command in `repl.py`.
-8. `ConfigManager.get_embedding_config()` (config inheritance merge).
+All planned embedding components are implemented and tested (1037 tests, all passing).
 
-Steps 1–3 are independent and can proceed in parallel.
+| Step | Module | Status |
+|---|---|---|
+| 1 | `chunker.py` | ✅ |
+| 2 | `vector_store.py` | ✅ |
+| 3 | `embedding_provider.py` | ✅ |
+| 4 | `embedding_index.py` + `Workspace.embedding_index` | ✅ |
+| 5 | `read_file` access control for external paths | ✅ |
+| 5 | `find_files` access control for `path` parameter | 🔲 planned |
+| 6 | `search_files.py` tool | ✅ |
+| 7 | `/index` slash command in `repl.py` + tab completion | ✅ |
+| 8 | `ConfigManager.get_embedding_config()` | ✅ |
+| + | `summary` document-embedding strategy | ✅ |

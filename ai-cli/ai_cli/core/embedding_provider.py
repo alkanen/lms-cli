@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import threading
 import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -163,7 +164,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 "Consider lowering it to 32 or fewer for LM Studio / Ollama.",
                 self._batch_size,
             )
-        # Lazy-initialized clients.
+        # Lazy-initialized clients.  The lock guards _sync_client and
+        # _dimension against concurrent access from the main thread (search)
+        # and the background indexing thread (asyncio.to_thread).
+        self._lock = threading.Lock()
         self._async_client: object | None = None
         self._sync_client: object | None = None
 
@@ -197,25 +201,26 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return self._async_client
 
     def _get_sync_client(self) -> object:
-        """Return (or create) the sync OpenAI client."""
-        if self._sync_client is None:
-            try:
-                from openai import OpenAI
-            except ImportError as exc:
-                raise ImportError(
-                    "openai package is required. Install it with: pip install openai"
-                ) from exc
-            kwargs: dict = {"timeout": self._request_timeout}
-            if self._base_url:
-                kwargs["base_url"] = self._base_url
-            if self._api_key:
-                kwargs["api_key"] = self._api_key
-            elif self._base_url:
-                kwargs["api_key"] = "local"
-            # (No else — no base_url means standard OpenAI endpoint; let the
-            # SDK read OPENAI_API_KEY from the environment as normal.)
-            self._sync_client = OpenAI(**kwargs)
-        return self._sync_client
+        """Return (or create) the sync OpenAI client (thread-safe)."""
+        with self._lock:
+            if self._sync_client is None:
+                try:
+                    from openai import OpenAI
+                except ImportError as exc:
+                    raise ImportError(
+                        "openai package is required. Install it with: pip install openai"
+                    ) from exc
+                kwargs: dict = {"timeout": self._request_timeout}
+                if self._base_url:
+                    kwargs["base_url"] = self._base_url
+                if self._api_key:
+                    kwargs["api_key"] = self._api_key
+                elif self._base_url:
+                    kwargs["api_key"] = "local"
+                # (No else — no base_url means standard OpenAI endpoint; let
+                # the SDK read OPENAI_API_KEY from the environment as normal.)
+                self._sync_client = OpenAI(**kwargs)
+            return self._sync_client
 
     # ------------------------------------------------------------------
     # EmbeddingProvider interface
@@ -268,7 +273,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             results.extend(batch_vecs)
 
             if self._dimension is None and batch_vecs:
-                self._dimension = len(batch_vecs[0])
+                with self._lock:
+                    if self._dimension is None:
+                        self._dimension = len(batch_vecs[0])
 
             if on_batch is not None:
                 on_batch(batch_end, total)
@@ -297,7 +304,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             results.extend(batch_vecs)
 
             if self._dimension is None and batch_vecs:
-                self._dimension = len(batch_vecs[0])
+                with self._lock:
+                    if self._dimension is None:
+                        self._dimension = len(batch_vecs[0])
 
         return results
 

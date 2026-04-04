@@ -530,8 +530,11 @@ domain chunkers.
 
 - The `/v1/embeddings` endpoint is called via the `openai` Python client
   (already a dependency), pointing at whatever `base_url` is configured.
-- Batch size is capped at 96 texts per request — a safe default across Ollama,
-  OpenAI, and LM Studio. Larger lists are split and results concatenated in order.
+- Batch size defaults to 32 texts per request — a conservative default for
+  local servers (LM Studio, Ollama) that can stall on large batches. Cloud APIs
+  (OpenAI) handle 96+ comfortably; users can increase `batch_size` in config.
+  A warning is logged when `batch_size` exceeds 512. Larger lists are split and
+  results concatenated in order.
 - The model's declared dimension is retrieved from the first successful response
   and stored in `meta.dimension`. Subsequent loads validate that the stored
   dimension matches the current model config; a mismatch requires a full re-index.
@@ -546,12 +549,54 @@ domain chunkers.
   this and falls back to `FixedSizeChunker` without logging at warning level
   (absence of the optional dep is not an error).
 
+### Thread Safety
+
+- `SQLiteVectorStore` is constructed with `check_same_thread=False` and
+  protected by a `threading.Lock`. All DB operations acquire the lock before
+  executing, making the store safe to use across threads, including the
+  background indexing thread and the main thread (search / tool calls).
+- `OpenAIEmbeddingProvider` uses a `threading.Lock` to guard lazy
+  construction of `_sync_client` and writes to `_dimension`, since
+  `embed_sync()` may be called concurrently from the main thread (search)
+  and from `asyncio.to_thread` (summary embedding during indexing).
+
+### Document-Level Embeddings
+
+- `strategy: average` — element-wise mean of all chunk vectors, L2-normalised.
+  No additional API calls. Default for code files.
+- `strategy: summary` — calls `llm_client.send()` with the (truncated) file
+  content and asks for a thematic summary, then embeds that summary text.
+  Input is truncated to `summary_max_tokens * 4` characters (~4 chars per token)
+  before sending. `summary_max_tokens` controls input size, not output length.
+  The summary prompt includes a word-count hint derived from
+  `summary_response_tokens` (default: `chunk_size // 4`) so the LLM targets a
+  length that fits within one embedding chunk. No per-call `max_tokens` cap is
+  set at the API level — the LLM client's configured `max_response_tokens`
+  still applies — to avoid starving reasoning models of their token budget.
+  If the LLM call fails or returns empty text, the strategy falls back to
+  `average` with a warning. If `llm_client` is `None`, a clear warning is
+  logged and the strategy falls back to `average` immediately.
+- `strategy: auto` — routes to `summary` for extensions in `prose_extensions`
+  (default: `.md .markdown .txt .rst .adoc .asciidoc .tex .org`), `average`
+  for everything else. Strategy resolution is handled by
+  `_resolve_doc_strategy()`, shared by both `_compute_doc_vector()` and
+  `_embed_and_upsert_file()` (which uses it to decide whether to dispatch to
+  `asyncio.to_thread`). `prose_extensions` entries are normalised to lowercase
+  for case-insensitive matching; a bare string (YAML scalar) is treated as a
+  single-item list.
+- `summary_model` is logged as a warning and ignored — per-call model switching
+  is not supported by the `LLMClient` interface.
+- Invalid or null `strategy` values are normalised to `"auto"` with a warning.
+
 ### Access Control
 
-- `read_file` and `find_files` call `workspace.embedding_index.is_indexed_path(path)`
-  before falling through to the normal permission-prompt flow.
+- `read_file` calls `workspace.embedding_index.is_indexed_path(path)` before
+  falling through to the normal permission-prompt flow. `find_files` access
+  control for its optional `path` parameter is planned but not yet implemented.
 - `is_indexed_path()` returns `True` only for paths strictly under a user-added
   external root (not the workspace root, which is always allowed by `Workspace.contains()`).
+  Uses `Path.resolve().relative_to(root)` — not string prefix matching — so
+  sibling paths with a common prefix are correctly rejected.
 - External roots are persisted in the SQLite `index_roots` table and loaded at
   `EmbeddingIndex` construction time, so access grants survive process restarts.
 
@@ -560,8 +605,10 @@ domain chunkers.
 - Target: <200 ms search latency for corpora up to 200 k chunks on a
   mid-range CPU (numpy vectorised cosine similarity; no GPU required).
 - Indexing throughput target: ≥ 50 files/minute on an average SSD, excluding
-  LLM summary API calls. LLM summary calls are inherently limited by the
-  backend's request rate; use async batching where possible.
+  LLM summary API calls. LLM summary calls are dispatched via
+  `asyncio.to_thread` so they do not block the event loop; they are made
+  per-file only for prose files under the `summary` or `auto` strategy.
+  The `average` strategy (pure numpy) runs inline without thread handoff.
 - `SQLiteVectorStore` L2-normalises stored vectors row-wise on upsert so
   cosine similarity reduces to a dot product; no separate norms cache is needed.
 

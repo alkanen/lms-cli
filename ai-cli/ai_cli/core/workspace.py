@@ -102,17 +102,21 @@ _INIT_TEMPLATES: dict[str, str] = {
         #
         #   document_embedding:
         #     enabled: true
-        #     strategy: auto            # "auto" | "average"
-        #                               # NOTE: "summary" is not yet implemented.
-        #     # The following options are reserved for the future "summary" strategy
-        #     # (LLM-generated document vectors) and have no effect yet:
-        #     prose_extensions:         # file types that will get LLM-summary doc vectors
-        #       - .md
+        #     strategy: auto            # "auto" | "average" | "summary"
+        #                               # auto: prose files use LLM summary,
+        #                               #       code files use chunk average
+        #     # Options for the "summary" path (also used by "auto" for prose files):
+        #     prose_extensions:         # extensions routed to LLM summary under "auto"
+        #       - .md                   # (default: .md .txt .rst .adoc .tex .org etc.)
         #       - .txt
         #       - .rst
         #       - .adoc
-        #     summary_model: ~          # null = inherit from llm model above
-        #     summary_max_tokens: 400
+        #     summary_model: ~          # null = use the configured main LLM model
+        #                               # (non-null warns; per-call override unsupported)
+        #     summary_max_tokens: 400   # caps input text chars sent to LLM (~4 chars/token)
+        #     summary_response_tokens: ~ # word-count hint injected into the summary prompt
+        #                               # null = chunk_size // 4; no per-call API cap is
+        #                               # added — LLM client max_response_tokens still applies
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
@@ -174,17 +178,21 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         #
         #   document_embedding:
         #     enabled: true
-        #     strategy: auto            # "auto" | "average"
-        #                               # NOTE: "summary" is not yet implemented.
-        #     # The following options are reserved for the future "summary" strategy
-        #     # (LLM-generated document vectors) and have no effect yet:
-        #     prose_extensions:         # file types that will get LLM-summary doc vectors
-        #       - .md
+        #     strategy: auto            # "auto" | "average" | "summary"
+        #                               # auto: prose files use LLM summary,
+        #                               #       code files use chunk average
+        #     # Options for the "summary" path (also used by "auto" for prose files):
+        #     prose_extensions:         # extensions routed to LLM summary under "auto"
+        #       - .md                   # (default: .md .txt .rst .adoc .tex .org etc.)
         #       - .txt
         #       - .rst
         #       - .adoc
-        #     summary_model: ~          # null = inherit from llm model above
-        #     summary_max_tokens: 400
+        #     summary_model: ~          # null = use the configured main LLM model
+        #                               # (non-null warns; per-call override unsupported)
+        #     summary_max_tokens: 400   # caps input text chars sent to LLM (~4 chars/token)
+        #     summary_response_tokens: ~ # word-count hint injected into the summary prompt
+        #                               # null = chunk_size // 4; no per-call API cap is
+        #                               # added — LLM client max_response_tokens still applies
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Default system prompt — applied to all projects unless a

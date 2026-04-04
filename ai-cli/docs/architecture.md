@@ -24,17 +24,17 @@ ai-cli/
 │   │   ├── agent_registry.py     # 🔲 AgentSpec loading from config, instance caching
 │   │   ├── task_manager.py       # 🔲 Task tree persistence, validation, queries
 │   │   ├── task_orchestrator.py  # 🔲 Deterministic plan→execute→review loop (/plan)
-│   │   ├── embedding_provider.py # 🔲 EmbeddingProvider ABC + OpenAIEmbeddingProvider
-│   │   ├── vector_store.py       # 🔲 VectorStore ABC + SQLiteVectorStore
-│   │   ├── chunker.py            # 🔲 Chunk dataclass, ChunkStrategy ABC, all chunker impls
-│   │   └── embedding_index.py    # 🔲 IndexRoot, EmbeddingIndex (orchestration + access control)
+│   │   ├── embedding_provider.py # ✅ EmbeddingProvider ABC + OpenAIEmbeddingProvider
+│   │   ├── vector_store.py       # ✅ VectorStore ABC + SQLiteVectorStore
+│   │   ├── chunker.py            # ✅ Chunk dataclass, ChunkStrategy ABC, all chunker impls
+│   │   └── embedding_index.py    # ✅ IndexRoot, EmbeddingIndex (orchestration + access control)
 │   ├── tools/
 │   │   ├── base.py               # ✅ Tool abstract base class
 │   │   ├── read_file.py          # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py         # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py         # ✅ Glob-pattern file search with ignore-rule enforcement
 │   │   ├── tool_manager.py       # ✅ Context-saving tool gatekeeper
-│   │   ├── search_files.py       # 🔲 search_files tool (semantic search over indexed corpus)
+│   │   ├── search_files.py       # ✅ search_files tool (semantic search over indexed corpus)
 │   │   ├── call_agent.py         # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
 │   │   └── tasks.py              # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/
@@ -44,7 +44,7 @@ ai-cli/
 │   └── utils/
 │       ├── ignore_filter.py      # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py      # 🔲 JSONL structured logging
-└── tests/                        # ✅ mirrors ai_cli/ structure (865 tests)
+└── tests/                        # ✅ mirrors ai_cli/ structure (1037 tests)
 ```
 
 ---
@@ -86,7 +86,7 @@ embedding_index → workspace     (is_ignored(), workspace root path)
 embedding_index → llm_client    (optional; summary strategy only)
 search_files (tool) → embedding_index   (via workspace.embedding_index)
 read_file (tool)    → embedding_index   (via workspace.embedding_index; access control)
-find_files (tool)   → embedding_index   (🔲 planned, via workspace.embedding_index; access control for path parameter)
+find_files (tool)   → embedding_index   (🔲 planned — access control for optional path parameter not yet implemented)
 ```
 
 ---
@@ -370,7 +370,7 @@ At runtime `_is_enabled()` checks session overrides first, then falls back to `_
 
 ---
 
-### Embedding Subsystem 🔲
+### Embedding Subsystem ✅
 
 See `design_embeddings.md` for the full design. Interfaces are summarised here.
 
@@ -378,23 +378,37 @@ See `design_embeddings.md` for the full design. Interfaces are summarised here.
 
 ```python
 class EmbeddingProvider(ABC):
-    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed(
+        self,
+        texts: list[str],
+        on_batch: Callable[[int, int], None] | None = None,
+    ) -> list[list[float]]: ...
     def embed_sync(self, texts: list[str]) -> list[list[float]]: ...
     @property
     def dimension(self) -> int: ...
     @property
     def model(self) -> str: ...
+    async def aclose(self) -> None: ...
 ```
 
 `embed()` is used by `EmbeddingIndex.index()` (bulk, called with `await` from
-the REPL). `embed_sync()` is used by `EmbeddingIndex.search()` (single query,
-called from synchronous tool `execute()` inside the running event loop — must
-not use `asyncio.run()` internally). Both use the `openai` client; `embed_sync()`
-uses the synchronous client variant.
+the REPL). The optional `on_batch(chunks_done, chunks_total)` callback drives
+progress reporting. `embed_sync()` is used by `EmbeddingIndex.search()` and the
+`summary` document-embedding path (dispatched via `asyncio.to_thread` during
+indexing). Both use the `openai` client; `embed_sync()` uses the synchronous
+client variant. A `threading.Lock` guards lazy client construction and
+`_dimension` writes so `embed_sync()` is safe to call from multiple threads.
 
-`OpenAIEmbeddingProvider` hits `/v1/embeddings` via the `openai` client.
+`aclose()` tears down the async HTTP client so it can be re-created on the next
+event loop (important when calling `index()` multiple times from a long-running
+process).
+
+`OpenAIEmbeddingProvider` hits `/v1/embeddings` via the `openai` client with
+configurable `batch_size` (default 32) and `request_timeout` (default 120 s).
 Backend config (base_url, api_key) is resolved by `ConfigManager.get_embedding_config()`
 which falls back to the LLM backend when embedding-specific values are absent.
+API key resolution is solely the responsibility of `ConfigManager`; the provider
+never reads environment variables directly.
 
 #### `VectorStore` ABC
 
@@ -408,14 +422,18 @@ class SearchResult:
 class VectorStore(ABC):
     def upsert(self, ids, vectors, metadata) -> None: ...
     def delete_by_file(self, file_path: str) -> None: ...
-    def search(self, query_vector, k=10, chunk_type=None) -> list[SearchResult]: ...
+    def search(self, query_vector, k=10, chunk_type=None, path_glob=None) -> list[SearchResult]: ...
     def all_file_hashes(self) -> dict[str, str]: ...
     def clear(self) -> None: ...
+    def close(self) -> None: ...  # no-op on base; releases SQLite connection on SQLiteVectorStore
 ```
 
 `SQLiteVectorStore` stores vectors as float32 blobs in a WAL-mode SQLite
-database at `.ai-cli/embeddings/index.db`. Search loads all vectors into a
-numpy matrix for vectorised cosine similarity. Swap-in path: implement the ABC,
+database at `.ai-cli/embeddings/index.db`. All DB operations are protected by a
+`threading.Lock` so the store is safe to use from indexing threads and the
+search path concurrently. File paths are stored as POSIX strings (`as_posix()`)
+for cross-platform consistency. Search loads all matching vectors into a numpy
+matrix for vectorised cosine similarity. Swap-in path: implement the ABC,
 update the factory — no other changes required.
 
 #### `Chunk` + `ChunkStrategy`
@@ -434,8 +452,12 @@ Implementations: `FixedSizeChunker`, `TreeSitterChunker` (optional dep,
 raises `ImportError` gracefully), `MultiDocYamlChunker`, `AnsibleChunker`,
 `ComposeChunker`, `TomlChunker`.
 
-`make_chunker(path, config)` selects the appropriate implementation: domain
-chunkers first, then tree-sitter if available, then fixed-size fallback.
+`make_chunker(path, config, text=None)` selects the appropriate implementation:
+domain chunkers first (using `text` when provided to avoid re-reading the file),
+then tree-sitter if available, then fixed-size fallback.
+
+`ComposeChunker` handles both unquoted and quoted (`"svc":` / `'svc':`) service
+keys, and falls back to a single services-block chunk when no key pattern matches.
 
 #### `EmbeddingIndex`
 
@@ -445,21 +467,42 @@ class IndexRoot:
     path: Path; label: str | None; added_at: str
 
 class EmbeddingIndex:
-    async def index(self, roots=None, *, incremental=True) -> IndexStats: ...
-    def add_root(self, path: Path, label=None) -> None: ...
+    async def index(
+        self,
+        roots: list[Path] | None = None,
+        *,
+        incremental: bool = True,
+        on_progress: Callable[[int, int, str], None] | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> IndexStats: ...
+    async def index_file(self, file_path: Path, *, full: bool = False) -> None: ...
+    async def aclose(self) -> None: ...
+    def add_root(self, path: Path, label: str | None = None) -> None: ...
+    def update_root_label(self, path: Path, label: str | None) -> None: ...
     def remove_root(self, path: Path) -> None: ...
     @property
     def roots(self) -> list[IndexRoot]: ...
+    @property
+    def db_path(self) -> Path: ...
     def is_indexed_path(self, path: Path) -> bool: ...
     def search(self, query, k=10, level="chunk", path_glob=None) -> list[SearchResult]: ...
 ```
+
+`index()` accepts an `on_progress(files_done, files_total, current_file)` callback
+for live progress reporting, and a `cancelled` `threading.Event` for cooperative
+cancellation between batches. `aclose()` tears down the provider's async HTTP
+client after each indexing run. `index_file()` indexes a single file directly
+(used by the `/index --file` REPL option).
+
+Both `add_root()` and `remove_root()` reject the filesystem root (`/` on POSIX)
+with a `ValueError`. Paths are stored as POSIX strings in the database.
 
 `Workspace` gains `embedding_index: EmbeddingIndex | None` (set by startup
 sequence when `embeddings.enabled: true`). Tools access it via `workspace.embedding_index`.
 
 Access control: `is_indexed_path()` returns `True` for paths under any
-user-added external root. `read_file` and `find_files` call this to decide
-whether a non-workspace path is accessible without a permission prompt.
+user-added external root. `read_file` calls this to decide whether a
+non-workspace path is accessible without a permission prompt.
 Indexing a path = granting read access to it; removing a root revokes access.
 
 ---
@@ -545,10 +588,13 @@ class LLMClient(ABC):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
+        max_tokens: int | None = None,
     ) -> Generator[dict, None, None]: ...
     # Yields the same Chunk types regardless of stream=True/False.
     # stream=True (default): text deltas arrive immediately, tool calls assembled from deltas.
     # stream=False: entire response awaited first, same Chunk sequence produced.
+    # max_tokens overrides the client's configured max_response_tokens for this
+    # call only; None (default) uses the client default.
     # Returns Generator (not Iterator) so callers can call .close() to cancel mid-stream.
 
     @abstractmethod
