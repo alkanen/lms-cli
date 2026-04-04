@@ -60,17 +60,34 @@ class ReadFileTool(Tool):
     # Permission helpers
     # ------------------------------------------------------------------
 
+    def _resolve_any(self, path_str: str) -> Path | None:
+        """Resolve *path_str* to an absolute Path via workspace or embedding index.
+
+        Returns ``None`` when the path cannot be resolved to either a
+        workspace-relative path or an external indexed path.
+        """
+        try:
+            return self._workspace.resolve(path_str)
+        except WorkspaceError:
+            pass
+        # Absolute path: resolve symlinks before checking so that comparisons
+        # against stored index roots (which are also resolved) are consistent.
+        abs_path = Path(path_str)
+        if abs_path.is_absolute():
+            resolved = abs_path.resolve()
+            ei = self._workspace.embedding_index
+            if ei is not None and ei.is_indexed_path(resolved):
+                return resolved
+        return None
+
     def request_permission(self, action: str, **kwargs: Any) -> tuple[bool, str]:
         """Check the tool's own allow-list before delegating to PermissionManager."""
         if not self.permission_required:
             return True, ""
         path_str = kwargs.get("path", "")
         if path_str:
-            try:
-                resolved = self._workspace.resolve(path_str)
-            except WorkspaceError:
-                pass
-            else:
+            resolved = self._resolve_any(path_str)
+            if resolved is not None:
                 if resolved in self._session_allowed_files:
                     return True, ""
                 if any(p in self._session_allowed_dirs for p in resolved.parents):
@@ -80,7 +97,8 @@ class ReadFileTool(Tool):
     def extra_permission_options(self, **kwargs: Any) -> list[str]:
         """
         Return one option per level of the path hierarchy, from the file
-        itself up to (and including) the workspace root.
+        itself up to (and including) the workspace root (or index root for
+        external paths).
 
         Example for ``path="./src/foo/bar.py"``:
 
@@ -88,33 +106,57 @@ class ReadFileTool(Tool):
             dir:./src/foo/
             dir:./src/
             dir:./
+
+        Example for an external absolute path ``/data/docs/api.md``:
+
+            file:/data/docs/api.md
+            dir:/data/docs/
+            dir:/data/
         """
         path_str = kwargs.get("path", "")
         if not path_str:
             return []
-        try:
-            resolved = self._workspace.resolve(path_str)
-        except WorkspaceError:
+        resolved = self._resolve_any(path_str)
+        if resolved is None:
             return []
 
         root = self._workspace.root
-        # A path that resolves to the workspace root is a directory, not a file.
-        if resolved == root:
-            return []
 
-        # Normalise the file label to a workspace-relative ./… path with
-        # forward slashes, matching the format used for dir: labels below.
-        file_rel = resolved.relative_to(root)
-        file_label = "./" + str(file_rel).replace("\\", "/")
+        # Workspace-relative path: walk up to workspace root.
+        try:
+            file_rel = resolved.relative_to(root)
+            if resolved == root:
+                return []
+            file_label = "./" + str(file_rel).replace("\\", "/")
+            options: list[str] = [f"file:{file_label}"]
+            current = resolved.parent
+            while True:
+                rel = current.relative_to(root)
+                rel_str = str(rel).replace("\\", "/")
+                dir_label = "./" if rel_str == "." else f"./{rel_str}/"
+                options.append(f"dir:{dir_label}")
+                if current == root:
+                    break
+                current = current.parent
+            return options
+        except ValueError:
+            pass
 
-        options: list[str] = [f"file:{file_label}"]
+        # External absolute path: use the absolute path directly, walking up
+        # to the filesystem root (or the indexed root, whichever comes first).
+        ei = self._workspace.embedding_index
+        index_roots: set[Path] = set()
+        if ei is not None:
+            index_roots = {Path(r.path).resolve() for r in ei.roots}
+
+        options = [f"file:{resolved}"]
         current = resolved.parent
         while True:
-            rel = current.relative_to(root)
-            rel_str = str(rel).replace("\\", "/")
-            dir_label = "./" if rel_str == "." else f"./{rel_str}/"
-            options.append(f"dir:{dir_label}")
-            if current == root:
+            # Never offer the filesystem root as a grantable directory.
+            if current == current.parent:
+                break
+            options.append(f"dir:{current}/")
+            if current in index_roots:
                 break
             current = current.parent
         return options
@@ -123,9 +165,8 @@ class ReadFileTool(Tool):
         kind, _, path_str = choice.partition(":")
         if not path_str:
             return
-        try:
-            resolved = self._workspace.resolve(path_str.rstrip("/"))
-        except WorkspaceError:
+        resolved = self._resolve_any(path_str.rstrip("/"))
+        if resolved is None:
             return
         if kind == "file":
             self._session_allowed_files.add(resolved)
@@ -144,8 +185,10 @@ class ReadFileTool(Tool):
                 ToolArgument(
                     name="path",
                     description=(
-                        "Path to the file, relative to the workspace root "
-                        "(e.g. './src/main.py')."
+                        "Path to the file. Workspace-relative paths "
+                        "(e.g. './src/main.py') are resolved against the workspace root. "
+                        "Absolute paths are also accepted when the file is under an "
+                        "externally indexed root (added via /index)."
                     ),
                     argument_type="string",
                     required=True,
@@ -186,12 +229,42 @@ class ReadFileTool(Tool):
             start_line if start_line is not None else "start",
             end_line if end_line is not None else "end",
         )
+
+        # For absolute paths that fall under an external indexed root, bypass
+        # the workspace bounds check and read the file directly.
+        # Resolve symlinks once so the same path is used for the access check
+        # and the read, eliminating a TOCTOU window.
+        abs_path = Path(path)
+        if abs_path.is_absolute():
+            resolved_abs = abs_path.resolve()
+            ei = self._workspace.embedding_index
+            if ei is not None and ei.is_indexed_path(resolved_abs):
+                if not resolved_abs.is_file():
+                    return self._err("read_error", f"File not found: '{path}'", 400)
+                try:
+                    full_text = resolved_abs.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    return self._err("read_error", f"Cannot read '{path}': {exc}", 400)
+                # Fall through to the common line-range handling below.
+                return self._apply_line_range(full_text, path, start_line, end_line)
+
         # Read the full file once; slicing and total_lines are derived here.
         try:
             full_text = self._workspace.read_file(path)
         except WorkspaceError as exc:
             logger.debug("read_file: error reading '%s': %s", path, exc)
             return self._err("read_error", str(exc), 400)
+
+        return self._apply_line_range(full_text, path, start_line, end_line)
+
+    def _apply_line_range(
+        self,
+        full_text: str,
+        path: str,
+        start_line: int | None,
+        end_line: int | None,
+    ) -> dict:
+        """Apply optional line range to *full_text* and return a canonical result."""
 
         all_lines = full_text.splitlines(keepends=True)
         total_lines = len(all_lines)

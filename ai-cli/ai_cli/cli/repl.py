@@ -33,7 +33,11 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 
-from ai_cli.cli.completer import DEFAULT_MAX_PATH_COMPLETIONS, REPLCompleter
+from ai_cli.cli.completer import (
+    DEFAULT_MAX_PATH_COMPLETIONS,
+    REPLCompleter,
+    _tokenize_command,
+)
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
@@ -105,6 +109,10 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     (
         "/rounds [--session] <N>",
         "Set the maximum tool-call rounds per turn (omit --session to persist)",
+    ),
+    (
+        "/index [path] [--file <path>] [--label <name>] [--full] [--remove]",
+        "Index files for semantic search; [path] adds a root, --file indexes a single file",
     ),
 ]
 
@@ -490,6 +498,9 @@ class REPL:
         elif cmd == "rounds":
             self._handle_rounds_subcommand(command[len(cmd) :].strip())
 
+        elif cmd == "index":
+            self._handle_index_command(command[len(cmd) :].strip())
+
         elif cmd == "":
             self._display.show_error(
                 "No command provided. Type /help for a list of commands."
@@ -647,6 +658,406 @@ class REPL:
         else:
             self._display.show_status(
                 f"Max tool rounds set to {value} for this session."
+            )
+
+    # ------------------------------------------------------------------
+    # /index subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_index_command(self, remainder: str) -> None:
+        """Dispatch /index [path] [--file <path>] [--label <name>] [--full] [--remove]."""
+        import asyncio
+        import time
+
+        ei = self._workspace.embedding_index
+        if ei is None:
+            self._display.show_error(
+                "Embedding index is not enabled. "
+                "Set 'embeddings.enabled: true' in config."
+            )
+            return
+
+        # Parse arguments using the same tokenizer as the completer so that
+        # backslash-escaped spaces (and quoted strings) in paths are handled.
+        # Appending a space ensures the final token is treated as complete.
+        args, _ = _tokenize_command(remainder + " ") if remainder.strip() else ([], "")
+        path: str | None = None
+        label: str | None = None
+        single_file: str | None = None
+        full = False
+        remove = False
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--full":
+                full = True
+            elif args[i] == "--remove":
+                remove = True
+            elif args[i] == "--label":
+                if i + 1 >= len(args):
+                    self._display.show_error("/index --label requires a label value.")
+                    return
+                label = args[i + 1]
+                i += 1
+            elif args[i] == "--file":
+                if i + 1 >= len(args):
+                    self._display.show_error("/index --file requires a file path.")
+                    return
+                single_file = args[i + 1]
+                i += 1
+            elif args[i].startswith("--"):
+                self._display.show_error(f"Unknown /index flag: {args[i]!r}")
+                return
+            else:
+                if path is not None:
+                    self._display.show_error(
+                        "/index accepts at most one PATH argument."
+                    )
+                    return
+                path = args[i]
+            i += 1
+
+        if path and single_file:
+            self._display.show_error(
+                "/index: positional PATH and --file are mutually exclusive."
+            )
+            return
+
+        if remove and single_file:
+            self._display.show_error("/index --remove cannot be used with --file.")
+            return
+
+        if remove and not path:
+            self._display.show_error("/index --remove requires a path argument.")
+            return
+
+        if remove and path:
+            _p = Path(path)
+            resolved = (_p if _p.is_absolute() else self._workspace.root / _p).resolve()
+            try:
+                ei.remove_root(resolved)
+            except ValueError as exc:
+                self._display.show_error(str(exc))
+                return
+            self._display.show_status(f"Removed root: {resolved}")
+            return
+
+        # --file: index a single file directly without root scanning.
+        if single_file:
+            _sf = Path(single_file)
+            resolved_file = (_sf if _sf.is_absolute() else self._workspace.root / _sf).resolve()
+            if not resolved_file.is_file():
+                self._display.show_error(f"Not a regular file: {resolved_file}")
+                return
+            self._handle_index_single_file(ei, resolved_file, full=full)
+            return
+
+        roots_to_index: list[Path] | None = None
+        if path:
+            _p2 = Path(path)
+            resolved = (_p2 if _p2.is_absolute() else self._workspace.root / _p2).resolve()
+            if not resolved.is_dir():
+                self._display.show_error(
+                    f"Positional path must be a directory. "
+                    f"For single files, use `/index --file {resolved}`."
+                )
+                return
+            root_paths = {r.path for r in ei.roots}
+            if resolved not in root_paths and resolved != self._workspace.root:
+                try:
+                    ei.add_root(resolved, label=label)
+                except ValueError as exc:
+                    self._display.show_error(str(exc))
+                    return
+                self._display.show_status(f"Added root: {resolved}")
+            elif resolved in root_paths and label:
+                try:
+                    ei.update_root_label(resolved, label)
+                except ValueError as exc:
+                    self._display.show_error(str(exc))
+                    return
+                self._display.show_status(f"Updated label for root: {resolved}")
+            roots_to_index = [resolved]
+
+        # ------------------------------------------------------------------
+        # Run indexing in a background thread so the main thread stays
+        # responsive to Ctrl+C (SIGINT) and Ctrl+Z (SIGTSTP).
+        # ------------------------------------------------------------------
+        import signal
+
+        cancelled = threading.Event()
+        stats_holder: list = [None]
+        error_holder: list = [None]
+        # Shared progress state written by the worker, read by the main thread.
+        progress: dict = {"current": 0, "total": 0, "file": ""}
+
+        def _on_progress(current: int, total: int, file_path: str) -> None:
+            progress["current"] = current
+            progress["total"] = total
+            progress["file"] = file_path
+
+        # Shared chunk-level progress (reset to 0 at start of each file).
+        chunk_progress: dict = {"done": 0, "total": 0}
+
+        def _on_chunk_progress(done: int, total: int) -> None:
+            chunk_progress["done"] = done
+            chunk_progress["total"] = total
+
+        async def _index_and_close() -> object:
+            try:
+                return await ei.index(
+                    roots=roots_to_index,
+                    incremental=not full,
+                    cancelled=cancelled,
+                    on_progress=_on_progress,
+                    on_chunk_progress=_on_chunk_progress,
+                )
+            finally:
+                # Close the async HTTP client so the next run gets a fresh one
+                # bound to its own event loop.
+                await ei.aclose()
+
+        def _run_worker() -> None:
+            try:
+                stats_holder[0] = asyncio.run(_index_and_close())
+            except Exception as exc:  # noqa: BLE001
+                error_holder[0] = exc
+
+        worker = threading.Thread(target=_run_worker, daemon=True)
+        worker.start()
+
+        # Install a custom SIGINT handler that sets the cancellation flag
+        # without raising KeyboardInterrupt, keeping the main thread
+        # unblocked so worker.join() runs to completion uninterrupted.
+        # A second Ctrl+C restores normal behaviour so the user can still
+        # force-exit if the worker is stuck on a slow network call.
+        old_sigint = signal.getsignal(signal.SIGINT)
+
+        def _cancel_handler(signum: int, frame: object) -> None:
+            cancelled.set()
+            # Restore original handler: second Ctrl+C raises KeyboardInterrupt.
+            signal.signal(signal.SIGINT, old_sigint)
+
+        signal.signal(signal.SIGINT, _cancel_handler)
+
+        try:
+            from tqdm import tqdm as _tqdm
+
+            _has_tqdm = True
+        except ImportError:
+            _has_tqdm = False
+
+        t0 = time.monotonic()
+        try:
+            if _has_tqdm:
+                with (
+                    _tqdm(
+                        total=0,
+                        unit="file",
+                        desc="Scanning",
+                        dynamic_ncols=True,
+                        position=0,
+                        leave=True,
+                    ) as pbar_files,
+                    _tqdm(
+                        total=0,
+                        unit="chunk",
+                        desc="Chunks",
+                        dynamic_ncols=True,
+                        position=1,
+                        leave=False,
+                    ) as pbar_chunks,
+                ):
+                    last_total = 0
+                    last_current = 0
+                    last_chunk_done = 0
+                    last_chunk_total = 0
+                    while worker.is_alive():
+                        cur = progress["current"]
+                        tot = progress["total"]
+                        c_done = chunk_progress["done"]
+                        c_total = chunk_progress["total"]
+
+                        # File-level bar.
+                        if tot != last_total:
+                            pbar_files.reset(total=tot)
+                            pbar_files.set_description("Indexing")
+                            last_total = tot
+                            last_current = 0
+
+                        if cur > last_current:
+                            pbar_files.update(cur - last_current)
+                            last_current = cur
+                            fname = Path(progress["file"]).name
+                            if fname:
+                                pbar_files.set_postfix_str(fname, refresh=False)
+
+                        # Chunk-level bar: reset when a new file begins.
+                        if c_total != last_chunk_total or c_done < last_chunk_done:
+                            pbar_chunks.reset(total=c_total if c_total > 0 else None)
+                            pbar_chunks.update(c_done)
+                            last_chunk_total = c_total
+                            last_chunk_done = c_done
+                        elif c_done > last_chunk_done:
+                            pbar_chunks.update(c_done - last_chunk_done)
+                            last_chunk_done = c_done
+
+                        worker.join(timeout=0.1)
+
+                    # Final updates to 100 %.
+                    if last_total > 0 and last_current < last_total:
+                        pbar_files.update(last_total - last_current)
+                    c_done = chunk_progress["done"]
+                    if last_chunk_total > 0 and c_done > last_chunk_done:
+                        pbar_chunks.update(c_done - last_chunk_done)
+            else:
+                worker.join()
+        except KeyboardInterrupt:
+            # Second Ctrl+C (original handler restored after first).
+            cancelled.set()
+            worker.join()
+            self._display.show_status("Indexing cancelled.")
+            return
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+
+        if cancelled.is_set():
+            self._display.show_status("Indexing cancelled.")
+            return
+
+        if error_holder[0] is not None:
+            self._display.show_error(f"Indexing failed: {error_holder[0]}")
+            return
+
+        stats = stats_holder[0]
+        elapsed = time.monotonic() - t0
+        self._display.show_status(
+            f"Index complete in {elapsed:.1f}s: "
+            f"{stats.files_indexed} indexed, {stats.files_skipped} skipped, "
+            f"{stats.files_deleted} deleted, {stats.chunks_added} chunks"
+        )
+
+    # ------------------------------------------------------------------
+    # /index --file helper
+    # ------------------------------------------------------------------
+
+    def _handle_index_single_file(
+        self,
+        ei: object,
+        file_path: Path,
+        *,
+        full: bool = False,
+    ) -> None:
+        """Index a single file, showing chunk-level progress and diagnostics."""
+        import asyncio
+        import signal
+        import time
+
+        chunk_progress: dict = {"done": 0, "total": 0}
+        stats_holder: list = [None]
+        error_holder: list = [None]
+
+        def _on_chunk_progress(done: int, total: int) -> None:
+            chunk_progress["done"] = done
+            chunk_progress["total"] = total
+
+        cancelled = threading.Event()
+
+        async def _run() -> object:
+            try:
+                return await ei.index_file(  # type: ignore[attr-defined]
+                    file_path,
+                    incremental=not full,
+                    on_chunk_progress=_on_chunk_progress,
+                    cancelled=cancelled,
+                )
+            finally:
+                await ei.aclose()  # type: ignore[attr-defined]
+
+        def _worker() -> None:
+            try:
+                stats_holder[0] = asyncio.run(_run())
+            except Exception as exc:  # noqa: BLE001
+                error_holder[0] = exc
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        old_sigint = signal.getsignal(signal.SIGINT)
+
+        def _cancel(signum: int, frame: object) -> None:
+            cancelled.set()
+            signal.signal(signal.SIGINT, old_sigint)
+
+        signal.signal(signal.SIGINT, _cancel)
+
+        t0 = time.monotonic()
+        try:
+            try:
+                from tqdm import tqdm as _tqdm
+
+                _has_tqdm = True
+            except ImportError:
+                _has_tqdm = False
+
+            if _has_tqdm:
+                with _tqdm(
+                    total=0,
+                    unit="chunk",
+                    desc=file_path.name,
+                    dynamic_ncols=True,
+                    position=0,
+                    leave=True,
+                ) as pbar:
+                    last_chunk_done = 0
+                    last_chunk_total = 0
+                    while worker.is_alive():
+                        c_done = chunk_progress["done"]
+                        c_total = chunk_progress["total"]
+                        if c_total != last_chunk_total or c_done < last_chunk_done:
+                            pbar.reset(total=c_total if c_total > 0 else None)
+                            pbar.update(c_done)
+                            last_chunk_total = c_total
+                            last_chunk_done = c_done
+                        elif c_done > last_chunk_done:
+                            pbar.update(c_done - last_chunk_done)
+                            last_chunk_done = c_done
+                        worker.join(timeout=0.1)
+                    c_done = chunk_progress["done"]
+                    if last_chunk_total > 0 and c_done > last_chunk_done:
+                        pbar.update(c_done - last_chunk_done)
+            else:
+                worker.join()
+        except KeyboardInterrupt:
+            cancelled.set()
+            worker.join()
+            self._display.show_status("Indexing cancelled.")
+            return
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+
+        if cancelled.is_set():
+            self._display.show_status("Indexing cancelled.")
+            return
+
+        if error_holder[0] is not None:
+            self._display.show_error(f"Indexing failed: {error_holder[0]}")
+            return
+
+        stats = stats_holder[0]
+        elapsed = time.monotonic() - t0
+        if stats is not None and stats.files_skipped:
+            self._display.show_status(
+                f"{file_path.name}: unchanged — skipped ({elapsed:.1f}s)"
+            )
+        elif stats is not None and stats.files_indexed:
+            self._display.show_status(
+                f"{file_path.name}: indexed {stats.chunks_added} chunks in {elapsed:.1f}s"
+            )
+        else:
+            self._display.show_status(
+                f"{file_path.name}: no chunks produced — check logs for details"
+                f" (elapsed {elapsed:.1f}s)"
             )
 
     # ------------------------------------------------------------------

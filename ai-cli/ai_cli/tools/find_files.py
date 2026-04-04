@@ -152,6 +152,10 @@ class FindFilesTool(Tool):
             return self._err("invalid_input", "'pattern' must not be empty.", 400)
 
         # Reject absolute patterns and any path traversal via ..
+        # NOTE: Access control for external indexed roots (via
+        # workspace.embedding_index.is_indexed_path()) is planned for a future
+        # update when an optional 'path' parameter is added to this tool.
+        # Currently all patterns are workspace-relative only.
         if pattern.startswith("/"):
             return self._err(
                 "invalid_input", "Pattern must not be an absolute path.", 400

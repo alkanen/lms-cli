@@ -28,10 +28,106 @@ if TYPE_CHECKING:
 
 # Matches a partial @ reference at the very end of the text before the cursor.
 # Group 1: optional '!' (bypass-ignore flag)
-# Group 2: the partial path being typed (may be empty)
-_AT_PARTIAL_RE = re.compile(r"@(!?)([^\s,;:!?()\[\]{}'\"<>]*)$")
+# Group 2: the partial path being typed (may be empty).
+#   Allows backslash-escaped characters (e.g. ``\\ `` for a space in a name)
+#   in addition to the usual non-whitespace, non-special characters.
+_AT_PARTIAL_RE = re.compile(r"@(!?)((?:\\.|[^\s\\,;:!?()\[\]{}'\"<>])*)$")
 
+_INDEX_FLAGS = ["--file", "--full", "--label", "--remove"]
 _TOOLS_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
+
+
+# ---------------------------------------------------------------------------
+# Shell-style tokenizer helpers
+# ---------------------------------------------------------------------------
+
+
+def _tokenize_command(text: str) -> tuple[list[str], str]:
+    """Parse *text* into completed tokens and the raw partial being typed.
+
+    Handles backslash-escaping (``\\ `` → space, ``\\\\`` → backslash, etc.)
+    and single/double quoting.
+
+    Returns ``(completed_tokens, partial_raw)`` where:
+
+    - *completed_tokens*: whitespace-delimited tokens already finished,
+      decoded (unescaped).
+    - *partial_raw*: the raw (un-decoded) suffix of *text* that forms the
+      token currently being typed; may be empty when the cursor is after
+      trailing whitespace.  Its ``len()`` is used as the negated
+      ``start_position`` for completions so the raw partial is fully
+      replaced.
+    """
+    completed: list[str] = []
+    buf: list[str] = []  # decoded chars of the token in progress
+    raw_start: int = 0  # index in *text* where the current token's raw text begins
+    in_single = False
+    in_double = False
+    i = 0
+
+    while i < len(text):
+        c = text[i]
+
+        if in_single:
+            if c == "'":
+                in_single = False
+            else:
+                buf.append(c)
+            i += 1
+        elif in_double:
+            if c == '"':
+                in_double = False
+                i += 1
+            elif c == "\\" and i + 1 < len(text) and text[i + 1] in ('"', "\\", " "):
+                buf.append(text[i + 1])
+                i += 2
+            else:
+                buf.append(c)
+                i += 1
+        elif c == "\\" and i + 1 < len(text):
+            buf.append(text[i + 1])
+            i += 2
+        elif c == "'":
+            if not buf:
+                # Opening quote starts a new token: raw_start must point past
+                # the quote so partial_raw (used for completion) is the quoted
+                # content only, not the quote character itself.
+                raw_start = i + 1
+            in_single = True
+            i += 1
+        elif c == '"':
+            if not buf:
+                raw_start = i + 1
+            in_double = True
+            i += 1
+        elif c in " \t":
+            if buf:
+                completed.append("".join(buf))
+                buf = []
+            i += 1
+            raw_start = i
+        else:
+            buf.append(c)
+            i += 1
+
+    return completed, text[raw_start:]
+
+
+def _unescape(s: str) -> str:
+    """Remove backslash escaping: ``\\x`` → ``x``."""
+    return re.sub(r"\\(.)", r"\1", s)
+
+
+def _escape_path(s: str) -> str:
+    """Backslash-escape characters that need quoting in a command token.
+
+    Currently escapes backslashes and spaces so that a filename like
+    ``terry pratchett.txt`` becomes ``terry\\ pratchett.txt`` when inserted
+    as a completion, making it parseable by :func:`_tokenize_command`.
+    """
+    return s.replace("\\", "\\\\").replace(" ", "\\ ")
+
+
 _TOOLS_NAME_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable", "info"})
 _TOOLS_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
 _SESSION_SUBCOMMANDS = ["name"]
@@ -96,7 +192,12 @@ class REPLCompleter(Completer):
         at_m = _AT_PARTIAL_RE.search(text)
         if at_m:
             bypass_ignore = bool(at_m.group(1))
-            yield from self._complete_path(at_m.group(2), bypass_ignore=bypass_ignore)
+            partial_raw = at_m.group(2)
+            yield from self._complete_path(
+                _unescape(partial_raw),
+                bypass_ignore=bypass_ignore,
+                raw_len=len(partial_raw),
+            )
             return
 
         stripped = text.lstrip()
@@ -133,6 +234,8 @@ class REPLCompleter(Completer):
             yield from self._complete_session(parts, text)
         elif cmd == "rounds":
             yield from self._complete_rounds(parts, text)
+        elif cmd == "index":
+            yield from self._complete_index(parts, text)
 
     def _complete_tools(self, parts: list[str], text: str) -> Iterable[Completion]:
         trailing = text.endswith(" ")
@@ -199,25 +302,77 @@ class REPLCompleter(Completer):
             if "--session".startswith(prefix):
                 yield Completion("--session", start_position=-len(prefix))
 
+    def _complete_index(self, parts: list[str], text: str) -> Iterable[Completion]:
+        """Completions for ``/index [path] [--label <name>] [--file <path>] ...``.
+
+        Uses :func:`_tokenize_command` so paths containing backslash-escaped
+        spaces (e.g. ``terry\\ pratchett/``) are handled correctly.
+        Completions with spaces in their names are inserted backslash-escaped.
+        """
+        completed_toks, partial_raw = _tokenize_command(text)
+        after = completed_toks[1:]  # decoded tokens after "/index"
+        partial = _unescape(partial_raw)
+        raw_len = len(partial_raw)
+
+        # Suppress completions when typing the free-form --label value.
+        if after and after[-1] == "--label":
+            return
+
+        # After --file, complete the next token as a file/directory path.
+        if after and after[-1] == "--file":
+            yield from self._complete_path(partial, raw_len=raw_len)
+            return
+
+        # When partial starts with "-" offer only flags (no path noise).
+        # When partial is empty, offer flags first then fall through to paths.
+        if partial_raw == "" or partial_raw.startswith("-"):
+            already = set(after)
+            for flag in _INDEX_FLAGS:
+                if flag.startswith(partial_raw) and flag not in already:
+                    yield Completion(flag, start_position=-raw_len)
+            if partial_raw.startswith("-"):
+                return  # don't mix paths when explicitly typing a flag
+
+        # Complete as a filesystem path (positional root argument).
+        yield from self._complete_path(partial, raw_len=raw_len)
+
     # ------------------------------------------------------------------
     # @ file-path completion
     # ------------------------------------------------------------------
 
     def _complete_path(
-        self, partial: str, bypass_ignore: bool = False
+        self,
+        partial: str,
+        bypass_ignore: bool = False,
+        raw_len: int | None = None,
     ) -> Iterable[Completion]:
-        """Yield file-path completions for a partial ``@``-reference.
+        """Yield file-path completions for *partial* (an unescaped path prefix).
 
         ``..`` and absolute paths (``/``) are allowed — Python's pathlib
         treats a leading ``/`` as absolute when joined, so
         ``root / "/etc"`` resolves to ``/etc``.  Ignore rules are only
         applied for paths inside the workspace root; paths that escape it
         (or when *bypass_ignore* is ``True``) are listed as-is.
+
+        Spaces in entry names are backslash-escaped in the inserted text so
+        the result is parseable by :func:`_tokenize_command`.
+
+        Parameters
+        ----------
+        partial:
+            The decoded (unescaped) path prefix being completed.
+        bypass_ignore:
+            When ``True``, skip workspace ignore-filter checks.
+        raw_len:
+            Length of the raw (escaped) partial in the original input.
+            Used as the negated ``start_position`` so the raw text is fully
+            replaced.  Defaults to ``len(partial)`` when ``None``.
         """
         if self._workspace is None:
             return
 
         root = self._workspace.root
+        start = -(raw_len if raw_len is not None else len(partial))
 
         # Split into a confirmed directory prefix and the stem being typed.
         if "/" in partial:
@@ -260,11 +415,17 @@ class REPLCompleter(Completer):
                         except OSError:
                             continue
 
-                    rel = f"{dir_part}/{entry.name}" if dir_part else entry.name
                     suffix = "/" if is_dir else ""
+                    # Escape spaces so the inserted text survives re-tokenization.
+                    escaped_name = _escape_path(entry.name)
+                    rel = (
+                        f"{_escape_path(dir_part)}/{escaped_name}"
+                        if dir_part
+                        else escaped_name
+                    )
                     yield Completion(
                         rel + suffix,
-                        start_position=-len(partial),
+                        start_position=start,
                         display=entry.name + suffix,
                     )
                     count += 1

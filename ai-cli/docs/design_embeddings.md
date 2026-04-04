@@ -230,8 +230,11 @@ class EmbeddingProvider(ABC):
 dependency) hitting the `/v1/embeddings` endpoint. It reads `base_url`,
 `api_key`, and `model` from the resolved embedding config.
 
-Batch size is capped at 96 texts per request (a safe default across Ollama,
-OpenAI, and LM Studio). Larger input lists are split and concatenated.
+Requests are batched according to the configurable `batch_size` parameter
+(default 32; local servers such as LM Studio can stall on large batches, so
+the default is kept conservative). Larger input lists are split and
+concatenated. Callers may increase `batch_size` for cloud APIs that support
+larger batches; a warning is logged when the value exceeds 512.
 
 ---
 
@@ -735,8 +738,8 @@ the REPL.
 
 ### `test_embedding_provider.py`
 
-- Mock the `openai` client; verify `embed()` batches correctly at the 96-text
-  limit and concatenates results in order.
+- Mock the `openai` client; verify `embed()` batches correctly according to
+  `batch_size` and concatenates results in order.
 - Verify `dimension` is read from the first API response and cached.
 
 ### `test_vector_store.py`

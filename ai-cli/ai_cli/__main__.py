@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -108,6 +109,15 @@ def parse_args() -> argparse.Namespace:
             "Display backend. Default: from config (which itself defaults to 'rich'). "
             "When provided, overrides 'display_backend' in config."
         ),
+    )
+    try:
+        _version = version("ai-cli")
+    except PackageNotFoundError:
+        _version = "unknown"
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"ai-cli {_version}",
     )
     return parser.parse_args()
 
@@ -257,6 +267,94 @@ def _show_resume_context(session: Session, ui: Display) -> None:
         ui.show_status(_truncate(content))
 
 
+def _init_embedding_index(
+    workspace: Workspace,
+    config: ConfigManager,
+    llm_client: object,
+) -> None:
+    """Build and attach an EmbeddingIndex to *workspace* if embeddings are enabled.
+
+    Does nothing (silently) when ``embeddings.enabled`` is false or absent.
+    Prints a warning and returns when required embedding dependencies cannot
+    be imported (``numpy`` is required; ``xxhash`` is optional — falls back to
+    ``hashlib`` when absent), when ``numpy`` is absent at
+    ``SQLiteVectorStore`` construction time, or when any other construction
+    error occurs.
+    """
+    try:
+        emb_cfg = config.get_embedding_config()
+    except ConfigError as exc:
+        print(f"Warning: embedding config error — {exc}", file=sys.stderr)
+        return
+    if emb_cfg is None:
+        return
+
+    try:
+        from ai_cli.core.embedding_index import EmbeddingIndex
+        from ai_cli.core.embedding_provider import OpenAIEmbeddingProvider
+        from ai_cli.core.vector_store import SQLiteVectorStore
+    except ImportError as exc:
+        print(
+            f"Warning: embedding dependencies not available ({exc}). "
+            "Run: pip install ai-cli[embeddings]",
+            file=sys.stderr,
+        )
+        return
+
+    db_path = workspace.ai_cli_dir / "embeddings" / "index.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        store = SQLiteVectorStore(db_path)
+    except ImportError as exc:
+        print(
+            f"Warning: embedding dependencies not available ({exc}). "
+            "Run: pip install ai-cli[embeddings]",
+            file=sys.stderr,
+        )
+        return
+
+    batch_size_raw = emb_cfg.get("batch_size")
+    timeout_raw = emb_cfg.get("request_timeout")
+    try:
+        batch_size = (
+            int(batch_size_raw)
+            if batch_size_raw is not None and batch_size_raw != ""
+            else 32
+        )
+        request_timeout = (
+            float(timeout_raw)
+            if timeout_raw is not None and timeout_raw != ""
+            else 120.0
+        )
+    except (TypeError, ValueError) as exc:
+        print(
+            f"Warning: invalid embedding configuration value — {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        provider = OpenAIEmbeddingProvider(
+            model=emb_cfg["model"],
+            base_url=emb_cfg.get("base_url"),
+            api_key=emb_cfg.get("api_key"),
+            batch_size=batch_size,
+            request_timeout=request_timeout,
+        )
+        workspace.embedding_index = EmbeddingIndex(
+            db_path=db_path,
+            provider=provider,
+            store=store,
+            config=emb_cfg,
+            workspace=workspace,
+            llm_client=llm_client,
+        )
+    except Exception as exc:
+        store.close()
+        print(f"Warning: failed to initialise embedding index — {exc}", file=sys.stderr)
+
+
 def _cmd_repl(
     start: Path,
     global_dir: Path,
@@ -286,6 +384,7 @@ def _cmd_repl(
         config = ConfigManager(root, cli_overrides)
         workspace = Workspace(root, config)
         llm_client = create_llm_client(config)
+        _init_embedding_index(workspace, config, llm_client)
     except (ConfigError, WorkspaceError, LLMError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

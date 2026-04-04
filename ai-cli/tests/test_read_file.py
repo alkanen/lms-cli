@@ -356,6 +356,119 @@ class TestSessionAllowList:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# External indexed path access control
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_ei(indexed_root: Path) -> MagicMock:
+    """Build a minimal EmbeddingIndex mock whose indexed root is *indexed_root*."""
+    resolved_root = indexed_root.resolve()
+    root_mock = MagicMock()
+    root_mock.path = resolved_root
+
+    def _is_indexed_path(p: Path) -> bool:
+        try:
+            p.resolve().relative_to(resolved_root)
+            return True
+        except ValueError:
+            return False
+
+    ei = MagicMock()
+    ei.roots = [root_mock]
+    ei.is_indexed_path.side_effect = _is_indexed_path
+    return ei
+
+
+def make_tool_with_index(
+    workspace_root: Path,
+    indexed_root: Path,
+    *,
+    permission_required: bool = False,
+) -> ReadFileTool:
+    """Tool backed by a real Workspace with a mocked EmbeddingIndex."""
+    from ai_cli.core.workspace import Workspace
+
+    ws = Workspace(workspace_root, config_manager=MagicMock())
+    ws.embedding_index = _make_mock_ei(indexed_root)
+    pm = MagicMock()
+    pm.request.return_value = (True, "")
+    return ReadFileTool(
+        workspace=ws,
+        permission_manager=pm,
+        permission_required=permission_required,
+        name="read_file",
+        description="Read a file.",
+    )
+
+
+class TestExternalIndexedPaths:
+    def test_execute_reads_file_under_indexed_root(self, tmp_path):
+        """Absolute path under an indexed root is readable."""
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        (ws_root / ".ai-cli").mkdir()
+        ext_root = tmp_path / "external"
+        ext_root.mkdir()
+        target = ext_root / "data.txt"
+        target.write_text("hello external\n")
+
+        tool = make_tool_with_index(ws_root, ext_root)
+        result = tool.execute(path=str(target))
+        assert result.get("error") is None
+        assert "hello external" in result.get("data", {}).get("content", "")
+
+    def test_execute_rejects_absolute_path_not_under_indexed_root(self, tmp_path):
+        """Absolute path outside any indexed root is rejected."""
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        (ws_root / ".ai-cli").mkdir()
+        ext_root = tmp_path / "external"
+        ext_root.mkdir()
+        outside = tmp_path / "other"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret")
+
+        tool = make_tool_with_index(ws_root, ext_root)
+        result = tool.execute(path=str(outside / "secret.txt"))
+        assert result.get("error") is not None
+
+    def test_permission_options_stop_at_index_root(self, tmp_path):
+        """extra_permission_options() walks up only as far as the index root."""
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        (ws_root / ".ai-cli").mkdir()
+        ext_root = tmp_path / "external"
+        (ext_root / "subdir").mkdir(parents=True)
+        target = ext_root / "subdir" / "file.txt"
+        target.write_text("")
+
+        tool = make_tool_with_index(ws_root, ext_root, permission_required=True)
+        options = tool.extra_permission_options(path=str(target))
+        option_paths = [o.split(":", 1)[1] for o in options]
+        # Must include the file and directories up to the index root.
+        assert any(str(target.resolve()) in p for p in option_paths)
+        assert any(str(ext_root.resolve()) in p for p in option_paths)
+        # Must NOT walk above the index root.
+        assert not any(str(tmp_path.resolve()) + "/" == p for p in option_paths)
+
+    def test_session_allow_list_works_for_external_paths(self, tmp_path):
+        """Grant for an external file is honoured by request_permission."""
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        (ws_root / ".ai-cli").mkdir()
+        ext_root = tmp_path / "external"
+        ext_root.mkdir()
+        target = ext_root / "doc.md"
+        target.write_text("content")
+
+        tool = make_tool_with_index(ws_root, ext_root, permission_required=True)
+        path_str = str(target.resolve())
+        tool.on_permission_granted(f"file:{path_str}", path=path_str)
+        allowed, _ = tool.request_permission("read", path=path_str)
+        assert allowed is True
+
+
 class TestResetViaRegistry:
     def test_registry_reset_clears_tool_session_state(self, tmp_path):
         from unittest.mock import MagicMock
