@@ -13,6 +13,7 @@ Currently implemented:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -23,7 +24,7 @@ from dotenv import load_dotenv
 from ai_cli.cli.display import create_display
 from ai_cli.cli.repl import REPL
 from ai_cli.core.config_manager import ConfigError, ConfigManager
-from ai_cli.core.llm_client import LLMError, create_llm_client
+from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
 from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
 from ai_cli.core.tool_registry import ToolRegistry
@@ -108,6 +109,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Display backend. Default: from config (which itself defaults to 'rich'). "
             "When provided, overrides 'display_backend' in config."
+        ),
+    )
+    parser.add_argument(
+        "--summarize",
+        metavar="FILE",
+        help=(
+            "Summarize FILE using the configured LLM and print the result. "
+            "Uses document_embedding.summary_max_tokens from config (default 400). "
+            "Useful for testing the summary document-embedding strategy."
         ),
     )
     try:
@@ -200,6 +210,10 @@ def main() -> None:
         _cmd_init(start)
         return
 
+    if args.summarize is not None:
+        _cmd_summarize(Path(args.summarize), start)
+        return
+
     if args.resume is _RESUME_PICK:
         _cmd_repl(
             start,
@@ -270,7 +284,7 @@ def _show_resume_context(session: Session, ui: Display) -> None:
 def _init_embedding_index(
     workspace: Workspace,
     config: ConfigManager,
-    llm_client: object,
+    llm_client: LLMClient,
 ) -> None:
     """Build and attach an EmbeddingIndex to *workspace* if embeddings are enabled.
 
@@ -470,6 +484,74 @@ def _ensure_global_dir(global_dir: Path) -> bool:
     print(f"Created global config directory: {global_dir}")
     print("Edit the config.yaml there to configure your default backend and model.")
     return True
+
+
+def _cmd_summarize(file_path: Path, start: Path) -> None:
+    """Read *file_path*, call the LLM to summarise it, and print the result."""
+    # Ensure warnings from _summarize_document are visible on stderr.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    if not file_path.is_file():
+        print(f"Error: not a file: {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load config from workspace if one exists; fall back to global-only config.
+    root = Workspace.find_root(start)
+    try:
+        if root is not None:
+            config = ConfigManager(root, {})
+        else:
+            config = ConfigManager(None, {})
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        llm_client = create_llm_client(config)
+    except (ConfigError, LLMError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"Error reading file: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    from ai_cli.core.embedding_index import _summarize_document
+
+    emb_cfg: dict = {}
+    try:
+        cfg = config.get_embedding_config()
+        if cfg is not None:
+            emb_cfg = cfg
+    except ConfigError:
+        pass
+
+    _raw_mt = (emb_cfg.get("document_embedding") or {}).get("summary_max_tokens")
+    try:
+        max_tokens = int(_raw_mt) if _raw_mt is not None else 400
+    except (TypeError, ValueError):
+        max_tokens = 400
+    max_tokens = max(1, max_tokens)
+    char_budget = max_tokens * 4
+    truncated = len(text) > char_budget
+
+    print(f"File:          {file_path}")
+    print(f"Size:          {len(text):,} chars")
+    if truncated:
+        print(f"Truncated to:  {char_budget:,} chars (summary_max_tokens={max_tokens})")
+    print(f"Model:          {config.get_model_config().get('model', '(unknown)')}")
+    print()
+
+    summary = _summarize_document(text, file_path, emb_cfg, llm_client)
+
+    if summary is None:
+        print("Error: summarization failed — see warnings above.", file=sys.stderr)
+        sys.exit(1)
+
+    print("--- Summary ---")
+    print(summary)
 
 
 def _cmd_init(path: Path) -> None:

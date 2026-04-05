@@ -109,17 +109,17 @@ ai-cli/
 │   │   ├── agent_registry.py      # 🔲 AgentSpec loading from config, instance caching
 │   │   ├── task_manager.py        # 🔲 Task tree persistence, validation, queries
 │   │   ├── task_orchestrator.py   # 🔲 Deterministic plan→execute→review loop (/plan)
-│   │   ├── embedding_provider.py  # 🔲 EmbeddingProvider ABC + OpenAIEmbeddingProvider
-│   │   ├── vector_store.py        # 🔲 VectorStore ABC + SQLiteVectorStore
-│   │   ├── chunker.py             # 🔲 Chunk, ChunkStrategy ABC, all chunker impls, make_chunker()
-│   │   └── embedding_index.py     # 🔲 IndexRoot, EmbeddingIndex (orchestration + access control)
+│   │   ├── embedding_provider.py  # ✅ EmbeddingProvider ABC + OpenAIEmbeddingProvider
+│   │   ├── vector_store.py        # ✅ VectorStore ABC + SQLiteVectorStore
+│   │   ├── chunker.py             # ✅ Chunk, ChunkStrategy ABC, all chunker impls, make_chunker()
+│   │   └── embedding_index.py     # ✅ IndexRoot, EmbeddingIndex (orchestration + access control)
 │   ├── tools/                      # Bundled tools
 │   │   ├── base.py                 # ✅ Tool ABC; ToolArgument (with min/max bounds); ToolSchema
 │   │   ├── read_file.py            # ✅ Read a file or line range from the workspace
 │   │   ├── write_file.py           # ✅ Write or partially replace a file in the workspace
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
 │   │   ├── tool_manager.py         # ✅ Context-saving tool gatekeeper
-│   │   ├── search_files.py         # 🔲 search_files tool — semantic search over indexed corpus
+│   │   ├── search_files.py         # ✅ search_files tool — semantic search over indexed corpus
 │   │   ├── call_agent.py          # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
 │   │   └── tasks.py               # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/                        # CLI interface and user-facing components
@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (911 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1037 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -146,14 +146,14 @@ ai-cli/
 │   ├── test_display.py
 │   ├── test_completer.py
 │   ├── test_main.py
-│   ├── test_chunker.py            # 🔲
-│   ├── test_vector_store.py       # 🔲
-│   ├── test_embedding_provider.py # 🔲
-│   ├── test_embedding_index.py    # 🔲
-│   └── test_search_files.py        # 🔲
+│   ├── test_chunker.py            # ✅
+│   ├── test_vector_store.py       # ✅
+│   ├── test_embedding_provider.py # ✅
+│   ├── test_embedding_index.py    # ✅
+│   └── test_search_files.py       # ✅
 └── docs/                           # Documentation
     ├── project_plan.md             # This file
-    ├── design_embeddings.md        # 🔲 Embedding index + semantic search design
+    ├── design_embeddings.md        # ✅ Embedding index + semantic search design
     └── HOWTO_custom_tools.md       # ✅ Guide for writing custom tools
 ```
 
@@ -343,20 +343,20 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Three agent roles: planner (read-only, creates task structure), executor (reads/writes files, updates tasks), reviewer (optional, validates DoD and marks done).
    - Reviewer is optional — when not configured, the executor marks tasks done directly via `tasks_mark_done`.
 
-3. **Embedding Index and Semantic Search** 🔲
+3. **Embedding Index and Semantic Search** ✅
    - See [design_embeddings.md](design_embeddings.md) for the full design.
    - Entirely additive. When `embeddings.enabled` is absent or `false`, nothing is initialised and `search_files` is not registered.
-   - Four new core modules (steps 1–3 are independent, can proceed in parallel):
+   - Four core modules implemented:
      1. `chunker.py` — `Chunk` dataclass, `ChunkStrategy` ABC, `FixedSizeChunker`, `TreeSitterChunker` (optional dep), domain chunkers for YAML/TOML/config formats, `make_chunker()` factory.
-     2. `vector_store.py` — `VectorStore` ABC + `SQLiteVectorStore`. WAL-mode SQLite at `.ai-cli/embeddings/index.db`; numpy vectorised cosine similarity; clean swap-in boundary for future vector databases.
-     3. `embedding_provider.py` — `EmbeddingProvider` ABC + `OpenAIEmbeddingProvider`. Config resolved via `ConfigManager.get_embedding_config()` which falls back to LLM backend values when embedding-specific values are absent.
+     2. `vector_store.py` — `VectorStore` ABC + `SQLiteVectorStore`. WAL-mode SQLite at `.ai-cli/embeddings/index.db`; thread-safe with `threading.Lock`; numpy vectorised cosine similarity; clean swap-in boundary for future vector databases.
+     3. `embedding_provider.py` — `EmbeddingProvider` ABC + `OpenAIEmbeddingProvider`. Config resolved via `ConfigManager.get_embedding_config()` which falls back to LLM backend values when embedding-specific values are absent. Thread-safe: `threading.Lock` guards lazy client construction and `_dimension` writes.
      4. `embedding_index.py` — `IndexRoot`, `EmbeddingIndex`. Orchestrates chunking → embedding → storage. Incremental re-index via xxhash64 change detection. Manages external index roots (user-added paths). `is_indexed_path()` access control used by tools.
    - One new tool: `search_files.py` — `search_files` tool. `DISABLED_BY_DEFAULT = True`. Parameters: `query`, `k`, `level` ("chunk"/"document"/"both"), `path_glob`. Returns ranked results with symbol names, line ranges, live snippets.
-   - Access control: indexing a path grants read access. `read_file` and `find_files` check `workspace.embedding_index.is_indexed_path()` for non-workspace paths.
-   - `/index [path] [--label] [--full] [--remove]` slash command added to `repl.py`.
+   - Access control: indexing a path grants read access. `read_file` checks `workspace.embedding_index.is_indexed_path()` for non-workspace paths; `find_files` access control for its optional `path` parameter is 🔲 planned.
+   - `/index [path] [--label] [--file] [--full] [--remove]` slash command added to `repl.py`; tab completion via `completer.py`.
    - Startup background indexing: not in phase 1, but `index()` is `async` from the start so adding `asyncio.create_task(index.index())` later requires zero changes to `EmbeddingIndex`.
-   - Multi-granularity: both chunk-level and document-level vectors stored. Document vectors: average of chunk vectors for code (no LLM call); LLM-generated summary for prose. Code summary skeleton: signatures + docstrings extracted via tree-sitter (not full file text). Config-file summaries use structural outlines (play names, resource kinds, service names).
-   - Optional dependencies in `pyproject.toml` under `[semantic]` extra: `tree-sitter>=0.21` + per-language grammar packages.
+   - Multi-granularity: both chunk-level and document-level vectors stored. Document vectors: `average` strategy (L2-normalised mean of chunk vectors) for code; `summary` strategy (LLM-generated thematic summary → embed that text) for prose. Input text is truncated to `summary_max_tokens * 4` chars before the LLM call. The summary prompt includes a word-count hint derived from `summary_response_tokens` (default `chunk_size // 4`); no per-call API `max_tokens` cap is set to preserve reasoning-model token budgets. Failed summary calls fall back to `average`. `auto` strategy routes per file extension via `_resolve_doc_strategy()`. Summary embedding during indexing is dispatched via `asyncio.to_thread` to avoid blocking the event loop.
+   - Optional dependencies in `pyproject.toml` under `[embeddings]` and `[semantic]` extras.
 
 4. **MCP Server Support** 🔲
    - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
@@ -385,7 +385,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 - **Embedding storage — SQLite over numpy+jsonl**: A single WAL-mode SQLite database (`.ai-cli/embeddings/index.db`) is used for all index data. Incremental upsert, per-file deletion, and atomic writes are trivially correct in SQLite; the equivalent with flat files requires compaction passes and file-replace tricks. Search still uses numpy vectorised cosine similarity (all vectors loaded into a float32 matrix). Human-readable metadata is accessible via the `sqlite3` CLI.
 - **Indexed roots as access control**: Running `/index /path/to/external` records the path in the persistent SQLite `index_roots` table and grants `read_file` and `find_files` access to that path in all sessions until explicitly removed. Indexed roots are the only persisted access-control list in the system — all other ad-hoc permission grants (yes/always) remain in-memory and reset on process exit or session resume. No symlinks, no separate permission config. Removing a root with `/index --remove /path` revokes access immediately and permanently.
 - **Chunking strategy — auto selection**: `make_chunker()` checks domain patterns first (Helm, Kubernetes, Ansible, Compose, TOML), then tree-sitter for source languages, then falls back to fixed-size. tree-sitter is optional; its absence is handled gracefully at construction time with no user-visible error.
-- **Document-level embeddings — auto strategy**: Code files → average of chunk vectors (no LLM call, fast). Prose files (configurable by extension) → LLM-generated summary of the structural skeleton → embed that summary. Skeleton for code: signatures + docstrings via tree-sitter. Skeleton for config: structural outline (resource kinds, task names, service names). LLM summary calls happen at `/index` time, not at query time.
+- **Document-level embeddings — auto strategy**: Code files → average of chunk vectors (no LLM call, fast). Prose files (configurable by extension) → LLM-generated thematic summary → embed that text. Input is truncated to `summary_max_tokens * 4` chars (default 1600 chars). The summary prompt includes a word-count hint (`summary_response_tokens`, default `chunk_size // 4`) so the response fits one embedding chunk; no per-call API `max_tokens` cap is applied (reasoning models keep their full budget). Failed LLM calls fall back to `average` with a warning. LLM summary calls happen at `/index` time (dispatched via `asyncio.to_thread`), not at query time. `prose_extensions` are normalised to lowercase for case-insensitive matching.
 - **Embedding backend config inheritance**: `embeddings.base_url` and `embeddings.api_key_env` inherit from the LLM backend config when absent or null. This allows Ollama (single port, different model names) to serve both the generation and embedding model with zero extra config.
 - **Startup indexing deferred to phase 2**: Phase 1 is on-demand only (`/index` command). `EmbeddingIndex.index()` is `async` from day one so startup background indexing (`asyncio.create_task(...)`) requires no changes to `EmbeddingIndex` when added later.
 
@@ -418,14 +418,14 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **Embedding Index and Semantic Search** — `chunker.py`, `vector_store.py`, `embedding_provider.py`, `embedding_index.py`, `search_files.py` tool, `/index` slash command. See [design_embeddings.md](design_embeddings.md). Steps 1–3 are independent and can proceed in parallel.
-2. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
-3. **Multi-agent system** — `agent.py`, `agent_registry.py`, `call_agent.py`, `SubAgentDisplay`. REPL refactor to extract `Agent.run()`. See [design_agents.md](design_agents.md).
-4. **Task system** — `task_manager.py`, `task_orchestrator.py`, `tasks.py`. `/plan` and `/tasks` slash commands. See [design_task_system.md](design_task_system.md).
-5. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
-6. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
-7. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
-8. **`/tools allow` REPL command + permission mutation refactor** — Invert the default persistence of `ToolRegistry.set_permission_required()`: bare invocation is in-memory only for the current session; `--persist` writes to the project config (`user_confirmed: true`); `--global` writes to `~/.ai-cli/config.yaml` (requires a confirmation step because it affects all projects). Update the underlying `ToolRegistry` API to match — temporary by default — so callers that need in-memory overrides (e.g. per-agent `ToolRegistry` factories) do not need to work around the API.
+1. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
+2. **Multi-agent system** — `agent.py`, `agent_registry.py`, `call_agent.py`, `SubAgentDisplay`. REPL refactor to extract `Agent.run()`. See [design_agents.md](design_agents.md).
+3. **Task system** — `task_manager.py`, `task_orchestrator.py`, `tasks.py`. `/plan` and `/tasks` slash commands. See [design_task_system.md](design_task_system.md).
+4. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
+5. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
+6. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
+7. **`/tools allow` REPL command + permission mutation refactor** — Invert the default persistence of `ToolRegistry.set_permission_required()`: bare invocation is in-memory only for the current session; `--persist` writes to the project config (`user_confirmed: true`); `--global` writes to `~/.ai-cli/config.yaml` (requires a confirmation step because it affects all projects). Update the underlying `ToolRegistry` API to match — temporary by default — so callers that need in-memory overrides (e.g. per-agent `ToolRegistry` factories) do not need to work around the API.
+8. **`find_files` access control for external roots** — call `workspace.embedding_index.is_indexed_path()` to validate any optional `path` parameter, consistent with how `read_file` handles external paths.
 
 ## Dependencies
 - Python 3.10+

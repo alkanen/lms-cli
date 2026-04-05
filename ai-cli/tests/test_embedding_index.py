@@ -10,7 +10,12 @@ import pytest
 
 pytest.importorskip("numpy")
 
-from ai_cli.core.embedding_index import EmbeddingIndex  # noqa: E402
+import ai_cli.core.embedding_index as _ei_mod  # noqa: E402
+from ai_cli.core.embedding_index import (  # noqa: E402
+    EmbeddingIndex,
+    _compute_doc_vector,
+    _summarize_document,
+)
 from ai_cli.core.vector_store import SQLiteVectorStore  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -57,6 +62,7 @@ def _make_index(
     *,
     provider: MagicMock | None = None,
     config: dict | None = None,
+    llm_client: object | None = None,
 ) -> EmbeddingIndex:
     if provider is None:
         provider = _make_provider()
@@ -67,7 +73,20 @@ def _make_index(
         store=store,
         config=config or {},
         workspace=ws,
+        llm_client=llm_client,
     )
+
+
+def _make_llm_client(summary: str = "This is a summary.") -> MagicMock:
+    """Return a mock LLMClient whose send() yields a text chunk then done."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "text", "delta": summary},
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +372,420 @@ def test_index_is_coroutine(store: SQLiteVectorStore, tmp_path: Path) -> None:
     assert inspect.iscoroutine(coro)
     # Clean up.
     asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# _summarize_document unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_warned_keys():
+    """Reset the process-level warning dedup set between tests."""
+    _ei_mod._SUMMARY_WARNED_KEYS.clear()
+    yield
+    _ei_mod._SUMMARY_WARNED_KEYS.clear()
+
+
+def test_summarize_document_returns_text(tmp_path: Path) -> None:
+    """Returns the summary text from a successful LLM call."""
+    client = _make_llm_client("Covers routing and middleware.")
+    result = _summarize_document("long doc text", tmp_path / "readme.md", {}, client)
+    assert result == "Covers routing and middleware."
+
+
+def test_summarize_document_none_client(tmp_path: Path) -> None:
+    """Returns None immediately when llm_client is None."""
+    result = _summarize_document("text", tmp_path / "readme.md", {}, None)
+    assert result is None
+
+
+def test_summarize_document_llm_raises(tmp_path: Path) -> None:
+    """Returns None and logs a warning when the LLM call raises."""
+    client = MagicMock()
+    client.send.side_effect = RuntimeError("connection refused")
+    result = _summarize_document("text", tmp_path / "readme.md", {}, client)
+    assert result is None
+
+
+def test_summarize_document_empty_response(tmp_path: Path) -> None:
+    """Returns None when the LLM yields no text deltas."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    result = _summarize_document("text", tmp_path / "readme.md", {}, client)
+    assert result is None
+
+
+def test_summarize_document_truncates_input(tmp_path: Path) -> None:
+    """Input is truncated to summary_max_tokens * 4 chars."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "text", "delta": "ok"},
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    long_text = "x" * 1000
+    config = {"document_embedding": {"summary_max_tokens": 10}}
+    _summarize_document(long_text, tmp_path / "f.md", config, client)
+
+    sent_messages = client.send.call_args[0][0]
+    user_content = sent_messages[-1]["content"]
+    # Extract the text portion after the instruction (everything after the last "\n\n").
+    text_portion = user_content.split("\n\n", 1)[1]
+    assert len(text_portion) <= 40  # summary_max_tokens=10 → 10*4=40 chars
+
+
+def test_summarize_document_clamps_negative_max_input_tokens(tmp_path: Path) -> None:
+    """A zero or negative summary_max_tokens is clamped to 1 (not passed raw to slice)."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "text", "delta": "ok"},
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    config = {"document_embedding": {"summary_max_tokens": -10}}
+    _summarize_document("hello world", tmp_path / "f.md", config, client)
+
+    sent_messages = client.send.call_args[0][0]
+    user_content = sent_messages[-1]["content"]
+    text_portion = user_content.split("\n\n", 1)[1]
+    # Clamped to 1 → budget = 4 chars; "hell" is sent, not an empty/reversed slice.
+    assert len(text_portion) <= 4
+
+
+def test_summarize_document_no_api_token_cap(tmp_path: Path) -> None:
+    """send() is called without a max_tokens override — reasoning models keep their full budget."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "text", "delta": "ok"},
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    _summarize_document("text", tmp_path / "f.md", {}, client)
+
+    _, kwargs = client.send.call_args
+    assert "max_tokens" not in kwargs
+
+
+def test_summarize_document_prompt_includes_word_limit(tmp_path: Path) -> None:
+    """User prompt mentions the derived word limit."""
+    client = MagicMock()
+    client.send.return_value = iter(
+        [
+            {"type": "text", "delta": "ok"},
+            {"type": "done", "stop_reason": "stop", "usage": {}},
+        ]
+    )
+    # chunk_size=400 → summary_response_tokens=100 → max_words=75
+    config = {"chunking": {"chunk_size": 400}}
+    _summarize_document("text", tmp_path / "f.md", config, client)
+
+    sent_messages = client.send.call_args[0][0]
+    user_content = sent_messages[-1]["content"]
+    assert "75 words" in user_content
+
+
+def test_summarize_document_warns_once_for_summary_model(tmp_path: Path) -> None:
+    """summary_model warning is recorded in _SUMMARY_WARNED_KEYS after the first call."""
+    config = {"document_embedding": {"summary_model": "gpt-4o"}}
+
+    def _fresh_send(*_a, **_kw):
+        return iter(
+            [
+                {"type": "text", "delta": "s"},
+                {"type": "done", "stop_reason": "stop", "usage": {}},
+            ]
+        )
+
+    client = MagicMock()
+    client.send.side_effect = _fresh_send
+
+    _summarize_document("t", tmp_path / "f.md", config, client)
+    assert "summary_model:override" in _ei_mod._SUMMARY_WARNED_KEYS
+
+    # Second call must NOT add a second entry (set semantics guarantee this, but
+    # also confirm send is still called — only the warning is suppressed).
+    _summarize_document("t", tmp_path / "f.md", config, client)
+    assert client.send.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _compute_doc_vector — strategy routing
+# ---------------------------------------------------------------------------
+
+_DOC_CFG_BASE = {"enabled": True}
+
+
+def _avg_config() -> dict:
+    return {"document_embedding": {**_DOC_CFG_BASE, "strategy": "average"}}
+
+
+def _summary_config() -> dict:
+    return {"document_embedding": {**_DOC_CFG_BASE, "strategy": "summary"}}
+
+
+def _auto_config(prose_extensions: list[str] | None = None) -> dict:
+    cfg: dict = {**_DOC_CFG_BASE, "strategy": "auto"}
+    if prose_extensions is not None:
+        cfg["prose_extensions"] = prose_extensions
+    return {"document_embedding": cfg}
+
+
+def test_compute_doc_vector_average_strategy(tmp_path: Path) -> None:
+    """average strategy returns the L2-normalised mean of chunk vectors."""
+    vecs = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    result = _compute_doc_vector(vecs, tmp_path / "f.py", _avg_config())
+    assert result is not None
+    import math
+
+    assert math.isclose(sum(x * x for x in result), 1.0, abs_tol=1e-5)
+
+
+def test_compute_doc_vector_summary_calls_llm(tmp_path: Path) -> None:
+    """summary strategy calls embed_sync with the LLM-generated text."""
+    summary_text = "Describes the HTTP router."
+    client = _make_llm_client(summary_text)
+    provider = MagicMock()
+    provider.embed_sync.return_value = [[0.1, 0.2, 0.3, 0.4]]
+
+    vecs = [[1.0, 0.0, 0.0, 0.0]]
+    result = _compute_doc_vector(
+        vecs,
+        tmp_path / "readme.md",
+        _summary_config(),
+        text="full doc text",
+        llm_client=client,
+        provider=provider,
+    )
+    assert result == [0.1, 0.2, 0.3, 0.4]
+    provider.embed_sync.assert_called_once()
+    embedded_text = provider.embed_sync.call_args[0][0][0]
+    assert embedded_text == summary_text
+
+
+def test_compute_doc_vector_summary_falls_back_when_no_client(tmp_path: Path) -> None:
+    """summary strategy falls back to average when llm_client is None."""
+    vecs = [[1.0, 0.0], [0.0, 1.0]]
+    provider = MagicMock()
+    result = _compute_doc_vector(
+        vecs,
+        tmp_path / "f.md",
+        _summary_config(),
+        text="text",
+        llm_client=None,
+        provider=provider,
+    )
+    assert result is not None  # average fallback succeeded
+    provider.embed_sync.assert_not_called()
+
+
+def test_compute_doc_vector_summary_falls_back_on_llm_failure(tmp_path: Path) -> None:
+    """summary strategy falls back to average when the LLM call raises."""
+    client = MagicMock()
+    client.send.side_effect = RuntimeError("timeout")
+    provider = MagicMock()
+    vecs = [[1.0, 0.0], [1.0, 0.0]]
+
+    result = _compute_doc_vector(
+        vecs,
+        tmp_path / "f.md",
+        _summary_config(),
+        text="text",
+        llm_client=client,
+        provider=provider,
+    )
+    assert result is not None
+    provider.embed_sync.assert_not_called()
+
+
+def test_compute_doc_vector_summary_falls_back_when_embed_sync_empty(
+    tmp_path: Path,
+) -> None:
+    """summary strategy falls back to average when embed_sync returns empty list."""
+    client = _make_llm_client("summary text")
+    provider = MagicMock()
+    provider.embed_sync.return_value = []
+    vecs = [[1.0, 0.0], [1.0, 0.0]]
+
+    result = _compute_doc_vector(
+        vecs,
+        tmp_path / "f.md",
+        _summary_config(),
+        text="text",
+        llm_client=client,
+        provider=provider,
+    )
+    assert result is not None  # average fallback
+
+
+def test_compute_doc_vector_auto_prose_uses_summary(tmp_path: Path) -> None:
+    """auto strategy routes .md files to the summary path."""
+    client = _make_llm_client("summary")
+    provider = MagicMock()
+    provider.embed_sync.return_value = [[0.5, 0.5]]
+
+    _compute_doc_vector(
+        [[1.0, 0.0]],
+        tmp_path / "notes.md",
+        _auto_config(),
+        text="text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_called_once()
+
+
+def test_compute_doc_vector_auto_code_uses_average(tmp_path: Path) -> None:
+    """auto strategy routes .py files to the average path (no LLM call)."""
+    client = _make_llm_client("summary")
+    provider = MagicMock()
+
+    _compute_doc_vector(
+        [[1.0, 0.0], [0.0, 1.0]],
+        tmp_path / "main.py",
+        _auto_config(),
+        text="code text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_not_called()
+    client.send.assert_not_called()
+
+
+def test_compute_doc_vector_auto_custom_prose_extensions(tmp_path: Path) -> None:
+    """Custom prose_extensions override the default list."""
+    client = _make_llm_client("summary")
+    provider = MagicMock()
+    provider.embed_sync.return_value = [[0.5, 0.5]]
+
+    # .log is in the custom list → summary path.
+    _compute_doc_vector(
+        [[1.0, 0.0]],
+        tmp_path / "app.log",
+        _auto_config(prose_extensions=[".log"]),
+        text="log text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_called_once()
+
+    provider.reset_mock()
+    client.reset_mock()
+
+    # .md is NOT in the custom list → average path.
+    _compute_doc_vector(
+        [[1.0, 0.0]],
+        tmp_path / "readme.md",
+        _auto_config(prose_extensions=[".log"]),
+        text="md text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_not_called()
+
+
+def test_compute_doc_vector_auto_prose_extensions_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    """prose_extensions entries are matched case-insensitively."""
+    client = _make_llm_client("summary")
+    provider = MagicMock()
+    provider.embed_sync.return_value = [[0.5, 0.5]]
+
+    # Config uses uppercase ".MD"; file suffix is ".md" — should still match.
+    _compute_doc_vector(
+        [[1.0, 0.0]],
+        tmp_path / "readme.md",
+        _auto_config(prose_extensions=[".MD"]),
+        text="text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_called_once()
+
+
+def test_compute_doc_vector_auto_prose_extensions_bare_string(tmp_path: Path) -> None:
+    """A bare string for prose_extensions (YAML scalar mistake) is treated as one entry."""
+    client = _make_llm_client("summary")
+    provider = MagicMock()
+    provider.embed_sync.return_value = [[0.5, 0.5]]
+
+    # Simulates `prose_extensions: .md` in YAML (string, not list).
+    cfg = {
+        "document_embedding": {
+            **_DOC_CFG_BASE,
+            "strategy": "auto",
+            "prose_extensions": ".md",
+        }
+    }
+    _compute_doc_vector(
+        [[1.0, 0.0]],
+        tmp_path / "readme.md",
+        cfg,
+        text="text",
+        llm_client=client,
+        provider=provider,
+    )
+    provider.embed_sync.assert_called_once()
+
+
+def test_compute_doc_vector_summary_embed_sync_raises_falls_back(
+    tmp_path: Path,
+) -> None:
+    """embed_sync failure after summarisation falls back to chunk-average."""
+    client = _make_llm_client("summary text")
+    provider = MagicMock()
+    provider.embed_sync.side_effect = RuntimeError("network error")
+    vecs = [[1.0, 0.0], [0.0, 1.0]]
+
+    result = _compute_doc_vector(
+        vecs,
+        tmp_path / "doc.md",
+        {"document_embedding": {**_DOC_CFG_BASE, "strategy": "summary"}},
+        text="some text",
+        llm_client=client,
+        provider=provider,
+    )
+    # Falls back to chunk-average — result is a normalised vector, not None.
+    assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: _embed_and_upsert_file stores a doc vector for prose files
+# ---------------------------------------------------------------------------
+
+
+def test_index_file_stores_document_vector_for_prose(
+    store: SQLiteVectorStore, tmp_path: Path
+) -> None:
+    """Indexing a .md file with summary strategy stores a chunk_type=document row."""
+    md_file = tmp_path / "notes.md"
+    md_file.write_text("# Hello\nThis is a note.\n")
+
+    provider = _make_provider(dimension=4)
+    # embed_sync returns a distinct vector so we can identify the doc vector.
+    provider.embed_sync.return_value = [[0.1, 0.2, 0.3, 0.4]]
+
+    client = _make_llm_client("A note about hello.")
+    config = {
+        "document_embedding": {"enabled": True, "strategy": "summary"},
+    }
+    idx = _make_index(
+        store, tmp_path, provider=provider, config=config, llm_client=client
+    )
+    asyncio.run(idx.index_file(md_file))
+
+    results = store.search(
+        query_vector=[0.1, 0.2, 0.3, 0.4],
+        k=10,
+        chunk_type="document",
+    )
+    assert any(r.metadata.get("chunk_type") == "document" for r in results)
+    provider.embed_sync.assert_called_once()

@@ -32,7 +32,6 @@ from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
-
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 
 if TYPE_CHECKING:
@@ -132,6 +131,7 @@ class LLMClient(ABC):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
+        max_tokens: int | None = None,
     ) -> Generator[dict, None, None]:
         """
         Send a conversation turn and yield Chunk dicts.
@@ -144,6 +144,9 @@ class LLMClient(ABC):
         When *stream* is ``False``, the entire response is awaited before any
         chunks are yielded; the same Chunk types are produced in the same order
         so callers need not handle the two modes differently.
+
+        *max_tokens* overrides the client's configured ``max_response_tokens``
+        for this call only.  Pass ``None`` (default) to use the client default.
 
         Yields
         ------
@@ -212,11 +215,14 @@ class OpenAIClient(LLMClient):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
+        max_tokens: int | None = None,
     ) -> Generator[dict, None, None]:
         """Stream one conversation turn, retrying on rate-limit errors."""
         for attempt in range(self._MAX_RETRIES):
             try:
-                yield from self._stream(messages, tools, stream=stream)
+                yield from self._stream(
+                    messages, tools, stream=stream, max_tokens=max_tokens
+                )
                 return
             except RateLimitError as exc:
                 if attempt == self._MAX_RETRIES - 1:
@@ -275,12 +281,15 @@ class OpenAIClient(LLMClient):
         messages: list[dict],
         tools: list[dict],
         stream: bool = True,
+        max_tokens: int | None = None,
     ) -> Generator[dict, None, None]:
         """Single attempt — not responsible for retries."""
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "max_tokens": self._max_response_tokens,
+            "max_tokens": max_tokens
+            if max_tokens is not None
+            else self._max_response_tokens,
             "stream": stream,
         }
         if stream:

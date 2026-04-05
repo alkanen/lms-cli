@@ -9,6 +9,7 @@ Optional dependencies: xxhash (for hashing), numpy (via vector_store).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -23,13 +24,43 @@ from ai_cli.core.vector_store import SearchResult, SQLiteVectorStore, VectorStor
 
 if TYPE_CHECKING:
     from ai_cli.core.embedding_provider import EmbeddingProvider
+    from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
-# Keys that have already triggered a "not yet implemented" warning this
-# process lifetime.  Prevents spamming logs once per indexed file.
+# Keys that have already triggered a warning this process lifetime.
+# Prevents spamming logs once per indexed file.
 _SUMMARY_WARNED_KEYS: set[str] = set()
+
+# File extensions treated as prose under the "auto" document-embedding strategy.
+# Prose files use LLM summarisation; all others use chunk-average.
+# Override via ``document_embedding.prose_extensions`` in config.
+_DEFAULT_PROSE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".rst",
+        ".adoc",
+        ".asciidoc",
+        ".tex",
+        ".org",
+    }
+)
+
+# Prompt templates for LLM-based document summarisation.
+_SUMMARY_SYSTEM_PROMPT: str = (
+    "You are a precise technical summarizer. "
+    "Produce a single dense paragraph (no bullet points, no headers) "
+    "capturing the document's main topics, purpose, and key concepts. "
+    "Focus on what would help someone decide whether this document is relevant "
+    "to a search query. Do not include opinions or extraneous commentary."
+)
+_SUMMARY_USER_TEMPLATE: str = (
+    "Summarize the following document for semantic search indexing "
+    "in at most {max_words} words:\n\n{text}"
+)
 
 try:
     import xxhash as _xxhash
@@ -181,7 +212,7 @@ class EmbeddingIndex:
         store: VectorStore,
         config: dict,
         workspace: Workspace,
-        llm_client: object = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._db_path = db_path
         self._provider = provider
@@ -789,9 +820,37 @@ class EmbeddingIndex:
             )
             return
 
-        # Delete existing chunks only after embeddings are successfully
-        # computed so that a failure or cancellation mid-embed leaves the
-        # previous index data intact rather than leaving the file unindexed.
+        # Compute the document-level vector before touching the store so
+        # the previous index data stays intact on failure, and the window
+        # where the file is absent is reduced to just delete + upsert.
+        # The "summary" and "auto" strategies may make blocking LLM and
+        # embedding calls — run those in a thread to keep the event loop
+        # free.  "average" (pure numpy) and disabled paths are cheap and
+        # don't need the thread handoff.
+        _effective = _resolve_doc_strategy(self._config, file_path)
+        _may_block = _effective == "summary"
+        if _may_block:
+            doc_vec = await asyncio.to_thread(
+                _compute_doc_vector,
+                chunk_vectors,
+                file_path,
+                self._config,
+                text=text,
+                llm_client=self._llm_client,
+                provider=self._provider,
+            )
+        else:
+            doc_vec = _compute_doc_vector(
+                chunk_vectors,
+                file_path,
+                self._config,
+                text=text,
+                llm_client=self._llm_client,
+                provider=self._provider,
+            )
+
+        # Delete existing chunks only after all embeddings are successfully
+        # computed so that a failure leaves the previous index data intact.
         self._store.delete_by_file(file_path_str)
 
         ids: list[str] = []
@@ -815,8 +874,6 @@ class EmbeddingIndex:
                 }
             )
 
-        # Document-level embedding.
-        doc_vec = _compute_doc_vector(chunk_vectors, file_path, self._config)
         if doc_vec is not None:
             doc_id = _chunk_id(file_path_str, "document", None)
             ids.append(doc_id)
@@ -850,64 +907,219 @@ class EmbeddingIndex:
 # ---------------------------------------------------------------------------
 
 
-def _compute_doc_vector(
-    chunk_vectors: list[list[float]],
+def _summarize_document(
+    text: str,
     file_path: Path,
     config: dict,
-) -> list[float] | None:
-    """Compute and return the document-level embedding vector, or ``None``.
+    llm_client: LLMClient | None,
+) -> str | None:
+    """Call the LLM to produce a concise thematic summary of *text*.
 
-    Returns ``None`` when ``document_embedding.enabled`` is false/absent,
-    when numpy is not installed, when there are no chunk vectors, or when an
-    unsupported strategy is configured.
+    Uses ``document_embedding.summary_max_tokens`` (default 400) to limit how
+    many characters of *text* are sent (approx. 4 chars per token).
 
-    Supported strategy: ``average`` — element-wise mean of chunk vectors,
-    L2-normalised.  The ``summary`` strategy (LLM call) is not yet
-    implemented and will return ``None``.
+    Returns the summary string, or ``None`` if the call fails or the client is
+    unavailable — the caller should fall back to the average strategy.
+    """
+    if llm_client is None:
+        return None
+
+    doc_cfg: dict = config.get("document_embedding", {}) or {}
+
+    # Warn once if summary_model is set — per-call model switching is unsupported.
+    summary_model = doc_cfg.get("summary_model")
+    if summary_model is not None:
+        warn_key = "summary_model:override"
+        if warn_key not in _SUMMARY_WARNED_KEYS:
+            _SUMMARY_WARNED_KEYS.add(warn_key)
+            logger.warning(
+                "document_embedding.summary_model=%r is set, but per-call model "
+                "switching is not supported — using the main LLM client instead.",
+                summary_model,
+            )
+
+    # Truncate input to roughly summary_max_tokens * 4 chars.
+    _raw = doc_cfg.get("summary_max_tokens")
+    try:
+        max_input_tokens = int(_raw) if _raw is not None else 400
+    except (TypeError, ValueError):
+        max_input_tokens = 400
+    max_input_tokens = max(1, max_input_tokens)
+    truncated = text[: max_input_tokens * 4]
+
+    # Derive a soft word-count hint for the prompt so the summary is likely
+    # to fit within one embedding chunk.  This is not an API-enforced cap;
+    # the LLM client's max_response_tokens still governs the actual limit.
+    # summary_response_tokens defaults to chunk_size // 4 (chars → tokens).
+    chunking_cfg: dict = config.get("chunking", {}) or {}
+    try:
+        chunk_size: int = int(chunking_cfg.get("chunk_size", 1200))
+    except (TypeError, ValueError):
+        chunk_size = 1200
+    _raw_rt = doc_cfg.get("summary_response_tokens")
+    try:
+        summary_response_tokens = (
+            int(_raw_rt) if _raw_rt is not None else chunk_size // 4
+        )
+    except (TypeError, ValueError):
+        summary_response_tokens = chunk_size // 4
+    # Convert tokens to an approximate word count for the prompt instruction.
+    max_words: int = max(1, summary_response_tokens * 3 // 4)
+
+    messages = [
+        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": _SUMMARY_USER_TEMPLATE.format(
+                text=truncated, max_words=max_words
+            ),
+        },
+    ]
+    try:
+        parts: list[str] = []
+        for chunk in llm_client.send(messages, tools=[], stream=False):
+            if chunk["type"] == "text":
+                parts.append(chunk["delta"])
+            elif chunk["type"] == "done":
+                break
+        summary = "".join(parts).strip()
+    except Exception:
+        logger.warning(
+            "LLM summarisation failed for %s",
+            file_path.name,
+            exc_info=True,
+        )
+        return None
+
+    if not summary:
+        logger.warning(
+            "LLM returned empty summary for %s",
+            file_path.name,
+        )
+        return None
+    return summary
+
+
+def _resolve_doc_strategy(config: dict, file_path: Path) -> str | None:
+    """Return the effective doc-embedding strategy, or ``None`` if disabled.
+
+    Resolves ``"auto"`` to ``"summary"`` or ``"average"`` based on file
+    extension, using ``prose_extensions`` from config (or the built-in
+    defaults).
     """
     doc_cfg = cast(dict, config.get("document_embedding", {}) or {})
     if not doc_cfg.get("enabled", False):
         return None
 
-    strategy = doc_cfg.get("strategy", "auto")
-    # "auto" maps to "average" until "summary" is implemented.
-    if strategy in ("auto", "average"):
-        # Warn once per process if summary-specific keys are set but have no
-        # effect yet.  _SUMMARY_WARNED_KEYS guards against per-file log spam.
-        for key in ("summary_model", "summary_max_tokens", "prose_extensions"):
-            if doc_cfg.get(key) is not None and key not in _SUMMARY_WARNED_KEYS:
-                _SUMMARY_WARNED_KEYS.add(key)
-                logger.warning(
-                    "document_embedding.%s is set but the 'summary' strategy is not "
-                    "yet implemented — this key has no effect.",
-                    key,
-                )
-    elif strategy == "summary":
-        warn_key = "strategy:summary"
-        if warn_key not in _SUMMARY_WARNED_KEYS:
-            _SUMMARY_WARNED_KEYS.add(warn_key)
-            logger.error(
-                "document_embedding.strategy is set to 'summary', but this "
-                "strategy is not yet implemented. No document-level vectors will be "
-                "generated. Use 'auto' or 'average' instead.",
-            )
-        return None
-    else:
+    raw_strategy = doc_cfg.get("strategy", "auto")
+    if not isinstance(raw_strategy, str) or not raw_strategy:
         logger.warning(
-            "Skipping document vector for %s: unknown strategy %r",
-            file_path.name,
-            strategy,
+            "document_embedding.strategy has invalid value %r — defaulting to 'auto'",
+            raw_strategy,
         )
+        raw_strategy = "auto"
+    strategy: str = raw_strategy
+    if strategy == "auto":
+        raw_exts = doc_cfg.get("prose_extensions")
+        if raw_exts is not None:
+            if isinstance(raw_exts, str):
+                raw_exts = [raw_exts]
+            try:
+                prose_exts: frozenset[str] = frozenset(
+                    (e if e.startswith(".") else f".{e}").lower() for e in raw_exts
+                )
+            except (TypeError, AttributeError):
+                prose_exts = _DEFAULT_PROSE_EXTENSIONS
+        else:
+            prose_exts = _DEFAULT_PROSE_EXTENSIONS
+        strategy = "summary" if file_path.suffix.lower() in prose_exts else "average"
+
+    return strategy
+
+
+def _compute_doc_vector(
+    chunk_vectors: list[list[float]],
+    file_path: Path,
+    config: dict,
+    *,
+    text: str | None = None,
+    llm_client: LLMClient | None = None,
+    provider: EmbeddingProvider | None = None,
+) -> list[float] | None:
+    """Compute and return the document-level embedding vector, or ``None``.
+
+    Returns ``None`` when ``document_embedding.enabled`` is false/absent,
+    when an unsupported strategy is configured, or when the chosen strategy
+    cannot produce a vector (e.g. numpy missing for ``average``, or both LLM
+    and embedding calls failing for ``summary``).
+
+    Supported strategies:
+
+    ``average``
+        Element-wise mean of chunk vectors, L2-normalised.  No LLM call.
+    ``summary``
+        LLM-generated thematic summary, then embed that text.  Falls back to
+        ``average`` when *llm_client* is ``None`` or the LLM call fails.
+    ``auto`` (default)
+        Routes to ``summary`` for file extensions in ``prose_extensions``
+        (default: ``.md``, ``.txt``, ``.rst``, etc.) and to ``average``
+        for everything else.
+    """
+    strategy = _resolve_doc_strategy(config, file_path)
+    if strategy is None:
         return None
 
-    if not _HAS_NUMPY:
-        return None
-    if not chunk_vectors:
-        return None
+    if strategy == "summary":
+        if text is None or provider is None:
+            logger.warning(
+                "summary strategy requested for %s but text/provider not available "
+                "— falling back to average",
+                file_path.name,
+            )
+        elif llm_client is None:
+            logger.warning(
+                "summary strategy requested for %s but no LLM client configured "
+                "— falling back to average",
+                file_path.name,
+            )
+        else:
+            summary = _summarize_document(text, file_path, config, llm_client)
+            if summary is not None:
+                try:
+                    vecs = provider.embed_sync([summary])
+                except Exception:
+                    logger.warning(
+                        "Summary embedding failed for %s "
+                        "— using chunk-average fallback",
+                        file_path.name,
+                        exc_info=True,
+                    )
+                else:
+                    if vecs:
+                        return cast("list[float]", vecs[0])
+            else:
+                logger.info(
+                    "No summary produced for %s — using chunk-average fallback",
+                    file_path.name,
+                )
+        # Fall through to average.
+        strategy = "average"
 
-    arr = _np.array(chunk_vectors, dtype=_np.float32)
-    mean_vec = arr.mean(axis=0)
-    norm = _np.linalg.norm(mean_vec)
-    if norm > 0:
-        mean_vec = mean_vec / norm
-    return cast("list[float]", mean_vec.tolist())
+    if strategy == "average":
+        if not _HAS_NUMPY:
+            return None
+        if not chunk_vectors:
+            return None
+        arr = _np.array(chunk_vectors, dtype=_np.float32)
+        mean_vec = arr.mean(axis=0)
+        norm = _np.linalg.norm(mean_vec)
+        if norm > 0:
+            mean_vec = mean_vec / norm
+        return cast("list[float]", mean_vec.tolist())
+
+    logger.warning(
+        "Skipping document vector for %s: unknown strategy %r",
+        file_path.name,
+        strategy,
+    )
+    return None
