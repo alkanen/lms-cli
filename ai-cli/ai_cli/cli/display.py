@@ -958,6 +958,111 @@ class RichDisplay(Display):
 
 
 # ---------------------------------------------------------------------------
+# SubAgentDisplay — captures output in a buffer for non-interactive agents
+# ---------------------------------------------------------------------------
+
+
+class SubAgentDisplay(Display):
+    """Display backend for sub-agents.
+
+    Instead of writing to a terminal, all streamed text is captured in an
+    internal buffer.  Tool calls and status messages are routed to the
+    logger.  Permission prompts are denied by default — sub-agents should
+    not require interactive approval at runtime.
+    """
+
+    def __init__(self, *, verbose: bool = False, markdown_enabled: bool = True) -> None:
+        super().__init__(verbose=verbose, markdown_enabled=markdown_enabled)
+        self._buffer: list[str] = []
+        self._last_usage: dict = {}
+
+    # -- Public API --------------------------------------------------------
+
+    @property
+    def captured_text(self) -> str:
+        """Return all streamed text as a single string."""
+        return "".join(self._buffer)
+
+    def reset(self) -> None:
+        """Clear the buffer for reuse (session-persistent agents)."""
+        self._buffer.clear()
+        self._last_usage = {}
+
+    # -- Streaming assistant output ----------------------------------------
+
+    def begin_assistant_turn(self) -> None:
+        pass
+
+    def stream_text(self, delta: str) -> None:
+        self._buffer.append(delta)
+
+    def stream_reasoning(self, delta: str) -> None:
+        logger.debug("Sub-agent reasoning: %s", delta)
+
+    def end_assistant_turn(self) -> None:
+        pass
+
+    def update_usage(self, usage: dict, context_window: int) -> None:
+        self._last_usage = usage
+
+    # -- Tool activity -----------------------------------------------------
+
+    def show_tool_call(self, name: str, args: dict) -> None:
+        if self._verbose:
+            logger.debug("Sub-agent tool call: %s (keys: %s)", name, list(args))
+        else:
+            logger.debug("Sub-agent tool call: %s", name)
+
+    def show_tool_result(
+        self, name: str, result: dict, display_str: str | None = None
+    ) -> None:
+        logger.debug("Sub-agent tool result: %s → %s", name, result.get("status"))
+
+    # -- Status and errors -------------------------------------------------
+
+    def show_status(self, message: str) -> None:
+        logger.info("Sub-agent status: %s", message)
+
+    def show_error(self, message: str) -> None:
+        logger.warning("Sub-agent error: %s", message)
+
+    # -- Slash-command output (no-ops for sub-agents) ----------------------
+
+    def show_help(self, commands: list[tuple[str, str]]) -> None:
+        pass
+
+    def show_tool_list(self, tools: list[Tool]) -> None:
+        pass
+
+    def show_session_info(self, session: Session) -> None:
+        pass
+
+    def show_tool_list_all(self, tools_info: list[dict]) -> None:
+        pass
+
+    def show_tool_info(self, tool_info: dict) -> None:
+        pass
+
+    def show_history(self, messages: list[dict]) -> None:
+        pass
+
+    # -- Interactive prompts -----------------------------------------------
+
+    def show_permission_prompt(
+        self,
+        question: str,
+        extra_options: list[str],
+    ) -> tuple[str, str]:
+        logger.warning(
+            "Sub-agent permission prompt denied (non-interactive): %s", question
+        )
+        return ("no", "")
+
+    def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
