@@ -483,3 +483,653 @@ repl → agent_registry   (to construct the coordinator Agent)
   listed in `AgentSpec.tools` once `MCPManager` is implemented
 - Model selection validation — `LLMClient` handles unknown model names at
   connection time, same as today
+
+---
+
+## Implementation Plan
+
+The agent system is split into five PRs.  Each one is independently mergeable
+and testable; later PRs build on earlier ones.  PRs 1–2 are purely additive
+with zero risk to existing behaviour.  PR 3 is the structural pivot.  PR 4
+lights up the feature.  PR 5 adds advanced capabilities.
+
+### Design Decisions (resolved)
+
+1. **Abort / cancellation:** `Agent.run()` accepts an optional
+   `abort: threading.Event | None` parameter.  The REPL creates the event
+   and `_AbortMonitor` as today; sub-agents pass `None` (non-interactive).
+   If coordinator-initiated sub-agent cancellation is needed later, this
+   can be refactored to an agent-owned event with a `cancel()` method —
+   the interface change is minimal.
+
+2. **Compaction:** The REPL calls `_check_compaction()` after
+   `agent.run()` returns — compaction remains the REPL's responsibility.
+   `Agent.run()` never triggers compaction.  Sub-agents return
+   `AgentResult(status="context_limit")` instead, letting the coordinator
+   decide how to proceed.
+
+3. **Coordinator display:** The coordinator's `Agent` receives the real
+   terminal `Display` (RichDisplay or PlainDisplay) directly.  Only
+   sub-agents use `SubAgentDisplay`.  If coordinator-specific display
+   behaviour is ever needed, any `Display` subclass is a drop-in
+   replacement.
+
+---
+
+### PR 1 — Data Structures and Config Parsing
+
+**Goal:** Introduce `AgentSpec`, `AgentResult`, `BackendConfig` dataclasses
+and the config-parsing layer.  No runtime behaviour change.
+
+#### Files to create
+
+**`ai_cli/core/agent.py`**
+
+```python
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BackendConfig:
+    """Connection details for an LLM backend.  When ``None`` on an
+    ``AgentSpec``, the agent inherits the coordinator's backend."""
+
+    base_url: str
+    api_key: str = "not-required"
+
+
+@dataclass
+class AgentSpec:
+    """Declarative description of an agent type, parsed from config."""
+
+    name: str
+    system_message: str
+    tools: list[str]                # tool names from the global registry
+    model: str                      # may differ from the coordinator's model
+    max_response_tokens: int = 4096
+    persistence: Literal["ephemeral", "session"] = "ephemeral"
+    backend: BackendConfig | None = None
+    tool_permission_overrides: dict[str, bool] = field(default_factory=dict)
+    max_tool_rounds: int = 10
+    context_limit_threshold: float = 0.90
+
+
+@dataclass
+class AgentResult:
+    """Returned by ``Agent.run()`` when the send→tool→repeat loop ends."""
+
+    text: str
+    status: Literal["ok", "context_limit", "tool_limit", "error"]
+    partial: bool = False
+    error_message: str = ""
+```
+
+**`ai_cli/core/agent_registry.py`**
+
+Provides:
+
+- `load_agent_specs(config: ConfigManager) -> dict[str, AgentSpec]`
+  Reads the `agents:` section from config, merges each entry with
+  `agent_defaults:`, validates, and returns a name → spec mapping.
+  Returns an empty dict when `agents:` is absent or empty.
+
+- `AgentRegistry` class (instantiated with the spec dict):
+  - `specs` property → `dict[str, AgentSpec]` (read-only copy).
+  - `has_agents` property → `bool` (True when at least one spec loaded).
+  - `get_or_create(name, *, build_fn)` → for PR 4 (lazy instantiation).
+    In this PR, declare the class with `specs` and `has_agents` only;
+    `get_or_create` is added in PR 4.
+
+#### Changes to existing files
+
+**`ai_cli/core/config_manager.py`**
+
+Add two methods:
+
+```python
+def get_agents_config(self) -> dict:
+    """Return the ``agents:`` mapping from config, or empty dict."""
+    return self.get("agents") or {}
+
+def get_agent_defaults(self) -> dict:
+    """Return the ``agent_defaults:`` mapping, or empty dict."""
+    return self.get("agent_defaults") or {}
+```
+
+#### Tests
+
+**`tests/test_agent.py`** — unit tests for the dataclasses:
+
+- `AgentSpec` defaults: verify `persistence == "ephemeral"`,
+  `max_tool_rounds == 10`, `context_limit_threshold == 0.90`,
+  `tool_permission_overrides == {}`, `backend is None`.
+- `AgentResult` defaults: verify `partial == False`,
+  `error_message == ""`.
+- `AgentResult.partial` is `True` when status is not `"ok"`.
+
+**`tests/test_agent_registry.py`** — parsing and validation:
+
+- Empty/absent `agents:` → empty spec dict, `has_agents == False`.
+- Valid single-agent config → correct `AgentSpec` fields.
+- Valid multi-agent config → all specs present.
+- `agent_defaults:` merge: agent-level keys override defaults;
+  defaults fill in missing keys.
+- `backend:` section → `BackendConfig` when present, `None` when absent.
+- `tool_permission_overrides:` parsed correctly.
+- Unknown top-level keys in an agent entry → logged warning, ignored.
+- Missing required fields (`name`, `system_message`, `tools`, `model`) →
+  raise `ValueError` (or skip with warning — choose one; document the
+  choice in a comment).
+
+**`tests/test_config_manager.py`** — add tests for the two new methods:
+
+- `get_agents_config()` returns the mapping when present.
+- `get_agents_config()` returns `{}` when absent.
+- Same pair for `get_agent_defaults()`.
+
+---
+
+### PR 2 — SubAgentDisplay
+
+**Goal:** Implement a `Display` subclass that captures output in a buffer
+instead of writing to a terminal.  No runtime behaviour change.
+
+#### Files to create / modify
+
+**`ai_cli/cli/display.py`** — add `SubAgentDisplay` at the bottom of the
+file, after `RichDisplay`.
+
+`SubAgentDisplay` extends `Display` and implements every abstract method:
+
+| Method | Behaviour |
+|---|---|
+| `begin_assistant_turn` | No-op. |
+| `stream_text(delta)` | Append `delta` to `self._buffer: list[str]`. |
+| `stream_reasoning(delta)` | `logger.debug("reasoning: %s", delta)` |
+| `end_assistant_turn` | No-op. |
+| `update_usage(usage, ctx)` | Store as `self._last_usage` for inspection. |
+| `show_tool_call(name, args)` | `logger.debug(...)` |
+| `show_tool_result(name, result, display_str)` | `logger.debug(...)` |
+| `show_status(message)` | `logger.info(...)` |
+| `show_error(message)` | `logger.warning(...)` |
+| `show_help(commands)` | No-op (sub-agents don't need help). |
+| `show_tool_list(tools)` | No-op. |
+| `show_session_info(session)` | No-op. |
+| `show_tool_list_all(tools_info)` | No-op. |
+| `show_tool_info(tool_info)` | No-op. |
+| `show_history(messages)` | No-op. |
+| `show_permission_prompt(q, extras)` | Log warning, return `("no", "")`. |
+| `show_session_list(sessions)` | Return `None`. |
+
+Public API:
+
+```python
+@property
+def captured_text(self) -> str:
+    """Return all streamed text as a single string."""
+    return "".join(self._buffer)
+
+def reset(self) -> None:
+    """Clear the buffer for reuse (session-persistent agents)."""
+    self._buffer.clear()
+    self._last_usage = {}
+```
+
+Constructor takes no required arguments beyond the inherited
+`verbose` / `markdown_enabled` (both default `False`).
+
+#### Tests
+
+**`tests/test_display.py`** — add a `TestSubAgentDisplay` class (or a new
+file `tests/test_sub_agent_display.py` if `test_display.py` is large):
+
+- `stream_text` accumulates deltas; `captured_text` joins them.
+- `reset()` clears the buffer.
+- `show_permission_prompt` always returns `("no", "")`.
+- `show_permission_prompt` logs a warning (use `caplog`).
+- `show_error` logs a warning.
+- `show_status` logs an info message.
+- `update_usage` stores the dict in `_last_usage`.
+- All no-op methods are callable without error (parametrize the list).
+
+---
+
+### PR 3 — REPL Refactor: Extract `Agent.run()`
+
+**Goal:** Move the `_send_rounds` loop into `Agent.run()` so the REPL
+delegates to an `Agent` instance.  **Zero behavioural change** — all
+existing tests must pass without modification.
+
+This is the riskiest PR.  It should contain *only* the extraction, no new
+features.
+
+#### Detailed steps
+
+##### 1. Add `Agent.run()` to `ai_cli/core/agent.py`
+
+`Agent` is a new class in the same file as `AgentSpec` / `AgentResult`:
+
+```python
+class Agent:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        session: Session,
+        llm_client: LLMClient,
+        tool_registry: ToolRegistry,
+        display: Display,
+    ) -> None:
+        self.spec = spec
+        self._session = session
+        self._llm = llm_client
+        self._tool_registry = tool_registry
+        self._display = display
+        self._pending_transients: dict[str, dict] = {}
+
+    def run(
+        self,
+        prompt: str | list[dict],
+        *,
+        abort: threading.Event | None = None,
+    ) -> AgentResult:
+        """Drive the send → tool-call → repeat loop for one prompt.
+
+        Returns an ``AgentResult`` when the LLM issues end_turn, the
+        tool-round limit is hit, or the abort event is set.
+        """
+```
+
+The body of `run()` is the **verbatim** content of the current
+`REPL._send_rounds()` method (lines ~1338–1567 of `repl.py`), with these
+mechanical substitutions:
+
+| In `_send_rounds` | In `Agent.run()` |
+|---|---|
+| `self._session` | `self._session` (same) |
+| `self._llm` | `self._llm` (same) |
+| `self._tool_registry` | `self._tool_registry` (same) |
+| `self._display` | `self._display` (same) |
+| `self._max_tool_rounds` | `self.spec.max_tool_rounds` |
+| `self._pending_transients` | `self._pending_transients` (same) |
+| `self._check_compaction()` call at end | **Remove.** Return `AgentResult` instead. |
+| `abort.is_set()` checks | Guard with `if abort is not None and abort.is_set()` |
+| bare `return` on error/abort | `return AgentResult(text=..., status="error"|"ok", ...)` |
+| tool-round limit warning | `return AgentResult(text=..., status="tool_limit", partial=True)` |
+
+The method collects `text_parts` across all rounds and returns
+`AgentResult(text="".join(all_text_parts), status="ok")` on normal
+completion.
+
+**Key invariant:** `Agent.run()` must not reference any REPL-specific
+state (`_AbortMonitor`, `PromptSession`, `_handle_slash_command`, etc.).
+It depends only on `Session`, `LLMClient`, `ToolRegistry`, and `Display`.
+
+##### 2. Create a coordinator `AgentSpec` in the REPL
+
+In `REPL.__init__`, construct a coordinator `AgentSpec` and `Agent`:
+
+```python
+coordinator_spec = AgentSpec(
+    name="coordinator",
+    system_message="",          # not used — system message is in the session
+    tools=[],                   # not used — registry already built
+    model="",                   # not used — llm_client already configured
+    max_response_tokens=0,      # not used
+    max_tool_rounds=self._max_tool_rounds,
+)
+self._main_agent = Agent(
+    spec=coordinator_spec,
+    session=self._session,
+    llm_client=self._llm,
+    tool_registry=self._tool_registry,
+    display=self._display,
+)
+```
+
+The coordinator spec's `tools`, `model`, `system_message`, and
+`max_response_tokens` fields are unused because the REPL already owns the
+fully-configured `LLMClient`, `ToolRegistry`, and `Session`.  Only
+`max_tool_rounds` is read by `Agent.run()`.
+
+##### 3. Replace `_send_rounds` call in `_send_to_llm`
+
+Before (in `_send_to_llm`):
+```python
+self._send_rounds(user_input, abort)
+```
+
+After:
+```python
+result = self._main_agent.run(user_input, abort=abort)
+```
+
+Handle the result after the monitor stops:
+
+```python
+if result.status == "tool_limit":
+    self._display.show_error(
+        f"Tool call limit ({self._max_tool_rounds} rounds) reached. Stopping."
+    )
+self._check_compaction()
+```
+
+The tool-limit warning and compaction check move *out* of `Agent.run()`
+and into `_send_to_llm`, after the monitor's `try/finally`.
+
+##### 4. Delete `_send_rounds`
+
+The method is fully replaced by `Agent.run()`.  Remove it from `repl.py`.
+
+##### 5. Update `/rounds` slash command
+
+The `/rounds` command currently sets `self._max_tool_rounds`.  It must now
+*also* update `self._main_agent.spec.max_tool_rounds` so the new value
+takes effect.  One line:
+
+```python
+self._main_agent.spec.max_tool_rounds = new_value
+```
+
+#### Tests
+
+- **All existing REPL tests must pass unchanged.** This is the primary
+  acceptance criterion.  If a test breaks, the extraction was not clean.
+- **`tests/test_agent.py`** — add unit tests for `Agent.run()` with a
+  mock `LLMClient` that returns canned streaming chunks:
+  - Simple text-only response → `AgentResult(status="ok", text=...)`.
+  - Single tool call + text follow-up → tool executed, result injected,
+    second LLM round produces text, returns `"ok"`.
+  - Abort event set before first round → returns immediately.
+  - Abort event set mid-tool-execution → stub results injected for
+    remaining calls, returns with status `"ok"` (abort is a soft stop,
+    not an error).
+  - Tool-round limit hit → `AgentResult(status="tool_limit", partial=True)`.
+  - LLM error → `AgentResult(status="error", error_message=...)`.
+
+---
+
+### PR 4 — `CallAgentTool` and End-to-End Agent Dispatch
+
+**Goal:** Wire up sub-agent creation and dispatch.  After this PR, users
+can configure agents in their config file and the coordinator LLM can
+delegate tasks to them.
+
+#### Prerequisites
+
+PRs 1–3 merged.
+
+#### Files to create
+
+**`ai_cli/tools/call_agent.py`** — `CallAgentTool`
+
+```python
+class CallAgentTool(Tool):
+    name = "call_agent"
+    description = "..."           # built dynamically; see below
+    permission_required = False   # coordinator has already decided to delegate
+
+    def __init__(self, agent_registry: AgentRegistry, ...):
+        self._agent_registry = agent_registry
+
+    @classmethod
+    def build_description(cls, specs: dict[str, AgentSpec]) -> str:
+        """Build the tool description from available agent specs.
+
+        Format:
+            Delegate a focused task to a specialised sub-agent.
+
+            Available agent types:
+              explore    Read files and search the workspace to answer questions.
+                         Tools: read_file, find_files
+              coder      Write or modify files to implement a specific change.
+                         Tools: read_file, write_file, find_files
+        """
+
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self._dynamic_description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_type": {
+                            "type": "string",
+                            "description": "Name of the agent type.",
+                            "enum": sorted(self._agent_registry.specs),
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task or question for the agent.",
+                        },
+                    },
+                    "required": ["agent_type", "prompt"],
+                },
+            },
+        }
+
+    def execute(self, args: dict) -> dict:
+        # 1. Validate agent_type exists in registry
+        # 2. Get or create Agent instance via registry
+        # 3. Call agent.run(prompt)
+        # 4. Return canonical tool response with AgentResult fields
+```
+
+#### Changes to existing files
+
+**`ai_cli/core/agent_registry.py`** — add `get_or_create()`:
+
+```python
+def get_or_create(
+    self,
+    name: str,
+    *,
+    workspace: Workspace,
+    config: ConfigManager,
+    coordinator_llm: LLMClient,
+    coordinator_display: Display,
+    global_tool_registry: ToolRegistry,
+) -> Agent:
+    """Return a cached Agent for session-persistent specs, or build a
+    new one for ephemeral specs."""
+```
+
+Logic:
+1. Look up `spec = self._specs[name]` (raise `KeyError` if missing).
+2. For `persistence == "session"`: check `self._instances[name]`.  If
+   present, call `display.reset()` on its `SubAgentDisplay` and return
+   it.  If absent, build and cache.
+3. For `persistence == "ephemeral"`: always build a new `Agent`.
+4. Building an agent:
+   a. Create an `LLMClient` — if `spec.backend` is set, construct a new
+      client pointing at that backend; otherwise reuse
+      `coordinator_llm` (or construct a new one with the same backend
+      but `spec.model`).
+   b. Create a `SubAgentDisplay`.
+   c. Create a fresh `Session` (in-memory only, no file persistence) with
+      `spec.system_message` as the system message.
+   d. Call `build_agent_tool_registry()` (from the design doc's "Tool
+      Registry Isolation" section) to build a scoped `ToolRegistry`.
+   e. Return `Agent(spec, session, llm_client, registry, display)`.
+
+**`ai_cli/core/agent.py`** — add `build_agent_tool_registry()`:
+
+Implement the function exactly as shown in the "Tool Registry Isolation"
+section of this design document.
+
+**`ai_cli/cli/repl.py`** — wire up on startup:
+
+In `REPL.__init__` (or in `__main__.py` before constructing the REPL):
+
+```python
+agent_registry = AgentRegistry(load_agent_specs(config))
+if agent_registry.has_agents:
+    call_agent_tool = CallAgentTool(agent_registry, ...)
+    tool_registry.register(type(call_agent_tool))  # or register the instance directly
+```
+
+This requires `ToolRegistry` to support registering a pre-built instance.
+If it doesn't today, add a `register_instance(tool: Tool)` method that
+stores the tool without calling `__init__` again.  Alternatively,
+`CallAgentTool.__init__` can accept all its dependencies and
+`ToolRegistry.register` can be made to pass them through — choose the
+simpler approach.
+
+**`ai_cli/core/session_manager.py`** (if needed) — sub-agents need an
+in-memory `Session` that is not persisted to disk.  If the current
+`Session` class always writes to a file, add a flag or a subclass:
+
+```python
+class InMemorySession(Session):
+    """Session that only lives in memory — for ephemeral sub-agents."""
+```
+
+Or add `persist=False` to `Session.__init__`.  Check the existing code
+to determine which approach is less invasive.
+
+#### Tests
+
+**`tests/test_call_agent.py`**:
+
+- `build_description` includes all configured agent names and their tools.
+- `definition()` includes the `enum` of agent type names.
+- Execute with valid agent_type + prompt → mock `Agent.run()`, verify
+  canonical response shape with `status`, `data.result`,
+  `data.agent_status`, `data.partial`, `data.error_message`.
+- Execute with unknown agent_type → tool-level `"error"` response.
+- Session-persistent agent: two calls with same type → same `Agent`
+  instance (mock `get_or_create` and verify call count).
+- Ephemeral agent: two calls → different `Agent` instances.
+
+**`tests/test_agent_registry.py`** — extend with `get_or_create` tests:
+
+- Ephemeral spec → new agent every call.
+- Session spec → cached agent on second call.
+- Unknown name → `KeyError`.
+- `SubAgentDisplay.reset()` called on cached session agents.
+
+**Integration test** (can be in `test_call_agent.py`):
+
+- Build a real `AgentRegistry` from a config dict, create a
+  `CallAgentTool`, mock only the `LLMClient.send()` to return canned
+  chunks.  Call `execute({"agent_type": "explore", "prompt": "..."})`.
+  Verify the sub-agent ran, tools were called, and the result came back
+  through the canonical wrapper.
+
+---
+
+### PR 5 — Parallel Dispatch, Context Overflow, and Polish
+
+**Goal:** Add `CallAgentsParallelTool`, context-overflow detection in
+`Agent.run()`, and any remaining UX polish.
+
+#### Prerequisites
+
+PR 4 merged.
+
+#### `CallAgentsParallelTool`
+
+**`ai_cli/tools/call_agent.py`** — add alongside `CallAgentTool`:
+
+```python
+class CallAgentsParallelTool(Tool):
+    name = "call_agents_parallel"
+    permission_required = False
+
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": "Run multiple sub-agent calls in parallel.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "agent_type": {"type": "string"},
+                                    "prompt": {"type": "string"},
+                                },
+                                "required": ["agent_type", "prompt"],
+                            },
+                        },
+                    },
+                    "required": ["calls"],
+                },
+            },
+        }
+
+    def execute(self, args: dict) -> dict:
+        calls = args["calls"]
+        # Use asyncio.gather or concurrent.futures.ThreadPoolExecutor
+        # to run all calls concurrently.
+        # Return list of per-agent results in input order.
+```
+
+**Gating:** Only registered when `agent_settings.allow_parallel: true` in
+config.  Add `get_agent_settings()` to `ConfigManager`:
+
+```python
+def get_agent_settings(self) -> dict:
+    return self.get("agent_settings") or {}
+```
+
+#### Context overflow detection
+
+In `Agent.run()`, after processing the `"done"` chunk:
+
+```python
+if chunk["type"] == "done":
+    usage = chunk.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    context_window = self._llm.get_model_metadata().get("context_window", 0)
+    if (
+        context_window > 0
+        and prompt_tokens / context_window >= self.spec.context_limit_threshold
+    ):
+        # Return early — let the caller decide what to do.
+        return AgentResult(
+            text="".join(all_text_parts),
+            status="context_limit",
+            partial=True,
+        )
+```
+
+This check only fires for sub-agents in practice.  The coordinator's
+threshold is handled by the REPL's existing `_check_compaction()`.
+
+#### Polish items
+
+- **`/agents` slash command** — list configured agents, their models,
+  tools, and persistence mode.  Display-only, no LLM call.
+- **Completer additions** — `/agents` completion.
+- **Config validation on startup** — warn if `agents:` references tools
+  that don't exist in the global registry.
+- **Logging** — structured log lines for agent dispatch (agent name,
+  prompt length, result status, elapsed time).
+
+#### Tests
+
+**`tests/test_call_agent.py`** — extend:
+
+- `CallAgentsParallelTool`: two concurrent calls → both results returned
+  in order.  Mock `Agent.run()` with a small sleep to verify true
+  concurrency (or verify `gather`/executor was used).
+- Parallel tool not registered when `allow_parallel` is false/absent.
+
+**`tests/test_agent.py`** — extend:
+
+- Context overflow: mock `done` chunk with `prompt_tokens` at 91% of
+  context window → `AgentResult(status="context_limit", partial=True)`.
+- Context overflow: mock at 89% → normal `"ok"` return.
+- Context overflow: `context_window == 0` (unknown) → never triggers.
