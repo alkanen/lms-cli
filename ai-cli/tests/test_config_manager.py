@@ -103,6 +103,57 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
+# get_agents_config / get_agent_defaults
+# ---------------------------------------------------------------------------
+
+
+class TestGetAgentsConfig:
+    def test_returns_mapping_when_present(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text(
+            "agents:\n  explore:\n    model: m1\n"
+        )
+        cm = ConfigManager(project, {})
+        assert cm.get_agents_config() == {"explore": {"model": "m1"}}
+
+    def test_returns_empty_when_absent(self, project):
+        cm = ConfigManager(project, {})
+        assert cm.get_agents_config() == {}
+
+    def test_returns_empty_when_null(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text("agents:\n")
+        cm = ConfigManager(project, {})
+        assert cm.get_agents_config() == {}
+
+    def test_returns_empty_when_not_dict(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text("agents: [a, b]\n")
+        cm = ConfigManager(project, {})
+        assert cm.get_agents_config() == {}
+
+
+class TestGetAgentDefaults:
+    def test_returns_mapping_when_present(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text(
+            "agent_defaults:\n  persistence: session\n"
+        )
+        cm = ConfigManager(project, {})
+        assert cm.get_agent_defaults() == {"persistence": "session"}
+
+    def test_returns_empty_when_absent(self, project):
+        cm = ConfigManager(project, {})
+        assert cm.get_agent_defaults() == {}
+
+    def test_returns_empty_when_null(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text("agent_defaults:\n")
+        cm = ConfigManager(project, {})
+        assert cm.get_agent_defaults() == {}
+
+    def test_returns_empty_when_not_dict(self, project):
+        (project / _DOT_AI_CLI / "config.yaml").write_text("agent_defaults: bad\n")
+        cm = ConfigManager(project, {})
+        assert cm.get_agent_defaults() == {}
+
+
+# ---------------------------------------------------------------------------
 # get_backend
 # ---------------------------------------------------------------------------
 
