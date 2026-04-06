@@ -215,6 +215,16 @@ class ConfigManager:
 
         return result
 
+    def get_agents_config(self) -> dict:
+        """Return the ``agents:`` mapping from config, or empty dict."""
+        raw = self._config.get("agents")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def get_agent_defaults(self) -> dict:
+        """Return the ``agent_defaults:`` mapping from config, or empty dict."""
+        raw = self._config.get("agent_defaults")
+        return dict(raw) if isinstance(raw, dict) else {}
+
     def get_backend(self) -> str:
         """Return the configured backend name ('openai' or 'lmstudio').
 

@@ -49,7 +49,7 @@ config file.  It specifies everything needed to construct and run an `Agent`.
 @dataclass
 class BackendConfig:
     base_url: str
-    api_key: str = "not-required"
+    api_key_env: str | None = None  # env var name; resolved at instantiation time
 
 @dataclass
 class AgentSpec:
@@ -94,7 +94,7 @@ class Agent:
 class AgentResult:
     text: str                         # final assistant text (may be empty)
     status: Literal["ok", "context_limit", "tool_limit", "error"]
-    partial: bool = False             # True when status != "ok"
+    partial: bool = False             # set explicitly by caller; typically True when status != "ok"
     error_message: str = ""
 ```
 
@@ -209,7 +209,7 @@ agents:
 
     backend:
       base_url: http://localhost:11435/v1   # separate Ollama instance
-      api_key: not-required
+      # api_key_env: OLLAMA_KEY            # optional; resolved from env at runtime
 ```
 
 If the `agents:` key is absent or is an empty mapping, no sub-agent
@@ -516,7 +516,7 @@ lights up the feature.  PR 5 adds advanced capabilities.
 
 ---
 
-### PR 1 — Data Structures and Config Parsing
+### PR 1 — Data Structures and Config Parsing ✅
 
 **Goal:** Introduce `AgentSpec`, `AgentResult`, `BackendConfig` dataclasses
 and the config-parsing layer.  No runtime behaviour change.
@@ -526,32 +526,17 @@ and the config-parsing layer.  No runtime behaviour change.
 **`ai_cli/core/agent.py`**
 
 ```python
-from __future__ import annotations
-
-import logging
-from dataclasses import dataclass, field
-from typing import Literal
-
-logger = logging.getLogger(__name__)
-
-
 @dataclass
 class BackendConfig:
-    """Connection details for an LLM backend.  When ``None`` on an
-    ``AgentSpec``, the agent inherits the coordinator's backend."""
-
     base_url: str
-    api_key: str = "not-required"
-
+    api_key_env: str | None = None  # env var name; resolved at instantiation time
 
 @dataclass
 class AgentSpec:
-    """Declarative description of an agent type, parsed from config."""
-
     name: str
     system_message: str
-    tools: list[str]                # tool names from the global registry
-    model: str                      # may differ from the coordinator's model
+    tools: list[str]
+    model: str
     max_response_tokens: int = 4096
     persistence: Literal["ephemeral", "session"] = "ephemeral"
     backend: BackendConfig | None = None
@@ -559,14 +544,11 @@ class AgentSpec:
     max_tool_rounds: int = 10
     context_limit_threshold: float = 0.90
 
-
 @dataclass
 class AgentResult:
-    """Returned by ``Agent.run()`` when the send→tool→repeat loop ends."""
-
     text: str
     status: Literal["ok", "context_limit", "tool_limit", "error"]
-    partial: bool = False
+    partial: bool = False       # set explicitly by caller
     error_message: str = ""
 ```
 
@@ -611,7 +593,8 @@ def get_agent_defaults(self) -> dict:
   `tool_permission_overrides == {}`, `backend is None`.
 - `AgentResult` defaults: verify `partial == False`,
   `error_message == ""`.
-- `AgentResult.partial` is `True` when status is not `"ok"`.
+- `AgentResult` preserves explicitly provided `partial` and `status`
+  values (no auto-derivation — both are set by the caller).
 
 **`tests/test_agent_registry.py`** — parsing and validation:
 
@@ -681,8 +664,10 @@ def reset(self) -> None:
     self._last_usage = {}
 ```
 
-Constructor takes no required arguments beyond the inherited
-`verbose` / `markdown_enabled` (both default `False`).
+Constructor: inherits `Display.__init__` defaults (`verbose=False`,
+`markdown_enabled=True`).  These flags have no visible effect since
+`SubAgentDisplay` never renders to a terminal, but the defaults match the
+ABC contract.
 
 #### Tests
 
@@ -868,54 +853,51 @@ PRs 1–3 merged.
 
 **`ai_cli/tools/call_agent.py`** — `CallAgentTool`
 
+Must follow the existing `Tool` base class conventions:
+
+- Class attributes: `NAME`, `DESCRIPTION`, `PERMISSION_REQUIRED` (uppercase).
+- `definition()` returns a `ToolSchema` (not a raw dict).
+- `execute(self, **kwargs)` (not `execute(self, args: dict)`).
+
 ```python
 class CallAgentTool(Tool):
-    name = "call_agent"
-    description = "..."           # built dynamically; see below
-    permission_required = False   # coordinator has already decided to delegate
+    NAME = "call_agent"
+    DESCRIPTION = "Delegate a focused task to a specialised sub-agent."
+    PERMISSION_REQUIRED = False
 
-    def __init__(self, agent_registry: AgentRegistry, ...):
+    def __init__(self, workspace, permission_manager, agent_registry: AgentRegistry):
+        super().__init__(workspace, permission_manager,
+                         self.PERMISSION_REQUIRED, self.NAME, self.DESCRIPTION)
         self._agent_registry = agent_registry
+        self._dynamic_description = self._build_description()
 
-    @classmethod
-    def build_description(cls, specs: dict[str, AgentSpec]) -> str:
-        """Build the tool description from available agent specs.
+    def _build_description(self) -> str:
+        """Build tool description from available agent specs.
 
         Format:
             Delegate a focused task to a specialised sub-agent.
 
             Available agent types:
-              explore    Read files and search the workspace to answer questions.
+              explore    Read files and search the workspace.
                          Tools: read_file, find_files
-              coder      Write or modify files to implement a specific change.
-                         Tools: read_file, write_file, find_files
         """
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self._dynamic_description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent_type": {
-                            "type": "string",
-                            "description": "Name of the agent type.",
-                            "enum": sorted(self._agent_registry.specs),
-                        },
-                        "prompt": {
-                            "type": "string",
-                            "description": "The task or question for the agent.",
-                        },
-                    },
-                    "required": ["agent_type", "prompt"],
-                },
-            },
-        }
+    def definition(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.NAME,
+            description=self._dynamic_description,
+            arguments=[
+                ToolArgument("agent_type", "Name of the agent type.",
+                             "string", required=True,
+                             enum=sorted(self._agent_registry.specs)),
+                ToolArgument("prompt", "The task or question for the agent.",
+                             "string", required=True),
+            ],
+        )
 
-    def execute(self, args: dict) -> dict:
+    def execute(self, **kwargs) -> dict:
+        agent_type = kwargs["agent_type"]
+        prompt = kwargs["prompt"]
         # 1. Validate agent_type exists in registry
         # 2. Get or create Agent instance via registry
         # 3. Call agent.run(prompt)
@@ -968,19 +950,18 @@ section of this design document.
 
 In `REPL.__init__` (or in `__main__.py` before constructing the REPL):
 
+`CallAgentTool` has a non-standard constructor (it needs `agent_registry`).
+The existing `ToolRegistry.register()` instantiates tool classes with
+`(workspace, permission_manager)`, which won't work here.  Add a
+`register_instance(tool: Tool)` method to `ToolRegistry` that stores a
+pre-built tool instance directly:
+
 ```python
 agent_registry = AgentRegistry(load_agent_specs(config))
 if agent_registry.has_agents:
-    call_agent_tool = CallAgentTool(agent_registry, ...)
-    tool_registry.register(type(call_agent_tool))  # or register the instance directly
+    call_agent_tool = CallAgentTool(workspace, permission_manager, agent_registry)
+    tool_registry.register_instance(call_agent_tool)
 ```
-
-This requires `ToolRegistry` to support registering a pre-built instance.
-If it doesn't today, add a `register_instance(tool: Tool)` method that
-stores the tool without calling `__init__` again.  Alternatively,
-`CallAgentTool.__init__` can accept all its dependencies and
-`ToolRegistry.register` can be made to pass them through — choose the
-simpler approach.
 
 **`ai_cli/core/session_manager.py`** (if needed) — sub-agents need an
 in-memory `Session` that is not persisted to disk.  If the current
@@ -999,7 +980,7 @@ to determine which approach is less invasive.
 **`tests/test_call_agent.py`**:
 
 - `build_description` includes all configured agent names and their tools.
-- `definition()` includes the `enum` of agent type names.
+- `definition()` returns a `ToolSchema` with the correct `enum` of names.
 - Execute with valid agent_type + prompt → mock `Agent.run()`, verify
   canonical response shape with `status`, `data.result`,
   `data.agent_status`, `data.partial`, `data.error_message`.
@@ -1038,42 +1019,23 @@ PR 4 merged.
 
 **`ai_cli/tools/call_agent.py`** — add alongside `CallAgentTool`:
 
+Following the same `Tool` conventions (`NAME`, `DESCRIPTION`,
+`PERMISSION_REQUIRED`, `ToolSchema`, `execute(**kwargs)`):
+
 ```python
 class CallAgentsParallelTool(Tool):
-    name = "call_agents_parallel"
-    permission_required = False
+    NAME = "call_agents_parallel"
+    DESCRIPTION = "Run multiple sub-agent calls in parallel."
+    PERMISSION_REQUIRED = False
 
-    def definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": "Run multiple sub-agent calls in parallel.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "calls": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "agent_type": {"type": "string"},
-                                    "prompt": {"type": "string"},
-                                },
-                                "required": ["agent_type", "prompt"],
-                            },
-                        },
-                    },
-                    "required": ["calls"],
-                },
-            },
-        }
+    def definition(self) -> ToolSchema:
+        # "calls" argument: array of {agent_type, prompt} objects
+        ...
 
-    def execute(self, args: dict) -> dict:
-        calls = args["calls"]
+    def execute(self, **kwargs) -> dict:
+        calls = kwargs["calls"]
         # Use asyncio.gather or concurrent.futures.ThreadPoolExecutor
-        # to run all calls concurrently.
-        # Return list of per-agent results in input order.
+        # Return list of per-agent results in input order
 ```
 
 **Gating:** Only registered when `agent_settings.allow_parallel: true` in
