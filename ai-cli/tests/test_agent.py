@@ -1,6 +1,12 @@
-"""Tests for ai_cli.core.agent data structures."""
+"""Tests for ai_cli.core.agent data structures and Agent.run()."""
 
-from ai_cli.core.agent import AgentResult, AgentSpec, BackendConfig
+import dataclasses
+import threading
+from unittest.mock import MagicMock
+
+from ai_cli.core.agent import Agent, AgentResult, AgentSpec, BackendConfig
+from ai_cli.core.llm_client import LLMError
+from ai_cli.core.session_manager import SessionError
 
 
 class TestBackendConfig:
@@ -93,3 +99,422 @@ class TestAgentResult:
         r = AgentResult(text="halfway", status="tool_limit", partial=True)
         assert r.status == "tool_limit"
         assert r.partial is True
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Agent.run() tests
+# ---------------------------------------------------------------------------
+
+_COORD_SPEC = AgentSpec(
+    name="test",
+    system_message="",
+    tools=[],
+    model="",
+    max_tool_rounds=10,
+)
+
+
+def _make_agent(
+    spec=None, session=None, llm=None, tool_registry=None, display=None
+) -> Agent:
+    if session is None:
+        session = MagicMock()
+        session.get_messages.return_value = []
+        session.should_compact.return_value = False
+    if display is None:
+        display = MagicMock()
+    if tool_registry is None:
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+    if llm is None:
+        llm = MagicMock()
+        llm.send.return_value = iter([])
+        llm.get_model_metadata.return_value = {}
+    return Agent(
+        spec=spec or dataclasses.replace(_COORD_SPEC),
+        session=session,
+        llm_client=llm,
+        tool_registry=tool_registry,
+        display=display,
+    )
+
+
+def _text_chunks(*parts):
+    """Return chunk list for a simple text-only response."""
+    chunks = [{"type": "text", "delta": p} for p in parts]
+    chunks.append({"type": "done", "stop_reason": "stop", "usage": {}})
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Agent.run() tests
+# ---------------------------------------------------------------------------
+
+
+class TestAgentRun:
+    def test_text_only_response(self):
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("Hello", " world"))
+        llm.get_model_metadata.return_value = {}
+        agent = _make_agent(llm=llm)
+
+        result = agent.run("Hi")
+
+        assert result.status == "ok"
+        assert result.text == "Hello world"
+        assert result.partial is False
+
+    def test_text_streamed_to_display(self):
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("A", "B"))
+        llm.get_model_metadata.return_value = {}
+        display = MagicMock()
+        agent = _make_agent(llm=llm, display=display)
+
+        agent.run("go")
+
+        calls = [c[0][0] for c in display.stream_text.call_args_list]
+        assert calls == ["A", "B"]
+
+    def test_tool_call_and_followup(self):
+        """Tool call in round 1, text response in round 2."""
+        session = MagicMock()
+        session.get_messages.return_value = []
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {
+            "status": "success",
+            "data": {"content": "file data"},
+        }
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        # Round 1: tool call
+        # Round 2: text response
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c1",
+                        "arguments": {"path": "foo.py"},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter(_text_chunks("Here is the file.")),
+        ]
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        result = agent.run("Read foo.py")
+
+        assert result.status == "ok"
+        assert result.text == "Here is the file."
+        assert llm.send.call_count == 2
+        tool_registry.execute.assert_called_once_with(
+            "read_file", {"path": "foo.py"}, allow_transient=False
+        )
+
+    def test_abort_before_first_round(self):
+        abort = threading.Event()
+        abort.set()
+        agent = _make_agent()
+
+        result = agent.run("go", abort=abort)
+
+        assert result.partial is True
+        assert result.text == ""
+
+    def test_abort_mid_streaming(self):
+        abort = threading.Event()
+
+        def _chunks():
+            yield {"type": "text", "delta": "Hello"}
+            abort.set()
+            yield {"type": "text", "delta": " world"}
+            yield {"type": "done", "stop_reason": "stop", "usage": {}}
+
+        llm = MagicMock()
+        llm.send.return_value = _chunks()
+        llm.get_model_metadata.return_value = {}
+        display = MagicMock()
+        agent = _make_agent(llm=llm, display=display)
+
+        result = agent.run("Hi", abort=abort)
+
+        assert result.partial is True
+        status_calls = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("Aborted" in s for s in status_calls)
+
+    def test_abort_mid_tool_execution(self):
+        """Abort set after first tool call — remaining calls get stub results."""
+        abort = threading.Event()
+        session = MagicMock()
+        session.get_messages.return_value = []
+        raw_messages: list[dict] = []
+        session.add_raw_message.side_effect = lambda m: raw_messages.append(m)
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.get.return_value = None
+
+        def _execute(name, args, **kwargs):
+            abort.set()  # abort after first tool
+            return {"status": "success", "data": {}}
+
+        tool_registry.execute.side_effect = _execute
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.return_value = iter(
+            [
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "call_id": "call-A",
+                    "arguments": {},
+                },
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "call_id": "call-B",
+                    "arguments": {},
+                },
+                {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+            ]
+        )
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        result = agent.run("write two files", abort=abort)
+
+        assert result.partial is True
+
+        # call-B should get an abort stub
+        tool_msgs = [m for m in raw_messages if m.get("role") == "tool"]
+        stub_ids = {m["tool_call_id"] for m in tool_msgs}
+        assert "call-B" in stub_ids
+
+    def test_tool_round_limit(self):
+        spec = AgentSpec(
+            name="limited",
+            system_message="",
+            tools=[],
+            model="",
+            max_tool_rounds=2,
+        )
+        session = MagicMock()
+        session.get_messages.return_value = []
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        # Both rounds return a tool call — exceeds limit of 2.
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": f"c{i}",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            )
+            for i in range(3)  # 3 available but only 2 rounds allowed
+        ]
+
+        agent = _make_agent(
+            spec=spec, session=session, llm=llm, tool_registry=tool_registry
+        )
+        result = agent.run("loop forever")
+
+        assert result.status == "tool_limit"
+        assert result.partial is True
+        assert llm.send.call_count == 2
+
+    def test_llm_error_returns_error_result(self):
+        llm = MagicMock()
+        llm.send.side_effect = LLMError("Connection refused")
+        display = MagicMock()
+        agent = _make_agent(llm=llm, display=display)
+
+        result = agent.run("go")
+
+        assert result.status == "error"
+        assert "Connection refused" in result.error_message
+        display.show_error.assert_called_once()
+
+    def test_session_error_on_get_messages(self):
+        session = MagicMock()
+        session.get_messages.side_effect = SessionError("corrupt")
+        display = MagicMock()
+        agent = _make_agent(session=session, display=display)
+
+        result = agent.run("go")
+
+        assert result.status == "error"
+        assert "corrupt" in result.error_message
+
+    def test_none_abort_is_safe(self):
+        """abort=None (the default) must not crash."""
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("ok"))
+        llm.get_model_metadata.return_value = {}
+        agent = _make_agent(llm=llm)
+
+        result = agent.run("go")
+
+        assert result.status == "ok"
+        assert result.text == "ok"
+
+    def test_begin_end_turn_bracketing(self):
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("x"))
+        llm.get_model_metadata.return_value = {}
+        display = MagicMock()
+        agent = _make_agent(llm=llm, display=display)
+
+        agent.run("go")
+
+        display.begin_assistant_turn.assert_called_once()
+        display.end_assistant_turn.assert_called_once()
+
+    def test_usage_recorded(self):
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "hi"},
+                {
+                    "type": "done",
+                    "stop_reason": "stop",
+                    "usage": {"prompt_tokens": 42, "completion_tokens": 10},
+                },
+            ]
+        )
+        llm.get_model_metadata.return_value = {"context_window": 4096}
+        session = MagicMock()
+        session.get_messages.return_value = []
+        display = MagicMock()
+        agent = _make_agent(llm=llm, session=session, display=display)
+
+        agent.run("go")
+
+        session.record_usage.assert_called_once_with(42)
+        display.update_usage.assert_called_once()
+
+    def test_disallowed_tool_replaced_with_unknown(self):
+        """tool_disallowed result is replaced with unknown_tool for the LLM."""
+        session = MagicMock()
+        session.get_messages.return_value = []
+        raw_messages: list[dict] = []
+        session.add_raw_message.side_effect = lambda m: raw_messages.append(m)
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {
+            "status": "error",
+            "error": "tool_disallowed",
+        }
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "bad_tool",
+                        "call_id": "c1",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            iter(_text_chunks("ok")),
+        ]
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        result = agent.run("try bad tool")
+
+        # The tool result sent to the session should be the sanitised version.
+        import json
+
+        tool_result_msgs = [m for m in raw_messages if m.get("role") == "tool"]
+        assert len(tool_result_msgs) == 1
+        content = json.loads(tool_result_msgs[0]["content"])
+        assert content["error"] == "unknown_tool"
+        assert result.status == "ok"
+
+    def test_prompt_added_to_session_as_string(self):
+        session = MagicMock()
+        session.get_messages.return_value = []
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("hi"))
+        llm.get_model_metadata.return_value = {}
+        agent = _make_agent(session=session, llm=llm)
+
+        agent.run("Hello there")
+
+        session.add_message.assert_any_call("user", "Hello there")
+
+    def test_prompt_added_to_session_as_content_blocks(self):
+        session = MagicMock()
+        session.get_messages.return_value = []
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("hi"))
+        llm.get_model_metadata.return_value = {}
+        agent = _make_agent(session=session, llm=llm)
+
+        blocks = [{"type": "text", "text": "Hello"}]
+        agent.run(blocks)
+
+        session.add_raw_message.assert_any_call({"role": "user", "content": blocks})
+
+    def test_prompt_session_error_returns_error(self):
+        session = MagicMock()
+        session.add_message.side_effect = SessionError("disk full")
+        display = MagicMock()
+        agent = _make_agent(session=session, display=display)
+
+        result = agent.run("go")
+
+        assert result.status == "error"
+        assert "disk full" in result.error_message
+
+    def test_abort_mid_stream_includes_current_round_text(self):
+        """Text streamed before abort in the current round is in the result."""
+        abort = threading.Event()
+
+        def _chunks():
+            yield {"type": "text", "delta": "partial"}
+            abort.set()
+            yield {"type": "done", "stop_reason": "stop", "usage": {}}
+
+        llm = MagicMock()
+        llm.send.return_value = _chunks()
+        llm.get_model_metadata.return_value = {}
+        agent = _make_agent(llm=llm)
+
+        result = agent.run("go", abort=abort)
+
+        assert "partial" in result.text
+
+    def test_keyboard_interrupt_reraises_without_abort(self):
+        """KeyboardInterrupt re-raises when abort is None."""
+        llm = MagicMock()
+        llm.send.side_effect = KeyboardInterrupt()
+        agent = _make_agent(llm=llm)
+
+        import pytest as _pt
+
+        with _pt.raises(KeyboardInterrupt):
+            agent.run("go")

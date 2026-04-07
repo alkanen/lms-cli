@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import io
-import json
 import logging
 import os
 import re
@@ -38,7 +37,7 @@ from ai_cli.cli.completer import (
     REPLCompleter,
     _tokenize_command,
 )
-from ai_cli.core.llm_client import LLMError
+from ai_cli.core.agent import Agent, AgentSpec
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
 
@@ -347,11 +346,22 @@ class REPL:
                     raw,
                     _DEFAULT_MAX_TOOL_ROUNDS,
                 )
-        # Schemas injected by tool_manager.enable for the next API call only.
-        # Maps tool name → schema so we can both inject the schema into the
-        # tools list AND pass allow_transient=True when executing that tool.
-        # Populated during tool execution, consumed and cleared at the next send.
-        self._pending_transients: dict[str, dict] = {}
+        # Coordinator agent wrapping the send/tool-call loop.
+        coordinator_spec = AgentSpec(
+            name="coordinator",
+            system_message="",  # not used — system message is in the session
+            tools=[],  # not used — registry already built
+            model="",  # not used — llm_client already configured
+            max_response_tokens=0,  # not used
+            max_tool_rounds=self._max_tool_rounds,
+        )
+        self._main_agent = Agent(
+            spec=coordinator_spec,
+            session=self._session,
+            llm_client=self._llm,
+            tool_registry=self._tool_registry,
+            display=self._display,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -645,6 +655,7 @@ class REPL:
             return
 
         self._max_tool_rounds = value
+        self._main_agent.spec.max_tool_rounds = value
         if not session_flag:
             if self._persist_setting("max_tool_rounds", value):
                 self._display.show_status(
@@ -1295,15 +1306,6 @@ class REPL:
     # ------------------------------------------------------------------
 
     def _send_to_llm(self, user_input: str | list[dict]) -> None:
-        try:
-            if isinstance(user_input, list):
-                self._session.add_raw_message({"role": "user", "content": user_input})
-            else:
-                self._session.add_message("user", user_input)
-        except SessionError as exc:
-            self._display.show_error(f"Could not save message: {exc}")
-            return
-
         # Single abort event for the entire multi-round exchange.  The
         # _AbortMonitor background thread sets it on ESC or Ctrl+C; the main
         # thread sets it on KeyboardInterrupt.
@@ -1329,243 +1331,18 @@ class REPL:
             pm.prompt_fn = _paused_prompt_fn
             monitor.start()
             try:
-                self._send_rounds(user_input, abort)
+                result = self._main_agent.run(user_input, abort=abort)
             finally:
                 monitor.stop()
         finally:
             pm.prompt_fn = _orig_prompt_fn
 
-    def _send_rounds(
-        self, user_input: str | list[dict], abort: threading.Event
-    ) -> None:
-        """Inner loop that drives multi-round tool calls.  Separated so that
-        the abort monitor's ``try/finally`` in ``_send_to_llm`` stays clean."""
-        for _ in range(self._max_tool_rounds):
-            if abort.is_set():
-                self._display.show_status("Aborted.")
-                return
-
-            tool_calls: list[dict] = []
-            text_parts: list[str] = []
-
-            try:
-                messages = self._session.get_messages()
-            except SessionError as exc:
-                self._display.show_error(f"Could not read conversation history: {exc}")
-                return
-
-            # Consume transients injected by tool_manager.enable in the previous
-            # round, then clear so they don't persist beyond this round.
-            active_transients = dict(self._pending_transients)
-            self._pending_transients.clear()
-
-            self._display.begin_assistant_turn()
-            stream = None
-            try:
-                # Build the tools list, de-duplicating by name so that a
-                # transient schema for an already-enabled tool doesn't appear
-                # twice (some LLM APIs reject duplicate tool names).
-                # Transient schemas take precedence over the enabled definitions.
-                # Use .get() defensively — malformed definitions are skipped.
-                tools_by_name: dict[str, dict] = {}
-                for defn in self._tool_registry.definitions():
-                    func = defn.get("function")
-                    fname = func.get("name") if isinstance(func, dict) else None
-                    if fname:
-                        tools_by_name[fname] = defn
-                    else:
-                        logger.warning(
-                            "Skipping tool schema with missing name: %r", defn
-                        )
-                tools_by_name.update(active_transients)
-                stream = self._llm.send(
-                    messages,
-                    tools=list(tools_by_name.values()),
-                )
-                for chunk in stream:
-                    # NOTE: abort is only checked *between* chunks.  If the
-                    # iterator is blocked waiting for the server (e.g. no
-                    # tokens have arrived yet), ESC/Ctrl+C won't interrupt
-                    # the blocking read until the next chunk arrives.  A
-                    # complete fix requires running the stream in a worker
-                    # thread or plumbing a cancel token into LLMClient.send().
-                    if abort.is_set():
-                        break
-                    if chunk["type"] == "text":
-                        self._display.stream_text(chunk["delta"])
-                        text_parts.append(chunk["delta"])
-                    elif chunk["type"] == "reasoning":
-                        self._display.stream_reasoning(chunk["delta"])
-                    elif chunk["type"] == "tool_call":
-                        tool_calls.append(chunk)
-                    elif chunk["type"] == "done":
-                        usage = chunk.get("usage", {})
-                        prompt_tokens = usage.get("prompt_tokens")
-                        if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
-                            self._session.record_usage(prompt_tokens)
-                        context_window = self._llm.get_model_metadata().get(
-                            "context_window", 0
-                        )
-                        self._display.update_usage(usage, context_window)
-            except KeyboardInterrupt:
-                abort.set()
-            except LLMError as exc:
-                self._display.show_error(f"LLM error: {exc}")
-                return
-            finally:
-                # Explicitly close the stream so the underlying HTTP connection
-                # is released immediately rather than waiting for GC.
-                if stream is not None:
-                    with contextlib.suppress(Exception):
-                        stream.close()
-                self._display.end_assistant_turn()
-
-            if abort.is_set():
-                self._display.show_status("Aborted.")
-                return
-
-            full_text = "".join(text_parts)
-
-            if tool_calls:
-                # Persist the assistant turn as a proper tool-call message so the
-                # LLM can associate each tool result with its originating request.
-                assistant_msg: dict = {
-                    "role": "assistant",
-                    "content": full_text or None,
-                    "tool_calls": [
-                        {
-                            "id": call["call_id"],
-                            "type": "function",
-                            "function": {
-                                "name": call["name"],
-                                "arguments": json.dumps(call["arguments"]),
-                            },
-                        }
-                        for call in tool_calls
-                    ],
-                }
-                try:
-                    self._session.add_raw_message(assistant_msg)
-                except SessionError as exc:
-                    self._display.show_error(f"Could not save assistant message: {exc}")
-                    return
-            elif full_text:
-                try:
-                    self._session.add_message("assistant", full_text)
-                except SessionError as exc:
-                    self._display.show_error(f"Could not save assistant message: {exc}")
-                    return
-
-            if not tool_calls:
-                break
-
-            for i, call in enumerate(tool_calls):
-                if abort.is_set():
-                    # The assistant message (with tool_calls) was already saved.
-                    # Inject stub results for every unexecuted call so the
-                    # session history stays valid — the API requires a role:tool
-                    # result for every call_id in the preceding assistant turn.
-                    for pending in tool_calls[i:]:
-                        try:
-                            self._session.add_raw_message(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": pending["call_id"],
-                                    "content": json.dumps(
-                                        {
-                                            "status": "error",
-                                            "error": "aborted",
-                                            "message": "Aborted by user.",
-                                            "code": 499,
-                                        }
-                                    ),
-                                }
-                            )
-                        except SessionError as exc:
-                            logger.error(
-                                "Failed to inject abort stub for call_id=%r: %s",
-                                pending["call_id"],
-                                exc,
-                            )
-                    self._display.show_status("Aborted.")
-                    return
-                self._display.show_tool_call(call["name"], call["arguments"])
-                # Transiently-enabled tools must bypass the registry's enabled
-                # check — they were injected into the LLM's tools list for this
-                # round specifically, so allow_transient=True lets them execute.
-                allow_transient = call["name"] in active_transients
-                result = self._tool_registry.execute(
-                    call["name"], call["arguments"], allow_transient=allow_transient
-                )
-                # Disallowed tools: show a user-facing hint but replace the
-                # result with a generic unknown-tool error before it reaches
-                # the LLM — the agent must not learn that the tool exists.
-                if result.get("error") == "tool_disallowed":
-                    self._display.show_error(
-                        f"Tool '{call['name']}' is not available in the current "
-                        f"configuration. Use '/tools allow {call['name']}' to add it to the list of available tools."
-                    )
-                    result = {
-                        "status": "error",
-                        "error": "unknown_tool",
-                        "message": f"No tool named '{call['name']}'.",
-                        "code": 404,
-                    }
-                # Only tool_manager may inject transient schemas; any other tool
-                # returning this key is ignored.  Each schema is also validated
-                # against the registry so only known tools can be transiently
-                # enabled — arbitrary schemas cannot bypass the enable gate.
-                # Pop the key regardless so it never enters conversation history.
-                # Guard against malformed result shapes from user-defined tools.
-                data = result.get("data")
-                if not isinstance(data, dict):
-                    data = None
-                if call["name"] == "tool_manager" and result.get("status") == "success":
-                    schemas = (
-                        data.pop("transient_schemas", None)
-                        if data is not None
-                        else None
-                    )
-                    if isinstance(schemas, list):
-                        for schema in schemas:
-                            if not isinstance(schema, dict):
-                                continue
-                            func = schema.get("function")
-                            if not isinstance(func, dict):
-                                continue
-                            name = func.get("name")
-                            if name and self._tool_registry.get(name) is not None:
-                                self._pending_transients[name] = schema
-                elif data is not None:
-                    data.pop("transient_schemas", None)
-                display_str: str | None = None
-                tool_obj = self._tool_registry.get(call["name"])
-                if tool_obj is not None:
-                    with contextlib.suppress(Exception):
-                        display_str = tool_obj.format_display(
-                            args=call["arguments"], result=result
-                        )
-                self._display.show_tool_result(call["name"], result, display_str)
-                try:
-                    self._session.add_raw_message(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["call_id"],
-                            "content": json.dumps(result, default=str),
-                        }
-                    )
-                except SessionError as exc:
-                    self._display.show_error(f"Could not save tool result: {exc}")
-                    return
-        else:
-            logger.warning(
-                "Tool call limit (%d rounds) reached for session; stopping.",
-                self._max_tool_rounds,
-            )
+        if result.status == "error":
+            return
+        if result.status == "tool_limit":
             self._display.show_error(
                 f"Tool call limit ({self._max_tool_rounds} rounds) reached. Stopping."
             )
-
         self._check_compaction()
 
     # ------------------------------------------------------------------
