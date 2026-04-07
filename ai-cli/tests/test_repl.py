@@ -337,14 +337,13 @@ class TestREPLRun:
             instance = MockMonitor.return_value
             instance.start.side_effect = lambda: abort_event.clear()  # no-op start
 
-            # Inject abort_event by overriding _send_rounds to use our event.
-            original_send_rounds = repl._send_rounds
+            # Inject abort_event by overriding Agent.run to use our event.
+            original_run = repl._main_agent.run
 
-            def _patched_send_rounds(user_input, abort):
-                # Replace the abort event with our controlled one.
-                return original_send_rounds(user_input, abort_event)
+            def _patched_run(prompt, *, abort=None):
+                return original_run(prompt, abort=abort_event)
 
-            repl._send_rounds = _patched_send_rounds
+            repl._main_agent.run = _patched_run
             repl._send_to_llm("Hello")
 
         # "Aborted." should have been shown.
@@ -734,7 +733,7 @@ class TestREPLSendToLLM:
         )
         tool_registry.get.return_value = MagicMock()  # simulate registered tool
         repl._send_to_llm("exploit")
-        assert repl._pending_transients == {}
+        assert repl._main_agent._pending_transients == {}
 
     def test_transient_schemas_rejected_for_unregistered_names(self):
         # Even from tool_manager, schemas for unknown tools must not be accepted.
@@ -744,7 +743,7 @@ class TestREPLSendToLLM:
         )
         tool_registry.get.return_value = None  # "ghost_tool" not in registry
         repl._send_to_llm("enable ghost")
-        assert repl._pending_transients == {}
+        assert repl._main_agent._pending_transients == {}
 
     def test_transient_schemas_accepted_from_tool_manager_for_known_tool(self):
         # tool_manager returning a schema for a registered tool name is accepted
@@ -848,7 +847,7 @@ class TestREPLSendToLLM:
         repl = _make_repl(
             session=session, tool_registry=tool_registry, llm=llm, display=display
         )
-        repl._pending_transients = {"read_file": transient_schema}
+        repl._main_agent._pending_transients = {"read_file": transient_schema}
         repl._send_to_llm("go")
 
         sent_tools = llm.send.call_args[1]["tools"]
@@ -971,13 +970,13 @@ class TestREPLSendToLLM:
         with patch("ai_cli.cli.repl._AbortMonitor") as MockMonitor:
             MockMonitor.return_value.start.side_effect = lambda: None
 
-            # Replace abort in _send_rounds with our controlled event.
-            original_send_rounds = repl._send_rounds
+            # Replace abort in Agent.run with our controlled event.
+            original_run = repl._main_agent.run
 
-            def _patched_send_rounds(user_input, _abort):
-                return original_send_rounds(user_input, abort_event)
+            def _patched_run(prompt, *, abort=None):
+                return original_run(prompt, abort=abort_event)
 
-            repl._send_rounds = _patched_send_rounds
+            repl._main_agent.run = _patched_run
             repl._send_to_llm("write two files")
 
         # add_raw_message must have been called with stub results for BOTH call_ids.
