@@ -1,6 +1,7 @@
 """Tests for ai_cli.core.agent_registry — spec parsing and registry."""
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -415,3 +416,160 @@ class TestAgentRegistry:
         returned = reg.specs
         returned["y"] = spec  # mutate the copy
         assert "y" not in reg.specs  # original unaffected
+
+    # ------------------------------------------------------------------
+    # get_or_create
+    # ------------------------------------------------------------------
+
+    def _registry_deps(self):
+        """Return keyword args for get_or_create() with mocked dependencies."""
+        coordinator_llm = MagicMock()
+        coordinator_llm.get_model_metadata.return_value = {
+            "model": "test",
+            "context_window": 4096,
+            "max_response_tokens": 512,
+        }
+        return {
+            "workspace": MagicMock(),
+            "config": MagicMock(),
+            "coordinator_llm": coordinator_llm,
+            "global_tool_registry": MagicMock(get=lambda _name: None),
+        }
+
+    def test_get_or_create_unknown_name_raises(self):
+        reg = AgentRegistry({})
+        with pytest.raises(KeyError):
+            reg.get_or_create("nonexistent", **self._registry_deps())
+
+    def test_get_or_create_ephemeral_returns_agent(self):
+        from ai_cli.core.agent import Agent
+
+        spec = AgentSpec(
+            name="explore",
+            system_message="Search.",
+            tools=[],
+            model="m1",
+            persistence="ephemeral",
+        )
+        reg = AgentRegistry({"explore": spec})
+        agent = reg.get_or_create("explore", **self._registry_deps())
+        assert isinstance(agent, Agent)
+
+    def test_get_or_create_ephemeral_builds_new_each_call(self):
+        """Ephemeral agents are never cached — each call produces a new instance."""
+
+        spec = AgentSpec(
+            name="explore",
+            system_message="Search.",
+            tools=[],
+            model="m1",
+            persistence="ephemeral",
+        )
+        reg = AgentRegistry({"explore": spec})
+        deps = self._registry_deps()
+        agent1 = reg.get_or_create("explore", **deps)
+        agent2 = reg.get_or_create("explore", **deps)
+        assert agent1 is not agent2
+
+    def test_get_or_create_session_caches_instance(self):
+        """Session-persistent agents are returned from cache on the second call."""
+        spec = AgentSpec(
+            name="helper",
+            system_message="Help.",
+            tools=[],
+            model="m1",
+            persistence="session",
+        )
+        reg = AgentRegistry({"helper": spec})
+        deps = self._registry_deps()
+        agent1 = reg.get_or_create("helper", **deps)
+        agent2 = reg.get_or_create("helper", **deps)
+        assert agent1 is agent2
+
+    def test_get_or_create_session_calls_display_reset_on_cache_hit(self):
+        """On a cache hit the agent's SubAgentDisplay.reset() is called."""
+        from unittest.mock import patch
+
+        spec = AgentSpec(
+            name="helper",
+            system_message="Help.",
+            tools=[],
+            model="m1",
+            persistence="session",
+        )
+        reg = AgentRegistry({"helper": spec})
+        deps = self._registry_deps()
+        agent = reg.get_or_create("helper", **deps)
+        # Patch reset on the actual SubAgentDisplay instance so we can count calls.
+        with patch.object(agent._display, "reset") as mock_reset:
+            reg.get_or_create("helper", **deps)
+        mock_reset.assert_called_once()
+
+    def test_get_or_create_session_agent_display_is_sub_agent_display(self):
+        from ai_cli.cli.display import SubAgentDisplay
+
+        spec = AgentSpec(
+            name="helper",
+            system_message="Help.",
+            tools=[],
+            model="m1",
+            persistence="session",
+        )
+        reg = AgentRegistry({"helper": spec})
+        agent = reg.get_or_create("helper", **self._registry_deps())
+        assert isinstance(agent._display, SubAgentDisplay)
+
+    def test_get_or_create_uses_coordinator_llm_when_no_backend(self):
+        """When spec has no backend, the coordinator's LLM is reused."""
+        spec = AgentSpec(
+            name="explore",
+            system_message="Search.",
+            tools=[],
+            model="m1",
+            persistence="ephemeral",
+            backend=None,
+        )
+        reg = AgentRegistry({"explore": spec})
+        deps = self._registry_deps()
+        agent = reg.get_or_create("explore", **deps)
+        assert agent._llm is deps["coordinator_llm"]
+
+    def test_get_or_create_creates_new_llm_when_backend_set(self, monkeypatch):
+        """When spec has a backend, a new OpenAIClient is constructed."""
+        from ai_cli.core.agent import BackendConfig
+        from ai_cli.core.llm_client import OpenAIClient
+
+        spec = AgentSpec(
+            name="remote",
+            system_message="Remote.",
+            tools=[],
+            model="remote-model",
+            persistence="ephemeral",
+            backend=BackendConfig(base_url="http://remote:11434/v1"),
+        )
+        reg = AgentRegistry({"remote": spec})
+        deps = self._registry_deps()
+        agent = reg.get_or_create("remote", **deps)
+        assert isinstance(agent._llm, OpenAIClient)
+        assert agent._llm is not deps["coordinator_llm"]
+
+    def test_get_or_create_session_seeded_with_system_message(self):
+        """The agent's session should contain the spec's system_message."""
+        from ai_cli.core.session_manager import InMemorySession
+
+        spec = AgentSpec(
+            name="helper",
+            system_message="You are a specialist.",
+            tools=[],
+            model="m1",
+            persistence="ephemeral",
+        )
+        reg = AgentRegistry({"helper": spec})
+        agent = reg.get_or_create("helper", **self._registry_deps())
+        assert isinstance(agent._session, InMemorySession)
+        messages = agent._session.get_messages()
+        assert any(
+            m.get("role") == "system"
+            and "You are a specialist." in m.get("content", "")
+            for m in messages
+        )

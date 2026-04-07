@@ -12,10 +12,17 @@ once ``Agent.run()`` exists.
 from __future__ import annotations
 
 import logging
-from typing import Any
+import os
+from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.agent import AgentSpec, BackendConfig
 from ai_cli.core.config_manager import ConfigManager
+
+if TYPE_CHECKING:
+    from ai_cli.core.agent import Agent
+    from ai_cli.core.llm_client import LLMClient
+    from ai_cli.core.tool_registry import ToolRegistry
+    from ai_cli.core.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -202,13 +209,14 @@ class AgentRegistry:
     """Registry of available agent types.
 
     Constructed with the output of :func:`load_agent_specs`.  Provides
-    read-only access to specs and a ``has_agents`` convenience flag.
-
-    Agent instantiation (``get_or_create``) is added in a later PR.
+    read-only access to specs, a ``has_agents`` convenience flag, and
+    lazy agent instantiation via :meth:`get_or_create`.
     """
 
     def __init__(self, specs: dict[str, AgentSpec]) -> None:
         self._specs = dict(specs)
+        # Cache for session-persistent agent instances.
+        self._instances: dict[str, Agent] = {}
 
     @property
     def specs(self) -> dict[str, AgentSpec]:
@@ -219,3 +227,86 @@ class AgentRegistry:
     def has_agents(self) -> bool:
         """True when at least one agent spec is loaded."""
         return bool(self._specs)
+
+    def get_or_create(
+        self,
+        name: str,
+        *,
+        workspace: Workspace,
+        config: ConfigManager,
+        coordinator_llm: LLMClient,
+        global_tool_registry: ToolRegistry,
+    ) -> Agent:
+        """Return an ``Agent`` for *name*, building it if necessary.
+
+        For ``persistence == "session"`` specs the agent is cached and
+        returned on subsequent calls after calling ``agent.reset()`` (which
+        clears the display buffer and pending transient schemas).  For
+        ``persistence == "ephemeral"`` specs a fresh agent is built on every
+        call.
+
+        Raises ``KeyError`` if *name* is not in the registry.
+        """
+        spec = self._specs.get(name)
+        if spec is None:
+            raise KeyError(f"No agent spec named {name!r}")
+
+        if spec.persistence == "session":
+            if name in self._instances:
+                agent = self._instances[name]
+                agent.reset()
+                return agent
+            agent = self._build_agent(
+                spec, workspace, config, coordinator_llm, global_tool_registry
+            )
+            self._instances[name] = agent
+            return agent
+
+        # ephemeral — build a fresh agent every time
+        return self._build_agent(
+            spec, workspace, config, coordinator_llm, global_tool_registry
+        )
+
+    def _build_agent(
+        self,
+        spec: AgentSpec,
+        workspace: Workspace,
+        config: ConfigManager,
+        coordinator_llm: LLMClient,
+        global_tool_registry: ToolRegistry,
+    ) -> Agent:
+        """Construct a new ``Agent`` from *spec*."""
+        from ai_cli.cli.display import SubAgentDisplay
+        from ai_cli.core.agent import Agent, build_agent_tool_registry
+        from ai_cli.core.llm_client import OpenAIClient
+        from ai_cli.core.session_manager import InMemorySession
+
+        if spec.backend is not None:
+            meta = coordinator_llm.get_model_metadata()
+            llm_cfg: dict = {
+                "model": spec.model,
+                "context_window": meta.get("context_window", 8192),
+                "max_response_tokens": spec.max_response_tokens,
+                "base_url": spec.backend.base_url,
+            }
+            if spec.backend.api_key_env:
+                api_key = os.environ.get(spec.backend.api_key_env)
+                if api_key is None:
+                    logger.warning(
+                        "Agent '%s': environment variable '%s' (api_key_env) is not set"
+                        " — connecting without an API key.",
+                        spec.name,
+                        spec.backend.api_key_env,
+                    )
+                    api_key = "no-key"
+                llm_cfg["api_key"] = api_key
+            llm_client: LLMClient = OpenAIClient(llm_cfg)
+        else:
+            llm_client = coordinator_llm
+
+        display = SubAgentDisplay()
+        session = InMemorySession(llm_client, system_message=spec.system_message)
+        registry = build_agent_tool_registry(
+            spec, workspace, config, display, global_tool_registry
+        )
+        return Agent(spec, session, llm_client, registry, display)

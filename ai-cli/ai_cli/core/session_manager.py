@@ -14,6 +14,7 @@ factory and registry that creates and looks up sessions.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import yaml
 from slugify import slugify as _slugify
@@ -83,6 +84,28 @@ class SessionMeta:
     first_user_message: str
     last_message_role: str
     last_message_preview: str
+
+
+# ---------------------------------------------------------------------------
+# SessionProtocol — structural type accepted by Agent
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class SessionProtocol(Protocol):
+    """Minimal session interface required by :class:`~ai_cli.core.agent.Agent`.
+
+    Both :class:`Session` (on-disk) and :class:`InMemorySession` (in-memory)
+    satisfy this Protocol without explicit inheritance.
+    """
+
+    def add_message(self, role: str, content: str) -> None: ...
+
+    def add_raw_message(self, message: dict) -> None: ...
+
+    def get_messages(self) -> list[dict]: ...
+
+    def record_usage(self, prompt_tokens: int) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +745,102 @@ class SessionManager:
         if not sessions:
             return None
         return self.load(sessions[0].session_id)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# InMemorySession — in-memory session for ephemeral sub-agents
+# ---------------------------------------------------------------------------
+
+
+class InMemorySession:
+    """Session that only lives in memory — for ephemeral sub-agents.
+
+    No files are read or written; all history is stored in a list.
+    Seeded with an optional system message on construction.  Compatible
+    with the ``Session`` interface expected by :class:`~ai_cli.core.agent.Agent`.
+    """
+
+    def __init__(self, llm_client: LLMClient, system_message: str = "") -> None:
+        self._llm = llm_client
+        self._messages: list[dict] = []
+        self._last_prompt_tokens: int | None = None
+        if system_message:
+            self._messages.append({"role": "system", "content": system_message})
+
+    @property
+    def session_id(self) -> str:
+        """Fixed identifier — this session has no on-disk representation."""
+        return "in-memory"
+
+    def add_message(self, role: str, content: str) -> None:
+        """Append a simple role/content message to the in-memory history."""
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise SessionError(
+                f"role and content must be strings; got role={type(role).__name__!r}, "
+                f"content={type(content).__name__!r}"
+            )
+        if role not in _VALID_ROLES:
+            raise SessionError(
+                f"Invalid role {role!r}; must be one of {sorted(_VALID_ROLES)}"
+            )
+        self._messages.append({"role": role, "content": content})
+
+    def add_raw_message(self, message: dict) -> None:
+        """Append an arbitrary OpenAI-format message dict to the in-memory history."""
+        if not isinstance(message, dict):
+            raise SessionError(
+                f"add_raw_message() requires a dict; got {type(message).__name__!r}"
+            )
+        role = message.get("role")
+        if not isinstance(role, str) or role not in _VALID_ROLES:
+            raise SessionError(
+                f"Invalid or missing role in message; must be one of {sorted(_VALID_ROLES)}"
+            )
+        # Deep-copy so that later mutations to nested structures (e.g. content
+        # blocks, tool_calls lists) cannot retroactively alter recorded history.
+        self._messages.append(copy.deepcopy(message))
+
+    def get_messages(self) -> list[dict]:
+        """Return a deep copy of the in-memory message list.
+
+        Deep-copying ensures callers cannot accidentally mutate stored messages
+        in-place between turns (mirrors the JSON round-trip in on-disk Session).
+        """
+        return copy.deepcopy(self._messages)
+
+    def record_usage(self, prompt_tokens: int) -> None:
+        """Store the API-reported prompt token count for the most recent turn."""
+        if not isinstance(prompt_tokens, int) or prompt_tokens < 0:
+            raise SessionError(
+                f"prompt_tokens must be a non-negative integer; got {prompt_tokens!r}"
+            )
+        self._last_prompt_tokens = prompt_tokens
+
+    def token_usage(self) -> tuple[int, int]:
+        """Return ``(used_tokens, context_window)``."""
+        context_window: int = self._llm.get_model_metadata()["context_window"]
+        if self._last_prompt_tokens is not None:
+            return self._last_prompt_tokens, context_window
+        used = self._llm.count_tokens(self._messages)
+        return used, context_window
+
+    def should_compact(self) -> bool:
+        """Sub-agents don't compact; always returns ``False``."""
+        return False
+
+    def get_meta(self) -> dict:
+        """Return an empty metadata dict — in-memory sessions have no metadata."""
+        return {}
+
+    def clear(self) -> None:
+        """Clear the in-memory history and reset token tracking."""
+        self._messages.clear()
+        self._last_prompt_tokens = None
 
 
 # ---------------------------------------------------------------------------
