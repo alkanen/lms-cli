@@ -16,13 +16,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from ai_cli.core.llm_client import LLMError
-from ai_cli.core.session_manager import SessionError
+from ai_cli.core.session_manager import SessionError, SessionProtocol
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
+    from ai_cli.core.config_manager import ConfigManager
     from ai_cli.core.llm_client import LLMClient
-    from ai_cli.core.session_manager import Session
     from ai_cli.core.tool_registry import ToolRegistry
+    from ai_cli.core.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class Agent:
     def __init__(
         self,
         spec: AgentSpec,
-        session: Session,
+        session: SessionProtocol,
         llm_client: LLMClient,
         tool_registry: ToolRegistry,
         display: Display,
@@ -90,6 +91,17 @@ class Agent:
         self._tool_registry = tool_registry
         self._display = display
         self._pending_transients: dict[str, dict] = {}
+
+    def reset(self) -> None:
+        """Reset per-run state for agent reuse.
+
+        Called by :class:`~ai_cli.core.agent_registry.AgentRegistry` on
+        session-persistent agents before each new delegation so the captured
+        display output and any pending transient schemas from the previous run
+        do not bleed into the next result.
+        """
+        self._display.reset()
+        self._pending_transients.clear()
 
     def run(
         self,
@@ -365,3 +377,79 @@ class Agent:
             )
 
         return AgentResult(text="".join(all_text_parts), status="ok")
+
+
+def build_agent_tool_registry(
+    spec: AgentSpec,
+    workspace: Workspace,
+    config: ConfigManager,
+    display: Display,
+    global_tool_registry: ToolRegistry,
+) -> ToolRegistry:
+    """Build a scoped ``ToolRegistry`` and ``PermissionManager`` for a sub-agent.
+
+    Each sub-agent gets its own ``PermissionManager`` so that "always allow"
+    grants are scoped to that agent and its ``Display``.  Sharing the
+    coordinator's ``PermissionManager`` would leak grants between agents and
+    potentially bypass ``SubAgentDisplay``'s default-deny behaviour.
+
+    Only the tools listed in ``spec.tools`` are registered.  Unknown tool names
+    are logged and skipped.  ``spec.tool_permission_overrides`` are applied
+    in-memory to the freshly registered instances (no config writes).
+    """
+    from ai_cli.core.permission_manager import PermissionManager
+    from ai_cli.core.tool_registry import ToolRegistry
+
+    permission_manager = PermissionManager(prompt_fn=display.show_permission_prompt)
+    registry = ToolRegistry(workspace, config, permission_manager)
+
+    # De-duplicate while preserving declaration order so duplicate entries in
+    # spec.tools don't cause redundant registrations or noisy override warnings.
+    registered: list[str] = []
+    for name in dict.fromkeys(spec.tools):
+        # Sub-agents cannot recursively invoke other agents: CallAgentTool has a
+        # non-standard constructor that the generic register() path cannot satisfy,
+        # so skip it silently rather than emitting a noisy warning each build.
+        if name == "call_agent":
+            continue
+        tool_instance = global_tool_registry.get(name)
+        if tool_instance is None:
+            logger.warning("Agent '%s': unknown tool '%s' — skipped", spec.name, name)
+            continue
+        tool_cls = type(tool_instance)
+        try:
+            registry.register(tool_cls)
+        except Exception as exc:
+            logger.warning(
+                "Agent '%s': failed to register tool '%s' — skipped (%s: %s)",
+                spec.name,
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        registered.append(name)
+
+    # Apply project config so that user settings (allowed, permission_required,
+    # disabled) from config.yaml are honoured as starting defaults.
+    registry.apply_config()
+
+    # The agent spec is the authority on which tools are enabled: explicitly
+    # re-enable every registered tool so the config's `disabled` flag cannot
+    # silently remove a tool the spec declared.  `allowed` and
+    # `permission_required` from config are intentionally preserved — they
+    # control whether the tool requires a permission prompt, not whether the
+    # tool is accessible at all to this agent.
+    # Note: runtime `/tools allow|disallow|enable|disable` changes made after
+    # sub-agent creation are NOT reflected here (sub-agents snapshot config at
+    # build time).  See VULN-010 for details.
+    for name in registered:
+        registry.enable_session(name)
+
+    # Apply per-agent permission overrides last so they win over config.
+    for name, override in spec.tool_permission_overrides.items():
+        instance = registry.get(name)
+        if instance is not None:
+            instance.permission_required = override
+
+    return registry

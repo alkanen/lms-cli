@@ -296,6 +296,46 @@ with self._lock:
 
 ---
 
+## VULN-010 — Runtime `/tools` commands do not affect sub-agent tool registries
+
+**Component:** `ai_cli/core/agent.py` — `build_agent_tool_registry()`
+
+**Severity:** Low (requires the user to disallow a tool mid-session and then invoke a sub-agent)
+
+**Status:** Deferred — intentional design; a future `/agent` command will address per-agent runtime overrides
+
+### Description
+
+Sub-agents build their `ToolRegistry` at instantiation time by calling
+`registry.apply_config()` against the startup-merged config.  Runtime commands
+(`/tools allow`, `/tools disallow`, `/tools enable`, `/tools disable`) update
+the coordinator's `ToolRegistry` in memory and persist the change to config, but
+do not propagate to any sub-agent registry that was already built — nor to
+sub-agent registries built after the command, because `apply_config()` re-reads
+only the startup-merged config snapshot held by `ConfigManager`.
+
+Consequently, if a user runs `/tools disallow bash` mid-session and then
+triggers a sub-agent that lists `bash` in its spec, the sub-agent will still
+have `bash` enabled and allowed.
+
+### Conditions required
+
+- The user must explicitly run a `/tools disallow` (or similar) command after
+  the session has started.
+- A sub-agent whose spec lists the disallowed tool must be invoked after that
+  command.
+- The agent spec must declare the tool — sub-agents cannot use tools not in
+  their spec.
+
+### Proposed mitigation
+
+Introduce a `/agent` command (planned for a future PR) that allows the user to
+override tool settings per agent type by name, giving explicit runtime control
+over individual sub-agent capabilities without relying on the coordinator's
+global `/tools` state.
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`

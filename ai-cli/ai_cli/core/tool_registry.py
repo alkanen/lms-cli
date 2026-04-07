@@ -486,7 +486,7 @@ class ToolRegistry:
         self._schemas[name] = tool_schema
         enabled = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
         self._enabled[name] = enabled
-        self._allowed[name] = True
+        self._allowed[name] = not getattr(tool_cls, "DISALLOWED_BY_DEFAULT", False)
         self._tiers[name] = tier
         logger.debug(
             "Registered tool '%s' from %s tier (enabled=%s, permission_required=%s)",
@@ -535,6 +535,104 @@ class ToolRegistry:
         if error:
             raise ValueError(f"Cannot register {tool_cls.__name__}: {error}")
         self._register(tool_cls, tier)
+
+    def apply_config(self) -> None:
+        """
+        Re-apply per-tool settings from the merged config.
+
+        Useful after programmatic registration (``register`` / ``register_instance``)
+        that happens *after* :meth:`load` has already run.  Safe to call multiple
+        times — already-correct values are simply overwritten with the same value.
+        """
+        self._apply_config()
+
+    def register_instance(self, tool: Tool, tier: str = "programmatic") -> None:
+        """
+        Register a pre-built tool instance directly, bypassing class discovery.
+
+        Use this for tools with non-standard constructor signatures (e.g.
+        :class:`~ai_cli.tools.call_agent.CallAgentTool`) that cannot be
+        instantiated with the standard ``(workspace, permission_manager, …)``
+        signature used by the three-tier loader.
+
+        The instance is validated (``definition()`` is called and the returned
+        schema is checked) before registration.  Invalid instances are logged
+        and skipped.
+
+        The initial enabled/allowed state is derived from the tool's
+        ``DISABLED_BY_DEFAULT`` and ``DISALLOWED_BY_DEFAULT`` class attributes
+        (both default to ``False`` when absent).  The merged project config is
+        then re-applied, which may further enable, disable, allow, or disallow
+        the tool.
+        """
+        name = tool.name
+        try:
+            tool_schema = tool.definition()
+        except Exception as exc:
+            logger.warning(
+                "Skipping tool instance '%s' from %s tier: definition() raised — %s",
+                name,
+                tier,
+                exc,
+            )
+            return
+        try:
+            defn = tool_schema.schema()
+        except Exception as exc:
+            logger.warning(
+                "Skipping tool instance '%s' from %s tier: ToolSchema.schema() raised — %s",
+                name,
+                tier,
+                exc,
+            )
+            return
+        defn_error = _validate_tool_definition(defn, expected_name=name)
+        if defn_error:
+            logger.warning(
+                "Skipping tool instance '%s' from %s tier: invalid definition() — %s",
+                name,
+                tier,
+                defn_error,
+            )
+            return
+        if name in self._tools:
+            logger.warning(
+                "Tool '%s' from %s tier overrides an earlier definition.", name, tier
+            )
+        self._tools[name] = tool
+        self._schemas[name] = tool_schema
+        tool_cls = type(tool)
+        self._enabled[name] = not getattr(tool_cls, "DISABLED_BY_DEFAULT", False)
+        self._allowed[name] = not getattr(tool_cls, "DISALLOWED_BY_DEFAULT", False)
+        self._tiers[name] = tier
+        logger.debug(
+            "Registered tool instance '%s' from %s tier (enabled=%s, permission_required=%s)",
+            name,
+            tier,
+            self._enabled[name],
+            tool.permission_required,
+        )
+        # Apply project config so user settings (disabled/allowed/permission_required)
+        # take effect even for tools registered after load() has run.
+        self._apply_config()
+        set_reg = getattr(tool, "set_registry", None)
+        if set_reg is not None:
+            if not callable(set_reg):
+                logger.warning(
+                    "Tool '%s' has a non-callable 'set_registry' attribute — "
+                    "registry back-reference skipped.",
+                    name,
+                )
+            else:
+                try:
+                    set_reg(self)
+                except Exception as exc:
+                    logger.warning(
+                        "Tool '%s': set_registry() raised an exception — "
+                        "registry access may not be available: %s",
+                        name,
+                        exc,
+                    )
 
     def _apply_config(self) -> None:
         """Apply per-tool settings from the merged config over the loaded defaults.
@@ -606,6 +704,17 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         """Return the named tool, or ``None`` if not registered."""
         return self._tools.get(name)
+
+    def is_allowed(self, name: str) -> bool:
+        """Return whether *name* is registered and currently allowed.
+
+        Cheaper than :meth:`tool_info` for callers that only need the
+        allowed/unknown state — does not compute the tool's schema.
+        Returns ``False`` for unknown tool names.
+        """
+        if name not in self._tools:
+            return False
+        return self._is_allowed(name)
 
     def all_enabled(self) -> list[Tool]:
         """Return all tools that are currently enabled and allowed."""

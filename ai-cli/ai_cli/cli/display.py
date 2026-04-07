@@ -73,6 +73,14 @@ class Display(ABC):
         """Switch between Markdown rendering and raw text output."""
         self._markdown_enabled = not self._markdown_enabled
 
+    def reset(self) -> None:  # noqa: B027
+        """Reset per-run display state for agent reuse.
+
+        Called on session-persistent sub-agents before each new delegation.
+        The default implementation is a no-op; :class:`SubAgentDisplay`
+        overrides this to clear its captured-text buffer.
+        """
+
     def prompt_session_kwargs(self) -> dict:
         """
         Return extra kwargs to pass to the REPL's ``PromptSession`` constructor.

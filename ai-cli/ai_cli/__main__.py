@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from ai_cli.cli.display import create_display
 from ai_cli.cli.repl import REPL
+from ai_cli.core.agent_registry import AgentRegistry, load_agent_specs
 from ai_cli.core.config_manager import ConfigError, ConfigManager
 from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
 from ai_cli.core.permission_manager import PermissionManager
@@ -425,6 +426,21 @@ def _cmd_repl(
     # Set up logging before tool loading so all subsequent activity is captured.
     setup_logging(config, session.session_dir)
     tool_registry.load()
+
+    # Wire up call_agent tool if any agent specs are configured.
+    agent_registry = AgentRegistry(load_agent_specs(config))
+    if agent_registry.has_agents:
+        from ai_cli.tools.call_agent import CallAgentTool
+
+        call_agent_tool = CallAgentTool(
+            workspace,
+            permission_manager,
+            agent_registry,
+            config,
+            llm_client,
+            tool_registry,
+        )
+        tool_registry.register_instance(call_agent_tool)
 
     if resumed:
         _show_resume_context(session, ui)
