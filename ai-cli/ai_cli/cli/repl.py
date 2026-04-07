@@ -51,6 +51,7 @@ except ImportError:  # Windows
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
+    from ai_cli.core.agent_registry import AgentRegistry
     from ai_cli.core.config_manager import ConfigManager
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.session_manager import Session
@@ -113,6 +114,7 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "/index [path] [--file <path>] [--label <name>] [--full] [--remove]",
         "Index files for semantic search; [path] adds a root, --file indexes a single file",
     ),
+    ("/agents", "List configured agent types"),
 ]
 
 
@@ -318,6 +320,7 @@ class REPL:
         display: Display,
         workspace: Workspace,
         config: ConfigManager | None = None,
+        agent_registry: AgentRegistry | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
@@ -325,6 +328,7 @@ class REPL:
         self._display = display
         self._workspace = workspace
         self._config = config
+        self._agent_registry = agent_registry
         # Maximum tool-call rounds per user turn — readable from config and
         # overridable at runtime via /rounds.
         self._max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS
@@ -511,6 +515,9 @@ class REPL:
         elif cmd == "index":
             self._handle_index_command(command[len(cmd) :].strip())
 
+        elif cmd == "agents":
+            self._handle_agents_command()
+
         elif cmd == "":
             self._display.show_error(
                 "No command provided. Type /help for a list of commands."
@@ -597,6 +604,28 @@ class REPL:
             "Try /tools, /tools list, /tools info <name>, "
             "or /tools enable|disable|allow|disallow [--session] <name>."
         )
+
+    # ------------------------------------------------------------------
+    # /agents command handler
+    # ------------------------------------------------------------------
+
+    def _handle_agents_command(self) -> None:
+        """Display configured agent types."""
+        if self._agent_registry is None or not self._agent_registry.has_agents:
+            self._display.show_status("No agent types configured.")
+            return
+        rows = []
+        for name, spec in sorted(self._agent_registry.specs.items()):
+            rows.append(
+                {
+                    "name": name,
+                    "model": spec.model,
+                    "persistence": spec.persistence,
+                    "tools": ", ".join(spec.tools) or "(none)",
+                    "max_tool_rounds": spec.max_tool_rounds,
+                }
+            )
+        self._display.show_agents(rows)
 
     # ------------------------------------------------------------------
     # /session subcommand handler

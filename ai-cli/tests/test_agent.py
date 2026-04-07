@@ -518,3 +518,124 @@ class TestAgentRun:
 
         with _pt.raises(KeyboardInterrupt):
             agent.run("go")
+
+
+# ---------------------------------------------------------------------------
+# Context overflow detection
+# ---------------------------------------------------------------------------
+
+
+class TestContextOverflow:
+    def _make_done_chunk(self, prompt_tokens: int) -> dict:
+        return {
+            "type": "done",
+            "stop_reason": "stop",
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 10},
+        }
+
+    def test_context_limit_triggered_at_threshold(self):
+        """91% of context window → status='context_limit', partial=True."""
+        context_window = 1000
+        prompt_tokens = 910  # 91% >= 90% threshold
+
+        spec = dataclasses.replace(_COORD_SPEC, context_limit_threshold=0.90)
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "partial text"},
+                self._make_done_chunk(prompt_tokens),
+            ]
+        )
+        llm.get_model_metadata.return_value = {"context_window": context_window}
+        display = MagicMock()
+        session = MagicMock()
+        session.get_messages.return_value = []
+        agent = _make_agent(spec=spec, llm=llm, display=display, session=session)
+
+        result = agent.run("go")
+
+        assert result.status == "context_limit"
+        assert result.partial is True
+        assert "partial text" in result.text
+        assert "Context limit" in result.error_message
+        status_calls = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("Context limit" in s for s in status_calls)
+        # Assistant message must be persisted even when context limit fires.
+        session.add_message.assert_called_with("assistant", "partial text")
+
+    def test_context_limit_not_triggered_below_threshold(self):
+        """89% of context window → normal 'ok' return."""
+        context_window = 1000
+        prompt_tokens = 890  # 89% < 90% threshold
+
+        spec = dataclasses.replace(_COORD_SPEC, context_limit_threshold=0.90)
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "full response"},
+                self._make_done_chunk(prompt_tokens),
+            ]
+        )
+        llm.get_model_metadata.return_value = {"context_window": context_window}
+        agent = _make_agent(spec=spec, llm=llm)
+
+        result = agent.run("go")
+
+        assert result.status == "ok"
+        assert result.partial is False
+        assert result.text == "full response"
+
+    def test_context_limit_not_triggered_when_context_window_zero(self):
+        """context_window == 0 → never triggers, avoids division by zero."""
+        spec = dataclasses.replace(_COORD_SPEC, context_limit_threshold=0.90)
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "response"},
+                self._make_done_chunk(99999),
+            ]
+        )
+        llm.get_model_metadata.return_value = {"context_window": 0}
+        agent = _make_agent(spec=spec, llm=llm)
+
+        result = agent.run("go")
+
+        assert result.status == "ok"
+        assert result.partial is False
+
+    def test_context_limit_stubs_pending_tool_calls(self):
+        """When context limit fires mid-turn, dangling tool_calls get stub responses."""
+        context_window = 1000
+        prompt_tokens = 910  # 91% >= 90%
+
+        spec = dataclasses.replace(_COORD_SPEC, context_limit_threshold=0.90)
+        llm = MagicMock()
+        llm.send.return_value = iter(
+            [
+                {
+                    "type": "tool_call",
+                    "call_id": "call-abc",
+                    "name": "read_file",
+                    "arguments": {"path": "foo.py"},
+                },
+                self._make_done_chunk(prompt_tokens),
+            ]
+        )
+        llm.get_model_metadata.return_value = {"context_window": context_window}
+        session = MagicMock()
+        session.get_messages.return_value = []
+        agent = _make_agent(spec=spec, llm=llm, session=session)
+
+        result = agent.run("go")
+
+        assert result.status == "context_limit"
+        # A stub tool response must have been written for the dangling tool call.
+        stub_ids = [
+            (c.kwargs.get("message") or (c.args[0] if c.args else {})).get(
+                "tool_call_id"
+            )
+            for c in session.add_raw_message.call_args_list
+            if (c.kwargs.get("message") or (c.args[0] if c.args else {})).get("role")
+            == "tool"
+        ]
+        assert "call-abc" in stub_ids

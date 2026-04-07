@@ -1,10 +1,10 @@
-"""Tests for CallAgentTool and the end-to-end agent dispatch path."""
+"""Tests for CallAgentTool, CallAgentsParallelTool and the end-to-end agent dispatch path."""
 
 from unittest.mock import MagicMock, patch
 
 from ai_cli.core.agent import AgentResult, AgentSpec
 from ai_cli.core.agent_registry import AgentRegistry
-from ai_cli.tools.call_agent import CallAgentTool
+from ai_cli.tools.call_agent import CallAgentsParallelTool, CallAgentTool
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -428,3 +428,171 @@ class TestBuildAgentToolRegistry:
         # No warning should mention call_agent — it is silently skipped.
         for call in mock_logger.warning.call_args_list:
             assert "call_agent" not in str(call)
+
+
+# ---------------------------------------------------------------------------
+# CallAgentsParallelTool
+# ---------------------------------------------------------------------------
+
+
+def _make_parallel_tool(
+    specs: dict[str, AgentSpec] | None = None,
+) -> tuple[CallAgentsParallelTool, AgentRegistry]:
+    if specs is None:
+        specs = {
+            "explore": _make_spec("explore"),
+            "coder": _make_spec("coder"),
+        }
+    registry = AgentRegistry(specs)
+    workspace = MagicMock()
+    permission_manager = MagicMock()
+    config = MagicMock()
+    coordinator_llm = MagicMock()
+    global_tool_registry = MagicMock()
+    global_tool_registry.is_allowed.return_value = True
+    tool = CallAgentsParallelTool(
+        workspace,
+        permission_manager,
+        registry,
+        config,
+        coordinator_llm,
+        global_tool_registry,
+    )
+    return tool, registry
+
+
+class TestCallAgentsParallelTool:
+    def test_two_calls_returned_in_input_order(self):
+        """Two parallel calls return results in input order regardless of completion order."""
+        tool, registry = _make_parallel_tool()
+
+        mock_explore = MagicMock()
+        mock_explore.run.return_value = AgentResult(
+            text="explore result", status="ok", partial=False, error_message=""
+        )
+        mock_coder = MagicMock()
+        mock_coder.run.return_value = AgentResult(
+            text="coder result", status="ok", partial=False, error_message=""
+        )
+
+        def _get_or_create(name, **kwargs):
+            return mock_explore if name == "explore" else mock_coder
+
+        with patch.object(registry, "get_or_create", side_effect=_get_or_create):
+            result = tool.execute(
+                calls=[
+                    {"agent_type": "explore", "prompt": "find files"},
+                    {"agent_type": "coder", "prompt": "write code"},
+                ]
+            )
+
+        assert result["status"] == "success"
+        results = result["data"]["results"]
+        assert len(results) == 2
+        assert results[0]["agent_type"] == "explore"
+        assert results[0]["result"] == "explore result"
+        assert results[1]["agent_type"] == "coder"
+        assert results[1]["result"] == "coder result"
+
+    def test_calls_not_a_list_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        result = tool.execute(calls="not a list")
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_exceeds_default_max_parallel_calls_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        # 11 calls > default limit of 10
+        calls = [{"agent_type": "explore", "prompt": f"task {i}"} for i in range(11)]
+        result = tool.execute(calls=calls)
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert "10" in result["message"]
+
+    def test_configurable_max_parallel_calls_respected(self):
+        tool, registry = _make_parallel_tool()
+        tool._config.get.return_value = {"max_parallel_calls": 3}
+        mock_agent = MagicMock()
+        mock_agent.run.return_value = AgentResult(text="ok", status="ok")
+        with patch.object(registry, "get_or_create", return_value=mock_agent):
+            # 3 calls ≤ limit of 3 — should succeed
+            calls = [{"agent_type": "explore", "prompt": f"task {i}"} for i in range(3)]
+            result = tool.execute(calls=calls)
+        assert result["status"] == "success"
+
+    def test_exceeds_configurable_max_parallel_calls_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        tool._config.get.return_value = {"max_parallel_calls": 2}
+        calls = [{"agent_type": "explore", "prompt": f"task {i}"} for i in range(3)]
+        result = tool.execute(calls=calls)
+        assert result["status"] == "error"
+        assert "2" in result["message"]
+
+    def test_calls_none_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        result = tool.execute(calls=None)
+        assert result["status"] == "error"
+
+    def test_item_with_unknown_agent_type_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        result = tool.execute(
+            calls=[{"agent_type": "nonexistent", "prompt": "do something"}]
+        )
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_agent_type"
+
+    def test_item_with_non_string_prompt_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        result = tool.execute(calls=[{"agent_type": "explore", "prompt": 42}])
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_item_not_a_dict_returns_error(self):
+        tool, _ = _make_parallel_tool()
+        result = tool.execute(calls=["not a dict"])
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_definition_schema_has_calls_array(self):
+        tool, _ = _make_parallel_tool()
+        schema = tool.definition().schema()
+        props = schema["function"]["parameters"]["properties"]
+        assert "calls" in props
+        assert props["calls"]["type"] == "array"
+        assert "items" in props["calls"]
+
+    def test_definition_name_is_correct(self):
+        tool, _ = _make_parallel_tool()
+        schema = tool.definition().schema()
+        assert schema["function"]["name"] == "call_agents_parallel"
+
+    def test_duplicate_session_agent_returns_error(self):
+        """Duplicate session-persistent agent in one parallel call is rejected."""
+        specs = {
+            "helper": _make_spec("helper", persistence="session"),
+        }
+        tool, _ = _make_parallel_tool(specs)
+        result = tool.execute(
+            calls=[
+                {"agent_type": "helper", "prompt": "first"},
+                {"agent_type": "helper", "prompt": "second"},
+            ]
+        )
+        assert result["status"] == "error"
+        assert "helper" in result["message"]
+
+    def test_duplicate_ephemeral_agent_is_allowed(self):
+        """Duplicate ephemeral agents in one parallel call are permitted (each gets a fresh instance)."""
+        specs = {"explore": _make_spec("explore", persistence="ephemeral")}
+        tool, registry = _make_parallel_tool(specs)
+        mock_agent = MagicMock()
+        mock_agent.run.return_value = AgentResult(text="ok", status="ok")
+        with patch.object(registry, "get_or_create", return_value=mock_agent):
+            result = tool.execute(
+                calls=[
+                    {"agent_type": "explore", "prompt": "task one"},
+                    {"agent_type": "explore", "prompt": "task two"},
+                ]
+            )
+        assert result["status"] == "success"
+        assert len(result["data"]["results"]) == 2

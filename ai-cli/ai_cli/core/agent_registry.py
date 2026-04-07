@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.agent import AgentSpec, BackendConfig
@@ -217,6 +218,8 @@ class AgentRegistry:
         self._specs = dict(specs)
         # Cache for session-persistent agent instances.
         self._instances: dict[str, Agent] = {}
+        # Protects _instances cache mutations for thread-safe parallel dispatch.
+        self._lock = threading.Lock()
 
     @property
     def specs(self) -> dict[str, AgentSpec]:
@@ -252,15 +255,28 @@ class AgentRegistry:
             raise KeyError(f"No agent spec named {name!r}")
 
         if spec.persistence == "session":
-            if name in self._instances:
-                agent = self._instances[name]
-                agent.reset()
-                return agent
-            agent = self._build_agent(
+            # Fast path: already cached — acquire lock only briefly.
+            with self._lock:
+                if name in self._instances:
+                    agent = self._instances[name]
+                    agent.reset()
+                    return agent
+
+            # Build outside the lock so expensive construction doesn't
+            # serialise concurrent parallel dispatches.
+            candidate = self._build_agent(
                 spec, workspace, config, coordinator_llm, global_tool_registry
             )
-            self._instances[name] = agent
-            return agent
+
+            # Re-check under lock: another thread may have built and cached
+            # the agent while we were constructing ours.
+            with self._lock:
+                if name in self._instances:
+                    cached = self._instances[name]
+                    cached.reset()
+                    return cached
+                self._instances[name] = candidate
+                return candidate
 
         # ephemeral — build a fresh agent every time
         return self._build_agent(

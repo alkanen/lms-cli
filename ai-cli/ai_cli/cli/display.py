@@ -218,6 +218,17 @@ class Display(ABC):
         ``content`` may be a plain string or a list of content blocks.
         """
 
+    def show_agents(self, rows: list[dict]) -> None:  # noqa: B027
+        """
+        Render configured agent types.
+
+        *rows* is a list of dicts with keys ``name``, ``model``,
+        ``persistence``, ``tools``, and ``max_tool_rounds``.
+
+        The default implementation is a no-op.  Concrete display backends
+        override this to render a table.
+        """
+
     # ------------------------------------------------------------------
     # Interactive prompts
     # ------------------------------------------------------------------
@@ -467,6 +478,19 @@ class PlainDisplay(Display):
             except ValueError:
                 pass
             print("Invalid choice, please try again.")
+
+    def show_agents(self, rows: list[dict]) -> None:
+        if not rows:
+            print("No agent types configured.")
+            return
+        print("\nConfigured agent types:")
+        for row in rows:
+            tools_str = row.get("tools", "(none)")
+            print(
+                f"  {row['name']:<20}  model={row['model']}  "
+                f"persistence={row['persistence']}  "
+                f"max_rounds={row['max_tool_rounds']}  tools={tools_str}"
+            )
 
     def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
         if not sessions:
@@ -829,6 +853,27 @@ class RichDisplay(Display):
         self._console.print("\nAll tools:")
         self._console.print(table)
 
+    def show_agents(self, rows: list[dict]) -> None:
+        if not rows:
+            self._console.print("No agent types configured.")
+            return
+        table = Table(show_header=True)
+        table.add_column("Name", style="bold")
+        table.add_column("Model")
+        table.add_column("Persistence")
+        table.add_column("Max Rounds", justify="right")
+        table.add_column("Tools")
+        for row in rows:
+            table.add_row(
+                row["name"],
+                row["model"],
+                row["persistence"],
+                str(row["max_tool_rounds"]),
+                row["tools"],
+            )
+        self._console.print("\nConfigured agent types:")
+        self._console.print(table)
+
     def show_tool_info(self, tool_info: dict) -> None:
         name = tool_info.get("name", "")
         self._console.print(f"\nTool: {name}", style="bold")
@@ -1052,6 +1097,9 @@ class SubAgentDisplay(Display):
         pass
 
     def show_history(self, messages: list[dict]) -> None:
+        pass
+
+    def show_agents(self, rows: list[dict]) -> None:
         pass
 
     # -- Interactive prompts -----------------------------------------------
