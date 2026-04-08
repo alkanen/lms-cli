@@ -1979,3 +1979,88 @@ class TestRoundsCommand:
         # Value is still updated in memory even if persist failed.
         assert repl._max_tool_rounds == 4
         display.show_error.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# /agents command
+# ---------------------------------------------------------------------------
+
+
+class TestAgentsCommand:
+    def test_no_agents_configured_shows_status(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        # No agent_registry passed — _agent_registry is None.
+        repl._handle_slash_command("agents")
+        display.show_status.assert_called_once()
+        display.show_agents.assert_not_called()
+
+    def test_empty_agent_registry_shows_status(self):
+        from ai_cli.core.agent_registry import AgentRegistry
+
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._agent_registry = AgentRegistry({})
+        repl._handle_slash_command("agents")
+        display.show_status.assert_called_once()
+        display.show_agents.assert_not_called()
+
+    def test_agents_present_calls_show_agents(self):
+        from ai_cli.core.agent import AgentSpec
+        from ai_cli.core.agent_registry import AgentRegistry
+
+        spec = AgentSpec(
+            name="explore",
+            system_message="You explore.",
+            tools=["read_file"],
+            model="llama3:8b",
+            persistence="ephemeral",
+            max_tool_rounds=5,
+        )
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._agent_registry = AgentRegistry({"explore": spec})
+        repl._handle_slash_command("agents")
+        display.show_agents.assert_called_once()
+        display.show_status.assert_not_called()
+
+    def test_show_agents_rows_contain_expected_fields(self):
+        from ai_cli.core.agent import AgentSpec
+        from ai_cli.core.agent_registry import AgentRegistry
+
+        spec = AgentSpec(
+            name="coder",
+            system_message="You write code.",
+            tools=["read_file", "write_file"],
+            model="llama3:8b",
+            persistence="session",
+            max_tool_rounds=7,
+        )
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._agent_registry = AgentRegistry({"coder": spec})
+        repl._handle_slash_command("agents")
+        rows = display.show_agents.call_args[0][0]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["name"] == "coder"
+        assert row["model"] == "llama3:8b"
+        assert row["persistence"] == "session"
+        assert row["max_tool_rounds"] == 7
+        assert "read_file" in row["tools"]
+        assert "write_file" in row["tools"]
+
+    def test_show_agents_rows_sorted_by_name(self):
+        from ai_cli.core.agent import AgentSpec
+        from ai_cli.core.agent_registry import AgentRegistry
+
+        specs = {
+            "zebra": AgentSpec(name="zebra", system_message="z", tools=[], model="m"),
+            "alpha": AgentSpec(name="alpha", system_message="a", tools=[], model="m"),
+        }
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._agent_registry = AgentRegistry(specs)
+        repl._handle_slash_command("agents")
+        rows = display.show_agents.call_args[0][0]
+        assert [r["name"] for r in rows] == ["alpha", "zebra"]

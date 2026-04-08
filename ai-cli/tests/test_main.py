@@ -6,8 +6,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai_cli.__main__ import _RESUME_PICK, _pick_session, _show_resume_context
+from ai_cli.__main__ import (
+    _RESUME_PICK,
+    _pick_session,
+    _show_resume_context,
+    _wire_agents,
+)
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
+from ai_cli.core.agent import AgentSpec
+from ai_cli.core.agent_registry import AgentRegistry
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
 
@@ -623,3 +630,176 @@ class TestMainRouting:
     def test_no_max_tool_rounds_flag_passes_none(self, monkeypatch):
         kwargs = self._run([], monkeypatch)
         assert kwargs.get("max_tool_rounds") is None
+
+
+# ---------------------------------------------------------------------------
+# _wire_agents — registration gating and startup validation
+# ---------------------------------------------------------------------------
+
+
+def _make_spec(
+    name: str, tools: list[str] | None = None, persistence: str = "ephemeral"
+) -> AgentSpec:
+    return AgentSpec(
+        name=name,
+        system_message="You help.",
+        tools=tools or ["read_file"],
+        model="llama3:8b",
+        persistence=persistence,
+    )
+
+
+def _make_wire_mocks(*, allow_parallel: bool = False, agent_specs: dict | None = None):
+    """Return (agent_registry, tool_registry, shared mocks) for _wire_agents tests."""
+    if agent_specs is None:
+        agent_specs = {"explore": _make_spec("explore")}
+    agent_registry = AgentRegistry(agent_specs)
+
+    tool_registry = MagicMock()
+    tool_registry.get.return_value = MagicMock()  # tools exist by default
+
+    config = MagicMock()
+    config.get.side_effect = lambda key, *args, **kwargs: (
+        {"allow_parallel": allow_parallel} if key == "agent_settings" else None
+    )
+
+    workspace = MagicMock()
+    permission_manager = MagicMock()
+    llm_client = MagicMock()
+
+    return (
+        agent_registry,
+        tool_registry,
+        config,
+        workspace,
+        permission_manager,
+        llm_client,
+    )
+
+
+class TestWireAgents:
+    def test_call_agent_registered_when_agents_configured(self):
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks()
+        _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agent" in names
+
+    def test_call_agent_not_registered_when_no_agents(self):
+        agent_registry = AgentRegistry({})
+        tool_registry = MagicMock()
+        config = MagicMock()
+        _wire_agents(
+            agent_registry, tool_registry, MagicMock(), MagicMock(), config, MagicMock()
+        )
+        tool_registry.register_instance.assert_not_called()
+
+    def test_parallel_tool_registered_when_allow_parallel_true(self):
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks(
+            allow_parallel=True
+        )
+        _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agents_parallel" in names
+
+    def test_parallel_tool_not_registered_when_allow_parallel_false(self):
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks(
+            allow_parallel=False
+        )
+        _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agents_parallel" not in names
+
+    def test_parallel_tool_not_registered_when_agent_settings_absent(self):
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks()
+        # Override side_effect (takes precedence over return_value) so that
+        # config.get("agent_settings") genuinely returns None.
+        config.get.side_effect = lambda key, *a, **kw: None
+        _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agents_parallel" not in names
+
+    def test_non_dict_agent_settings_warns_and_is_ignored(self):
+        """A non-mapping agent_settings value emits a warning and is treated as absent."""
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks()
+        config.get.side_effect = lambda key, *a, **kw: (
+            "not-a-dict" if key == "agent_settings" else None
+        )
+        with patch("ai_cli.__main__.logger") as mock_logger:
+            _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agents_parallel" not in names
+        assert mock_logger.warning.called
+        assert any(
+            "agent_settings" in str(c) for c in mock_logger.warning.call_args_list
+        )
+
+    def test_parallel_tool_not_registered_for_truthy_non_boolean(self):
+        """A truthy non-boolean (e.g. the string 'true') must not enable parallel dispatch."""
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks()
+        config.get.side_effect = lambda key, *a, **kw: (
+            {"allow_parallel": "true"} if key == "agent_settings" else None
+        )
+        with patch("ai_cli.__main__.logger") as mock_logger:
+            _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+        names = [
+            call.args[0].NAME for call in tool_registry.register_instance.call_args_list
+        ]
+        assert "call_agents_parallel" not in names
+        # A warning should have been emitted for the invalid type.
+        assert mock_logger.warning.called
+        assert any(
+            "allow_parallel" in str(c) for c in mock_logger.warning.call_args_list
+        )
+
+
+class TestWireAgentsValidation:
+    def test_warns_for_unknown_tool_in_spec(self):
+        specs = {"explore": _make_spec("explore", tools=["nonexistent_tool"])}
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks(
+            agent_specs=specs
+        )
+        tool_registry.get.return_value = None  # tool not registered
+
+        with patch("ai_cli.__main__.logger") as mock_logger:
+            _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+
+        warning_msgs = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("nonexistent_tool" in m for m in warning_msgs)
+        assert any("explore" in m for m in warning_msgs)
+
+    def test_no_warning_for_known_tool_in_spec(self):
+        specs = {"explore": _make_spec("explore", tools=["read_file"])}
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks(
+            agent_specs=specs
+        )
+        tool_registry.get.return_value = MagicMock()  # tool is registered
+
+        with patch("ai_cli.__main__.logger") as mock_logger:
+            _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+
+        warning_msgs = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("read_file" in m for m in warning_msgs)
+
+    def test_call_agent_in_spec_tools_never_warns(self):
+        """call_agent in spec.tools is always skipped — no spurious warning."""
+        specs = {"explore": _make_spec("explore", tools=["call_agent"])}
+        agent_registry, tool_registry, config, workspace, pm, llm = _make_wire_mocks(
+            agent_specs=specs
+        )
+        tool_registry.get.return_value = None  # not in global registry
+
+        with patch("ai_cli.__main__.logger") as mock_logger:
+            _wire_agents(agent_registry, tool_registry, workspace, pm, config, llm)
+
+        warning_msgs = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("call_agent" in m for m in warning_msgs)

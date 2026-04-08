@@ -35,6 +35,8 @@ from ai_cli.utils.logging_utils import setup_logging
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
 
+logger = logging.getLogger(__name__)
+
 _PREVIEW_LEN = 120  # max chars shown in the "unanswered message" notice
 
 # Sentinel stored by argparse when --resume is given with no SESSION_ID argument.
@@ -429,10 +431,48 @@ def _cmd_repl(
 
     # Wire up call_agent tool if any agent specs are configured.
     agent_registry = AgentRegistry(load_agent_specs(config))
-    if agent_registry.has_agents:
-        from ai_cli.tools.call_agent import CallAgentTool
+    _wire_agents(
+        agent_registry, tool_registry, workspace, permission_manager, config, llm_client
+    )
 
-        call_agent_tool = CallAgentTool(
+    if resumed:
+        _show_resume_context(session, ui)
+
+    repl = REPL(
+        session,
+        tool_registry,
+        llm_client,
+        ui,
+        workspace,
+        config,
+        agent_registry=agent_registry,
+    )
+    repl.run()
+
+
+def _wire_agents(
+    agent_registry: AgentRegistry,
+    tool_registry: ToolRegistry,
+    workspace: Workspace,
+    permission_manager: PermissionManager,
+    config: ConfigManager,
+    llm_client: LLMClient,
+) -> None:
+    """Register agent tools against *tool_registry* and validate tool references.
+
+    Registers ``call_agent`` when at least one agent spec is configured.
+    Registers ``call_agents_parallel`` only when
+    ``agent_settings.allow_parallel: true`` is set in config.
+    Warns (but does not abort) when an agent spec references a tool that is
+    not present in the global registry.
+    """
+    if not agent_registry.has_agents:
+        return
+
+    from ai_cli.tools.call_agent import CallAgentTool
+
+    tool_registry.register_instance(
+        CallAgentTool(
             workspace,
             permission_manager,
             agent_registry,
@@ -440,13 +480,48 @@ def _cmd_repl(
             llm_client,
             tool_registry,
         )
-        tool_registry.register_instance(call_agent_tool)
+    )
 
-    if resumed:
-        _show_resume_context(session, ui)
+    agent_settings = config.get("agent_settings") or {}
+    if agent_settings and not isinstance(agent_settings, dict):
+        logger.warning(
+            "Ignoring agent_settings: expected a mapping, got %s.",
+            type(agent_settings).__name__,
+        )
+        agent_settings = {}
+    if isinstance(agent_settings, dict):
+        allow_parallel = agent_settings.get("allow_parallel")
+        if allow_parallel is True:
+            from ai_cli.tools.call_agent import CallAgentsParallelTool
 
-    repl = REPL(session, tool_registry, llm_client, ui, workspace, config)
-    repl.run()
+            tool_registry.register_instance(
+                CallAgentsParallelTool(
+                    workspace,
+                    permission_manager,
+                    agent_registry,
+                    config,
+                    llm_client,
+                    tool_registry,
+                )
+            )
+        elif "allow_parallel" in agent_settings and not isinstance(
+            allow_parallel, bool
+        ):
+            logger.warning(
+                "Ignoring non-boolean agent_settings.allow_parallel=%r; expected true or false.",
+                allow_parallel,
+            )
+
+    for agent_name, spec in agent_registry.specs.items():
+        for tool_name in spec.tools:
+            if tool_name == "call_agent":
+                continue  # always excluded from sub-agents
+            if tool_registry.get(tool_name) is None:
+                logger.warning(
+                    "Agent '%s': tool '%s' is not registered in the global registry.",
+                    agent_name,
+                    tool_name,
+                )
 
 
 def _ensure_global_dir(global_dir: Path) -> bool:

@@ -131,6 +131,7 @@ class Agent:
             )
 
         all_text_parts: list[str] = []
+        context_limit_hit = False
 
         for _ in range(self.spec.max_tool_rounds):
             if abort is not None and abort.is_set():
@@ -201,6 +202,22 @@ class Agent:
                             "context_window", 0
                         )
                         self._display.update_usage(usage, context_window)
+                        # Context overflow check — break out of the stream loop
+                        # so the assistant message is persisted before returning.
+                        if (
+                            isinstance(context_window, int)
+                            and context_window > 0
+                            and isinstance(prompt_tokens, int)
+                            and prompt_tokens / context_window
+                            >= self.spec.context_limit_threshold
+                        ):
+                            context_limit_msg = (
+                                f"Context limit reached "
+                                f"({prompt_tokens}/{context_window} tokens)."
+                            )
+                            self._display.show_status(context_limit_msg)
+                            context_limit_hit = True
+                            break
             except KeyboardInterrupt:
                 if abort is not None:
                     abort.set()
@@ -266,6 +283,39 @@ class Agent:
                         partial=True,
                         error_message=str(exc),
                     )
+
+            if context_limit_hit:
+                # Stub responses for any tool_calls the LLM emitted in this
+                # turn so the session history stays consistent — dangling
+                # tool_calls without responses will confuse the next LLM call.
+                for pending in tool_calls:
+                    try:
+                        self._session.add_raw_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": pending["call_id"],
+                                "content": json.dumps(
+                                    {
+                                        "status": "error",
+                                        "error": "context_limit",
+                                        "message": "Context limit reached; tool not executed.",
+                                        "code": 503,
+                                    }
+                                ),
+                            }
+                        )
+                    except SessionError as exc:
+                        logger.error(
+                            "Failed to inject context-limit stub for call_id=%r: %s",
+                            pending["call_id"],
+                            exc,
+                        )
+                return AgentResult(
+                    text="".join(all_text_parts),
+                    status="context_limit",
+                    partial=True,
+                    error_message=context_limit_msg,
+                )
 
             if not tool_calls:
                 break
