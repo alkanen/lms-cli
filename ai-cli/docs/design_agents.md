@@ -79,7 +79,7 @@ class Agent:
     tool_registry: ToolRegistry
     display: Display           # SubAgentDisplay for sub-agents; terminal Display for coordinator
 
-    async def run(self, prompt: str) -> AgentResult:
+    def run(self, prompt: str | list[dict], *, abort: threading.Event | None = None) -> AgentResult:
         """
         Run the full send → tool-call → repeat loop for one prompt.
         Returns when the LLM issues end_turn or when a safety limit is hit.
@@ -407,9 +407,13 @@ Returns (canonical tool wrapper):
       error_message string
 ```
 
-`call_agents_parallel` uses `asyncio.gather()` internally.  It is only
-registered on the coordinator if `agent_settings.allow_parallel: true` is set
-in config (default `false`).
+`call_agents_parallel` uses `concurrent.futures.ThreadPoolExecutor` internally
+(not `asyncio`).  It is only registered on the coordinator if
+`agent_settings.allow_parallel: true` is set in config (default `false`).
+The maximum number of parallel calls per invocation defaults to 10 and is
+configurable via `agent_settings.max_parallel_calls`.  Session-persistent agent
+types may not appear more than once in a single `call_agents_parallel` invocation
+(they share state and cannot safely run concurrently).
 
 ```yaml
 agent_settings:
@@ -454,8 +458,10 @@ Available agent types:
 ```
 ai_cli/
 ├── core/
-│   ├── agent.py          # Agent, AgentSpec, AgentResult, SubAgentDisplay
-│   └── agent_registry.py # Parses AgentSpecs from config (load()); instantiates agents lazily via get()
+│   ├── agent.py          # Agent, AgentSpec, AgentResult, BackendConfig, build_agent_tool_registry()
+│   └── agent_registry.py # Parses AgentSpecs from config (load()); instantiates agents lazily via get_or_create()
+├── cli/
+│   └── display.py        # SubAgentDisplay (alongside PlainDisplay and RichDisplay)
 ├── tools/
 │   └── call_agent.py     # CallAgentTool, CallAgentsParallelTool
 ```
@@ -618,7 +624,7 @@ def get_agent_defaults(self) -> dict:
 
 ---
 
-### PR 2 — SubAgentDisplay
+### PR 2 — SubAgentDisplay ✅
 
 **Goal:** Implement a `Display` subclass that captures output in a buffer
 instead of writing to a terminal.  No runtime behaviour change.
@@ -685,7 +691,7 @@ file `tests/test_sub_agent_display.py` if `test_display.py` is large):
 
 ---
 
-### PR 3 — REPL Refactor: Extract `Agent.run()`
+### PR 3 — REPL Refactor: Extract `Agent.run()` ✅
 
 **Goal:** Move the `_send_rounds` loop into `Agent.run()` so the REPL
 delegates to an `Agent` instance.  **Zero behavioural change** — all
@@ -839,7 +845,7 @@ self._main_agent.spec.max_tool_rounds = new_value
 
 ---
 
-### PR 4 — `CallAgentTool` and End-to-End Agent Dispatch
+### PR 4 — `CallAgentTool` and End-to-End Agent Dispatch ✅
 
 **Goal:** Wire up sub-agent creation and dispatch.  After this PR, users
 can configure agents in their config file and the coordinator LLM can
@@ -865,11 +871,22 @@ class CallAgentTool(Tool):
     DESCRIPTION = "Delegate a focused task to a specialised sub-agent."
     PERMISSION_REQUIRED = False
 
-    def __init__(self, workspace, permission_manager, agent_registry: AgentRegistry):
+    def __init__(
+        self,
+        workspace,
+        permission_manager,
+        agent_registry: AgentRegistry,
+        config: ConfigManager,
+        coordinator_llm: LLMClient,
+        global_tool_registry: ToolRegistry,
+    ):
         super().__init__(workspace, permission_manager,
                          self.PERMISSION_REQUIRED, self.NAME, self.DESCRIPTION)
         self._agent_registry = agent_registry
-        self._dynamic_description = self._build_description()
+        self._config = config
+        self._coordinator_llm = coordinator_llm
+        self._global_tool_registry = global_tool_registry
+        # Description is built dynamically on each definition() call.
 
     def _build_description(self) -> str:
         """Build tool description from available agent specs.
@@ -916,29 +933,32 @@ def get_or_create(
     workspace: Workspace,
     config: ConfigManager,
     coordinator_llm: LLMClient,
-    coordinator_display: Display,
     global_tool_registry: ToolRegistry,
 ) -> Agent:
     """Return a cached Agent for session-persistent specs, or build a
     new one for ephemeral specs."""
 ```
 
+Note: there is no `coordinator_display` parameter; each agent builds its
+own `SubAgentDisplay` internally via `_build_agent()`.  Thread safety for
+parallel dispatch is provided by a `threading.Lock` and a double-checked
+locking pattern (check cache under lock, build outside lock, re-check under
+lock before inserting) so concurrent ephemeral-to-session upgrades are safe.
+
 Logic:
 1. Look up `spec = self._specs[name]` (raise `KeyError` if missing).
-2. For `persistence == "session"`: check `self._instances[name]`.  If
-   present, call `display.reset()` on its `SubAgentDisplay` and return
-   it.  If absent, build and cache.
+2. For `persistence == "session"`: check `self._instances[name]` under
+   lock.  If present, call `agent.reset()` and return it.  If absent,
+   build outside the lock, then re-check under lock before caching.
 3. For `persistence == "ephemeral"`: always build a new `Agent`.
-4. Building an agent:
+4. Building an agent (`_build_agent()`):
    a. Create an `LLMClient` — if `spec.backend` is set, construct a new
-      client pointing at that backend; otherwise reuse
-      `coordinator_llm` (or construct a new one with the same backend
-      but `spec.model`).
+      `OpenAIClient` pointing at that backend (resolving `api_key_env` from
+      the environment); otherwise reuse `coordinator_llm`.
    b. Create a `SubAgentDisplay`.
-   c. Create a fresh `Session` (in-memory only, no file persistence) with
+   c. Create an `InMemorySession` (from `session_manager.py`) with
       `spec.system_message` as the system message.
-   d. Call `build_agent_tool_registry()` (from the design doc's "Tool
-      Registry Isolation" section) to build a scoped `ToolRegistry`.
+   d. Call `build_agent_tool_registry()` to build a scoped `ToolRegistry`.
    e. Return `Agent(spec, session, llm_client, registry, display)`.
 
 **`ai_cli/core/agent.py`** — add `build_agent_tool_registry()`:
@@ -957,11 +977,19 @@ The existing `ToolRegistry.register()` instantiates tool classes with
 pre-built tool instance directly:
 
 ```python
+# In __main__.py — _wire_agents() extracted function
 agent_registry = AgentRegistry(load_agent_specs(config))
 if agent_registry.has_agents:
-    call_agent_tool = CallAgentTool(workspace, permission_manager, agent_registry)
-    tool_registry.register_instance(call_agent_tool)
+    tool_registry.register_instance(CallAgentTool(
+        workspace, permission_manager, agent_registry,
+        config, llm_client, tool_registry,
+    ))
+    # Optionally register parallel tool (see PR 5)
 ```
+
+`_wire_agents()` also validates at startup that all tool names listed in
+agent specs are present in the global registry and logs a warning for each
+unknown tool.
 
 **`ai_cli/core/session_manager.py`** (if needed) — sub-agents need an
 in-memory `Session` that is not persisted to disk.  If the current
@@ -1006,7 +1034,7 @@ to determine which approach is less invasive.
 
 ---
 
-### PR 5 — Parallel Dispatch, Context Overflow, and Polish
+### PR 5 — Parallel Dispatch, Context Overflow, and Polish ✅
 
 **Goal:** Add `CallAgentsParallelTool`, context-overflow detection in
 `Agent.run()`, and any remaining UX polish.
@@ -1048,24 +1076,48 @@ def get_agent_settings(self) -> dict:
 
 #### Context overflow detection
 
-In `Agent.run()`, after processing the `"done"` chunk:
+In `Agent.run()`, the `"done"` chunk handler sets a `context_limit_hit`
+flag and breaks from the stream loop (rather than returning early) so
+that the assistant message can be persisted to the session before the
+method returns.  After message persistence, any tool_calls that were
+emitted in the same turn receive stub error responses (so the session
+history stays consistent and the next LLM call won't see dangling
+tool_calls without responses), and then the method returns:
 
 ```python
 if chunk["type"] == "done":
     usage = chunk.get("usage", {})
-    prompt_tokens = usage.get("prompt_tokens", 0)
+    prompt_tokens = usage.get("prompt_tokens")
     context_window = self._llm.get_model_metadata().get("context_window", 0)
     if (
-        context_window > 0
+        isinstance(context_window, int) and context_window > 0
+        and isinstance(prompt_tokens, int)
         and prompt_tokens / context_window >= self.spec.context_limit_threshold
     ):
-        # Return early — let the caller decide what to do.
-        return AgentResult(
-            text="".join(all_text_parts),
-            status="context_limit",
-            partial=True,
-        )
+        context_limit_msg = f"Context limit reached ({prompt_tokens}/{context_window} tokens)."
+        self._display.show_status(context_limit_msg)
+        context_limit_hit = True
+        break  # persist assistant message first, then return
+
+# ... (after message persistence) ...
+if context_limit_hit:
+    for pending in tool_calls:
+        self._session.add_raw_message({
+            "role": "tool", "tool_call_id": pending["call_id"],
+            "content": json.dumps({"status": "error", "error": "context_limit",
+                "message": "Context limit reached; tool not executed.", "code": 503})
+        })
+    return AgentResult(
+        text="".join(all_text_parts),
+        status="context_limit",
+        partial=True,
+        error_message=context_limit_msg,
+    )
 ```
+
+`AgentResult.error_message` is populated with the human-readable
+`"Context limit reached (x/y tokens)."` string so the coordinator can
+surface it to the user.
 
 This check only fires for sub-agents in practice.  The coordinator's
 threshold is handled by the REPL's existing `_check_compaction()`.

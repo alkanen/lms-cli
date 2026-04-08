@@ -101,12 +101,12 @@ ai-cli/
 │   │   ├── config_manager.py       # ✅ Layered YAML config loading
 │   │   ├── workspace.py            # ✅ Workspace root resolution, file ops, ignore rules
 │   │   ├── permission_manager.py   # ✅ In-memory permission state
-│   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, argument validation
+│   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, argument validation; apply_config(); register_instance(); is_allowed()
 │   │   ├── llm_client.py           # ✅ LLMClient ABC + OpenAIClient (REST/streaming); LMStudio WebSocket 🔲
-│   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist
+│   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist; InMemorySession; SessionProtocol
 │   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
-│   │   ├── agent.py               # 🔲 Agent, AgentSpec, AgentResult, SubAgentDisplay
-│   │   ├── agent_registry.py      # 🔲 AgentSpec loading from config, instance caching
+│   │   ├── agent.py               # ✅ Agent, AgentSpec, AgentResult, BackendConfig, build_agent_tool_registry()
+│   │   ├── agent_registry.py      # ✅ AgentSpec loading from config, lazy instance caching (get_or_create)
 │   │   ├── task_manager.py        # 🔲 Task tree persistence, validation, queries
 │   │   ├── task_orchestrator.py   # 🔲 Deterministic plan→execute→review loop (/plan)
 │   │   ├── embedding_provider.py  # ✅ EmbeddingProvider ABC + OpenAIEmbeddingProvider
@@ -120,7 +120,7 @@ ai-cli/
 │   │   ├── find_files.py           # ✅ Glob-pattern file search with ignore-rule enforcement
 │   │   ├── tool_manager.py         # ✅ Context-saving tool gatekeeper
 │   │   ├── search_files.py         # ✅ search_files tool — semantic search over indexed corpus
-│   │   ├── call_agent.py          # 🔲 CallAgentTool (coordinator → sub-agent dispatch)
+│   │   ├── call_agent.py          # ✅ CallAgentTool, CallAgentsParallelTool (coordinator → sub-agent dispatch)
 │   │   └── tasks.py               # 🔲 Task tools (list, get, create, update, add_note, mark_done)
 │   ├── cli/                        # CLI interface and user-facing components
 │   │   ├── repl.py                 # ✅ REPL loop; all slash commands; keyboard shortcuts; streaming abort
@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1037 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1219 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -146,6 +146,9 @@ ai-cli/
 │   ├── test_display.py
 │   ├── test_completer.py
 │   ├── test_main.py
+│   ├── test_agent.py              # ✅
+│   ├── test_agent_registry.py     # ✅
+│   ├── test_call_agent.py         # ✅
 │   ├── test_chunker.py            # ✅
 │   ├── test_vector_store.py       # ✅
 │   ├── test_embedding_provider.py # ✅
@@ -264,7 +267,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - `@path` inline file reference expansion. `@path` respects ignore rules; `@!path` bypasses them.
      - **Text files**: the `@ref` token is replaced with a `[file: …]\ncontent\n[/file]` block inline; message stays a plain string.
      - **Image files** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) 🔲: the file is base64-encoded and the user message is converted to a content block array (`{"type": "text", …}` + `{"type": "image_url", …}`). `_preprocess_at_references()` returns `str | list[dict]`; the REPL calls `add_raw_message` when the result is a list. The backend adapter is responsible for translating canonical `image_url` blocks to the wire format required by its endpoint (e.g. `input_image` for the OpenAI Responses API). See `docs/technical_requirements.md` — Multimodal Messages.
-   - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`, `/history`.
+   - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`, `/history`, `/agents`, `/rounds`, `/index`.
    - RichDisplay prerequisite REPL changes ✅:
      - Route `{"type": "reasoning", "delta": str}` chunks to `display.stream_reasoning()`.
      - Capture `usage` from `"done"` chunk and call `display.update_usage(usage, context_window)`.
@@ -317,19 +320,22 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 7. **Logging** ✅
    - `logging_utils.py` — JSONL structured logging to `<session_dir>/session.log`. Integrated into `__main__.py`.
 
-### Phase 4: Advanced Features 🔲
+### Phase 4: Advanced Features
 
-1. **Multi-Agent System** 🔲
+1. **Multi-Agent System** ✅
    - See [design_agents.md](design_agents.md) for full design.
-   - `agent.py` — `Agent` class (extracted send→tool→loop from REPL), `AgentSpec`, `AgentResult`, `SubAgentDisplay`.
-   - `agent_registry.py` — loads `AgentSpec` entries from the `agents:` config section, caches session-persistent agent instances.
-   - `call_agent.py` — `CallAgentTool` registered on the coordinator when agents are configured. Dynamically builds its tool description from available agent types.
-   - REPL refactor: extract `_send_rounds()` into `Agent.run()`. The REPL constructs a main `Agent` (the coordinator) and delegates to it. Zero behavioural change when `agents:` is absent or empty.
-   - `SubAgentDisplay` captures output in a buffer; permission prompts default to "no".
-   - Per-agent `ToolRegistry` instances with independent tool sets and permission overrides.
+   - `agent.py` — `Agent` class (send→tool→repeat loop), `AgentSpec`, `AgentResult`, `BackendConfig`, `build_agent_tool_registry()`. `Agent.run()` extracted from what was `REPL._send_rounds()`.
+   - `agent_registry.py` — loads `AgentSpec` entries from the `agents:` config section; lazy `get_or_create()` with double-checked locking for thread-safe parallel dispatch; caches session-persistent agent instances.
+   - `call_agent.py` — `CallAgentTool` registered on the coordinator when agents are configured. Dynamically builds its tool description from available agent types using `is_allowed()` (cheap dict lookup, no schema computation). `CallAgentsParallelTool` runs multiple sub-agents concurrently via `ThreadPoolExecutor`; gated by `agent_settings.allow_parallel: true`; max batch size configurable via `agent_settings.max_parallel_calls` (default 10); rejects duplicate session-persistent agents.
+   - `session_manager.py` — `SessionProtocol` (`@runtime_checkable`) and `InMemorySession` added for sub-agent use (isolated in-memory history with deep-copy isolation).
+   - `tool_registry.py` — `register_instance()` for non-standard constructors (used by `CallAgentTool`/`CallAgentsParallelTool`); `is_allowed(name)` public method (dict-lookup only); `DISALLOWED_BY_DEFAULT` honoured in both `_register()` and `register_instance()`.
+   - `__main__.py` — `_wire_agents()` extracted function: registers `CallAgentTool` (always) and optionally `CallAgentsParallelTool` when `agent_settings.allow_parallel: true`; validates tool names in agent specs at startup and logs warnings for unknown tools.
+   - `SubAgentDisplay` (in `display.py`) captures streaming output in a buffer; permission prompts default to "no"; `reset()` clears buffer and supports agent reuse.
+   - Per-agent `ToolRegistry` instances with independent tool sets and permission overrides (`build_agent_tool_registry()` in `agent.py`).
    - Sequential execution by default (single-GPU constraint). Parallel opt-in via `call_agents_parallel` tool gated by `agent_settings.allow_parallel: true`.
    - Persistence modes: `ephemeral` (fresh context per call) and `session` (context accumulates across calls within the CLI session).
-   - Context overflow: token monitoring → structured `AgentResult(status="context_limit")` → coordinator decides how to proceed.
+   - Context overflow: token monitoring → stream loop breaks (assistant message persisted first) → dangling tool_call stubs injected → `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")` returned → coordinator decides how to proceed.
+   - `/agents` slash command: lists configured agent types with model, persistence, tools, and max_tool_rounds.
 
 2. **Task System** 🔲
    - See [design_task_system.md](design_task_system.md) for full design.
