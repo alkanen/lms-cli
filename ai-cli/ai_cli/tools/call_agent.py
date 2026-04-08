@@ -45,6 +45,9 @@ class CallAgentTool(Tool):
     NAME = "call_agent"
     DESCRIPTION = "Delegate a focused task to a specialised sub-agent."
     PERMISSION_REQUIRED = False
+    # Non-standard constructor: must be registered via ToolRegistry.register_instance(),
+    # not the three-tier file loader.
+    REGISTER_VIA_INSTANCE = True
 
     def __init__(
         self,
@@ -197,6 +200,9 @@ class CallAgentsParallelTool(Tool):
     NAME = "call_agents_parallel"
     DESCRIPTION = "Run multiple sub-agent tasks in parallel and return all results."
     PERMISSION_REQUIRED = False
+    # Non-standard constructor: must be registered via ToolRegistry.register_instance(),
+    # not the three-tier file loader.
+    REGISTER_VIA_INSTANCE = True
 
     def __init__(
         self,
