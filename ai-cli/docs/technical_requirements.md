@@ -368,9 +368,12 @@ technical constraints that affect implementation.
   - A single consumer GPU can process one LLM request at a time.  Sub-agent
     calls block the coordinator until the sub-agent's `Agent.run()` returns.
   - Parallel execution (`call_agents_parallel`) is opt-in via
-    `agent_settings.allow_parallel: true` and uses `asyncio.gather()`.  Only enable
+    `agent_settings.allow_parallel: true` and uses
+    `concurrent.futures.ThreadPoolExecutor` (not `asyncio`).  Only enable
     when the backend supports concurrent requests (e.g. remote API, multiple
-    GPUs).
+    GPUs).  Maximum batch size defaults to 10; configurable via
+    `agent_settings.max_parallel_calls`.  Session-persistent agent types may
+    not appear more than once in a single parallel call (shared state).
 
 - **Agent isolation**:
   - Each agent has its own `Session`, `ToolRegistry`, and `Display` instance.
@@ -383,8 +386,11 @@ technical constraints that affect implementation.
 - **Context overflow**:
   - After each LLM turn, `Agent.run()` checks token usage from the `done`
     chunk against the model's context window.  When usage exceeds
-    `context_limit_threshold` (default 90 %), the loop breaks and returns
-    `AgentResult(status="context_limit", partial=True)`.
+    `context_limit_threshold` (default 90 %), the stream loop breaks (not an
+    early return — the assistant message is persisted first), any dangling
+    tool_calls receive stub error responses so session history stays consistent,
+    and then returns
+    `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")`.
   - No automatic compaction is performed on sub-agent sessions — the
     coordinator receives the partial result and decides whether to retry with
     a fresh ephemeral instance, escalate, or accept the partial result.
@@ -449,9 +455,16 @@ See `design_task_system.md` for the full schema and tool definitions.
   - Test `Agent.run()` with mock `LLMClient` and `ToolRegistry` in isolation.
   - Verify tool registry isolation: tools on different agents are independent
     instances with separate state.
-  - Test context overflow detection (mock a `done` chunk near the threshold).
-  - Test tool round limit enforcement.
+  - Test context overflow detection (mock a `done` chunk at/near the threshold);
+    verify assistant message is persisted before returning, dangling tool_calls
+    get stub responses, and `AgentResult.error_message` is populated.
+  - Test tool round limit enforcement (`status="tool_limit"`).
   - Test `SubAgentDisplay` captures output and denies permission prompts.
+  - Test `CallAgentsParallelTool`: concurrent calls return results in input
+    order; duplicate session-persistent agents rejected; max batch size enforced.
+  - Test `_wire_agents()`: `CallAgentTool` registered when agents present;
+    `CallAgentsParallelTool` registered only when `allow_parallel: true`; startup
+    warnings for unknown tool names in agent specs.
 
 - **Task Tests**:
   - Test `TaskManager` CRUD operations and status transition validation.

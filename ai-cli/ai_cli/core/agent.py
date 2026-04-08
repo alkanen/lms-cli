@@ -457,10 +457,10 @@ def build_agent_tool_registry(
     # spec.tools don't cause redundant registrations or noisy override warnings.
     registered: list[str] = []
     for name in dict.fromkeys(spec.tools):
-        # Sub-agents cannot recursively invoke other agents: CallAgentTool has a
-        # non-standard constructor that the generic register() path cannot satisfy,
-        # so skip it silently rather than emitting a noisy warning each build.
-        if name == "call_agent":
+        # Sub-agents cannot recursively invoke other agents: CallAgentTool and
+        # CallAgentsParallelTool have non-standard constructors that the generic
+        # register() path cannot satisfy, so skip them silently.
+        if name in ("call_agent", "call_agents_parallel"):
             continue
         tool_instance = global_tool_registry.get(name)
         if tool_instance is None:
