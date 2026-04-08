@@ -393,6 +393,8 @@ class ToolRegistry:
             for _attr_name, obj in inspect.getmembers(module, inspect.isclass):
                 if obj is Tool or not issubclass(obj, Tool):
                     continue
+                if getattr(obj, "REGISTER_VIA_INSTANCE", False):
+                    continue
                 error = _validate_tool_class(obj)
                 if error:
                     logger.warning(
@@ -429,6 +431,8 @@ class ToolRegistry:
 
         for _attr_name, obj in inspect.getmembers(module, inspect.isclass):
             if obj is Tool or not issubclass(obj, Tool):
+                continue
+            if getattr(obj, "REGISTER_VIA_INSTANCE", False):
                 continue
             error = _validate_tool_class(obj)
             if error:

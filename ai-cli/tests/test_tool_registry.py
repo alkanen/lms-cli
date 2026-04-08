@@ -1,5 +1,6 @@
 """Tests for ai_cli.core.tool_registry.ToolRegistry."""
 
+import textwrap
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1228,3 +1229,104 @@ class TestSetRegistryHook:
 
         assert reg.get("raising_tool") is not None
         assert any("set_registry" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# REGISTER_VIA_INSTANCE — file loader skip
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterViaInstance:
+    """Tools with REGISTER_VIA_INSTANCE=True must be silently skipped by
+    both the bundled module loader and the directory file loader."""
+
+    def _make_bare_registry(self, tmp_path: Path) -> ToolRegistry:
+        """Return a ToolRegistry with no tools pre-registered."""
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        (tmp_path / ".ai-cli").mkdir(exist_ok=True)
+        config = MagicMock()
+        config.get.return_value = {}
+        config.get_project.return_value = {}
+        pm = MagicMock()
+        return ToolRegistry(workspace, config, pm)
+
+    def test_load_bundled_skips_register_via_instance(self, tmp_path):
+        """_load_bundled must not attempt to instantiate a class marked
+        REGISTER_VIA_INSTANCE=True, even though it passes _validate_tool_class.
+
+        Calls _load_bundled() directly: writes a .py file into a temp directory,
+        pre-populates sys.modules under the expected 'ai_cli.tools.<stem>' key so
+        importlib.import_module returns the fake module, then verifies the tool is
+        not registered and its incompatible __init__ is never called.
+        """
+        import sys
+        import types
+
+        tool_src = textwrap.dedent("""\
+            from typing import Any
+            from ai_cli.tools.base import Tool, ToolSchema
+
+            class NonStandardBundledTool(Tool):
+                NAME = "non_standard_bundled"
+                DESCRIPTION = "Requires extra constructor args."
+                PERMISSION_REQUIRED = False
+                REGISTER_VIA_INSTANCE = True
+
+                def __init__(self, workspace, permission_manager, extra_arg):
+                    raise AssertionError("should never be instantiated by the loader")
+
+                def definition(self):
+                    return ToolSchema(name=self.name, description=self.description)
+
+                def execute(self, **kwargs: Any) -> dict:
+                    return self._ok()
+        """)
+        tool_file = tmp_path / "non_standard_bundled.py"
+        tool_file.write_text(tool_src)
+
+        # Build the fake module and inject it so importlib.import_module finds it
+        # under the name _load_bundled will request.
+        module_name = "ai_cli.tools.non_standard_bundled"
+        fake_module = types.ModuleType(module_name)
+        exec(compile(tool_src, str(tool_file), "exec"), fake_module.__dict__)  # noqa: S102
+        sys.modules[module_name] = fake_module
+
+        try:
+            reg = self._make_bare_registry(tmp_path)
+            reg._load_bundled(tmp_path)  # exercises the real production path
+        finally:
+            sys.modules.pop(module_name, None)
+
+        assert reg.get("non_standard_bundled") is None
+
+    def test_load_from_file_skips_register_via_instance(self, tmp_path):
+        """_load_from_file must not attempt to instantiate a class marked
+        REGISTER_VIA_INSTANCE=True discovered in a user tool file."""
+        tool_src = textwrap.dedent("""\
+            from typing import Any
+            from ai_cli.tools.base import Tool, ToolSchema
+
+            class _NonStandardFileTool(Tool):
+                NAME = "non_standard_file"
+                DESCRIPTION = "Non-standard constructor tool."
+                PERMISSION_REQUIRED = False
+                REGISTER_VIA_INSTANCE = True
+
+                def __init__(self, workspace, permission_manager, extra_arg):
+                    raise AssertionError("should never be instantiated by the loader")
+
+                def definition(self):
+                    return ToolSchema(name=self.name, description=self.description)
+
+                def execute(self, **kwargs: Any) -> dict:
+                    return self._ok()
+        """)
+        tool_file = tmp_path / "non_standard_file_tool.py"
+        tool_file.write_text(tool_src)
+
+        reg = self._make_bare_registry(tmp_path)
+        # Must not raise; tool must not be registered.
+        reg._load_from_file(tool_file, tier="user")
+
+        assert reg.get("non_standard_file") is None
