@@ -94,11 +94,24 @@ _INIT_TEMPLATES: dict[str, str] = {
         #
         #   chunking:
         #     strategy: auto            # "auto" | "fixed" | "semantic"
-        #     chunk_size: 1200          # characters per chunk (fixed/auto)
-        #     chunk_overlap: 200        # character overlap between adjacent chunks
-        #     max_file_chunks: 300      # skip files that would exceed this limit
-        #     min_chunk_chars: 80       # merge tree-sitter nodes smaller than this
-        #     max_chunk_chars: 3000     # split nodes larger than this
+        #
+        #     # ---- shared (all strategies) ----
+        #     min_chunk_chars: 80       # minimum useful chunk size in chars.
+        #                               # fixed/auto: merges a too-small trailing
+        #                               #   chunk into the previous one.
+        #                               # semantic:   merges consecutive short symbol
+        #                               #   nodes (functions, classes, …) together.
+        #
+        #     # ---- fixed/auto strategy only (FixedSizeChunker) ----
+        #     chunk_size: 1200          # target window size in chars; every chunk
+        #                               # aims to be approximately this length
+        #     chunk_overlap: 200        # chars of overlap between adjacent chunks
+        #     max_file_chunks: 300      # skip files that would produce more chunks
+        #                               # than this (not enforced by semantic chunker)
+        #
+        #     # ---- semantic strategy only (TreeSitterChunker) ----
+        #     max_chunk_chars: 3000     # split a single symbol node that is longer
+        #                               # than this at blank-line boundaries
         #
         #   document_embedding:
         #     enabled: true
@@ -117,6 +130,122 @@ _INIT_TEMPLATES: dict[str, str] = {
         #     summary_response_tokens: ~ # word-count hint injected into the summary prompt
         #                               # null = chunk_size // 4; no per-call API cap is
         #                               # added — LLM client max_response_tokens still applies
+        #
+        # ---------------------------------------------------------------------------
+        # Multi-agent system
+        # ---------------------------------------------------------------------------
+        # agent_defaults:              # fallback values for all agents (any key from AgentSpec)
+        #   persistence: ephemeral     # "ephemeral" = fresh context per call
+        #                              # "session"   = context accumulates within the CLI session
+        #   max_response_tokens: 4096
+        #   max_tool_rounds: 10        # max tool-call rounds before returning tool_limit
+        #   context_limit_threshold: 0.90  # fraction of context window that triggers early return
+        #
+        # agent_settings:
+        #   allow_parallel: false      # true = register call_agents_parallel tool
+        #   max_parallel_calls: 10     # max agents per call_agents_parallel invocation
+        #
+        # agents:
+        #   explore:                   # agent type name (used as call_agent's agent_type argument)
+        #     model: llama3.2:3b       # may differ from the coordinator's model
+        #     system_message: |
+        #       You are a focused file-exploration assistant.
+        #       Read and search files to answer the question you are given.
+        #       Report findings concisely. Do not modify any files.
+        #     tools:
+        #       - read_file
+        #       - find_files
+        #     # persistence: ephemeral   # inherits agent_defaults when omitted
+        #     # max_response_tokens: 2048
+        #     # max_tool_rounds: 10
+        #     # context_limit_threshold: 0.90
+        #     # tool_permission_overrides:
+        #     #   write_file: false      # false = skip interactive prompt (pre-vetted by coordinator)
+        #     # backend:                 # omit to inherit the coordinator's backend
+        #     #   base_url: http://localhost:11434/v1
+        #     #   api_key_env: OLLAMA_KEY  # name of env-var holding the API key
+    """),
+    "tools/example_tool.py": textwrap.dedent("""\
+        \"\"\"example_tool — echoes a message a number of times.
+
+        This file is a minimal working example of a project-specific tool.
+        Copy it, rename the class, and adapt definition() and execute() to
+        build your own tool.  The file is picked up automatically from
+        .ai-cli/tools/ — no registration step is needed.
+
+        Two-level visibility model
+        --------------------------
+        DISALLOWED_BY_DEFAULT controls the hard gate (allowed/disallowed):
+
+          True   Tool is invisible to both the AI and tool_manager.
+                 Use /tools allow <name> (or set to False here) to expose it.
+          False  Tool is visible to tool_manager and therefore discoverable by
+                 the AI via a list action.
+
+        DISABLED_BY_DEFAULT controls the soft gate (enabled/disabled), and only
+        applies when DISALLOWED_BY_DEFAULT is False:
+
+          True   Tool appears in tool_manager's list but is not in the AI's
+                 active tool list.  The AI must call tool_manager enable to use
+                 it for a single turn, or the user can run /tools enable <name>.
+          False  Tool is immediately available to the AI without any enable step.
+
+        PERMISSION_REQUIRED = True     The user is prompted to approve each execution.
+        PERMISSION_REQUIRED = False    The tool runs without a confirmation prompt.
+        \"\"\"
+
+        from __future__ import annotations
+
+        from typing import Any
+
+        from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
+
+
+        class ExampleTool(Tool):
+            NAME = "example_tool"
+            DESCRIPTION = "Echo a message back a given number of times."
+
+            # Hidden from tool_manager and the AI entirely.
+            # Change to False to make it visible to tool_manager (discoverable).
+            DISALLOWED_BY_DEFAULT = True
+            # Not in the AI's active tool list even when allowed.
+            # Change to False to make it immediately available once allowed.
+            DISABLED_BY_DEFAULT = True
+            # User must approve each execution.
+            PERMISSION_REQUIRED = True
+
+            def definition(self) -> ToolSchema:
+                return ToolSchema(
+                    name=self.name,
+                    description=self.description,
+                    arguments=[
+                        ToolArgument(
+                            name="message",
+                            description="The message to echo back.",
+                            argument_type="string",
+                            required=True,
+                        ),
+                        ToolArgument(
+                            name="times",
+                            description="How many times to repeat the message.",
+                            argument_type="integer",
+                            required=True,
+                            minimum=1,
+                            maximum=20,
+                        ),
+                    ],
+                )
+
+            def execute(self, **kwargs: Any) -> dict:
+                # Note: permission prompting is handled by ToolRegistry before
+                # execute() is called for any tool with PERMISSION_REQUIRED = True.
+                # Do not call self.request_permission() here — it would produce a
+                # second prompt.  Override execute_log() instead if you want to
+                # customise what appears in the permission prompt.
+                message: str = kwargs["message"]
+                times: int = kwargs["times"]
+
+                return self._ok({"result": " ".join([message] * times)})
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
@@ -170,11 +299,24 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         #
         #   chunking:
         #     strategy: auto            # "auto" | "fixed" | "semantic"
-        #     chunk_size: 1200          # characters per chunk (fixed/auto)
-        #     chunk_overlap: 200        # character overlap between adjacent chunks
-        #     max_file_chunks: 300      # skip files that would exceed this limit
-        #     min_chunk_chars: 80       # merge tree-sitter nodes smaller than this
-        #     max_chunk_chars: 3000     # split nodes larger than this
+        #
+        #     # ---- shared (all strategies) ----
+        #     min_chunk_chars: 80       # minimum useful chunk size in chars.
+        #                               # fixed/auto: merges a too-small trailing
+        #                               #   chunk into the previous one.
+        #                               # semantic:   merges consecutive short symbol
+        #                               #   nodes (functions, classes, …) together.
+        #
+        #     # ---- fixed/auto strategy only (FixedSizeChunker) ----
+        #     chunk_size: 1200          # target window size in chars; every chunk
+        #                               # aims to be approximately this length
+        #     chunk_overlap: 200        # chars of overlap between adjacent chunks
+        #     max_file_chunks: 300      # skip files that would produce more chunks
+        #                               # than this (not enforced by semantic chunker)
+        #
+        #     # ---- semantic strategy only (TreeSitterChunker) ----
+        #     max_chunk_chars: 3000     # split a single symbol node that is longer
+        #                               # than this at blank-line boundaries
         #
         #   document_embedding:
         #     enabled: true
@@ -193,6 +335,40 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
         #     summary_response_tokens: ~ # word-count hint injected into the summary prompt
         #                               # null = chunk_size // 4; no per-call API cap is
         #                               # added — LLM client max_response_tokens still applies
+        #
+        # ---------------------------------------------------------------------------
+        # Multi-agent system
+        # ---------------------------------------------------------------------------
+        # agent_defaults:              # fallback values for all agents (any key from AgentSpec)
+        #   persistence: ephemeral     # "ephemeral" = fresh context per call
+        #                              # "session"   = context accumulates within the CLI session
+        #   max_response_tokens: 4096
+        #   max_tool_rounds: 10        # max tool-call rounds before returning tool_limit
+        #   context_limit_threshold: 0.90  # fraction of context window that triggers early return
+        #
+        # agent_settings:
+        #   allow_parallel: false      # true = register call_agents_parallel tool
+        #   max_parallel_calls: 10     # max agents per call_agents_parallel invocation
+        #
+        # agents:
+        #   explore:                   # agent type name (used as call_agent's agent_type argument)
+        #     model: llama3.2:3b       # may differ from the coordinator's model
+        #     system_message: |
+        #       You are a focused file-exploration assistant.
+        #       Read and search files to answer the question you are given.
+        #       Report findings concisely. Do not modify any files.
+        #     tools:
+        #       - read_file
+        #       - find_files
+        #     # persistence: ephemeral   # inherits agent_defaults when omitted
+        #     # max_response_tokens: 2048
+        #     # max_tool_rounds: 10
+        #     # context_limit_threshold: 0.90
+        #     # tool_permission_overrides:
+        #     #   write_file: false      # false = skip interactive prompt (pre-vetted by coordinator)
+        #     # backend:                 # omit to inherit the coordinator's backend
+        #     #   base_url: http://localhost:11434/v1
+        #     #   api_key_env: OLLAMA_KEY  # name of env-var holding the API key
     """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Default system prompt — applied to all projects unless a
