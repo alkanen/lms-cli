@@ -8,9 +8,11 @@ import pytest
 
 from ai_cli.__main__ import (
     _RESUME_PICK,
+    _is_placeholder_only,
     _pick_session,
     _show_resume_context,
     _wire_agents,
+    load_system_prompt,
 )
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
 from ai_cli.core.agent import AgentSpec
@@ -803,3 +805,119 @@ class TestWireAgentsValidation:
 
         warning_msgs = [str(c) for c in mock_logger.warning.call_args_list]
         assert not any("call_agent" in m for m in warning_msgs)
+
+
+# ---------------------------------------------------------------------------
+# load_system_prompt / _is_placeholder_only
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_PROJECT = """\
+<!-- Project-specific system prompt (optional).
+     Overrides the global default system prompt when present. -->
+"""
+_PLACEHOLDER_GLOBAL = """\
+<!-- Default system prompt — applied to all projects unless a
+     project-level system_prompt.md is present. -->
+"""
+_REAL_PROMPT = "You are a helpful assistant."
+
+
+class TestIsPlaceholderOnly:
+    def test_empty_string_is_placeholder(self):
+        assert _is_placeholder_only("") is True
+
+    def test_whitespace_only_is_placeholder(self):
+        assert _is_placeholder_only("   \n  ") is True
+
+    def test_html_comment_only_is_placeholder(self):
+        assert _is_placeholder_only("<!-- hello -->") is True
+
+    def test_multiline_html_comment_is_placeholder(self):
+        assert _is_placeholder_only(_PLACEHOLDER_PROJECT) is True
+
+    def test_real_content_is_not_placeholder(self):
+        assert _is_placeholder_only(_REAL_PROMPT) is False
+
+    def test_comment_plus_content_is_not_placeholder(self):
+        assert _is_placeholder_only("<!-- intro -->\nBe concise.") is False
+
+
+class TestLoadSystemPrompt:
+    def _make_dirs(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        (root / _DOT_AI_CLI).mkdir()
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        return root, global_dir
+
+    def test_returns_empty_when_no_files_exist(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        assert load_system_prompt(root, global_dir) == ""
+
+    def test_project_prompt_takes_priority(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_text(_REAL_PROMPT)
+        (root / "AGENTS.md").write_text("AGENTS content")
+        (global_dir / "system_prompt.md").write_text("Global content")
+        assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+    def test_agents_md_used_when_project_prompt_missing(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / "AGENTS.md").write_text("AGENTS content")
+        (global_dir / "system_prompt.md").write_text("Global content")
+        assert load_system_prompt(root, global_dir) == "AGENTS content"
+
+    def test_global_prompt_used_as_last_resort(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (global_dir / "system_prompt.md").write_text("Global content")
+        assert load_system_prompt(root, global_dir) == "Global content"
+
+    def test_project_placeholder_skipped(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_text(_PLACEHOLDER_PROJECT)
+        (root / "AGENTS.md").write_text(_REAL_PROMPT)
+        assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+    def test_agents_md_placeholder_skipped(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / "AGENTS.md").write_text("<!-- placeholder -->")
+        (global_dir / "system_prompt.md").write_text(_REAL_PROMPT)
+        assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+    def test_global_placeholder_skipped(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (global_dir / "system_prompt.md").write_text(_PLACEHOLDER_GLOBAL)
+        assert load_system_prompt(root, global_dir) == ""
+
+    def test_all_placeholders_returns_empty(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_text(_PLACEHOLDER_PROJECT)
+        (root / "AGENTS.md").write_text("<!-- x -->")
+        (global_dir / "system_prompt.md").write_text(_PLACEHOLDER_GLOBAL)
+        assert load_system_prompt(root, global_dir) == ""
+
+    def test_oserror_skips_candidate(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (global_dir / "system_prompt.md").write_text(_REAL_PROMPT)
+        # Make project prompt unreadable
+        p = root / _DOT_AI_CLI / "system_prompt.md"
+        p.write_text(_REAL_PROMPT)
+        p.chmod(0o000)
+        try:
+            result = load_system_prompt(root, global_dir)
+        finally:
+            p.chmod(0o644)
+        # Falls through to global
+        assert result == _REAL_PROMPT
+
+    def test_unicode_decode_error_skips_candidate(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_bytes(b"\xff\xfe invalid utf-8")
+        (global_dir / "system_prompt.md").write_text(_REAL_PROMPT)
+        assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+    def test_result_is_stripped(self, tmp_path):
+        root, global_dir = self._make_dirs(tmp_path)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_text(f"\n\n{_REAL_PROMPT}\n\n")
+        assert load_system_prompt(root, global_dir) == _REAL_PROMPT

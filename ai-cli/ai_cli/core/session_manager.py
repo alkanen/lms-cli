@@ -107,6 +107,8 @@ class SessionProtocol(Protocol):
 
     def record_usage(self, prompt_tokens: int) -> None: ...
 
+    def set_system_message(self, message: str) -> None: ...
+
 
 # ---------------------------------------------------------------------------
 # Session — the live conversation handle
@@ -141,6 +143,9 @@ class Session:
         self._current_path = self._dir / "history_current.jsonl"
         # Last API-reported prompt token count; None until the first turn.
         self._last_prompt_tokens: int | None = None
+        # Transient system message prepended to every get_messages() call.
+        # Never written to the JSONL history files.
+        self._system_message: str = ""
 
     # ------------------------------------------------------------------
     # Properties
@@ -159,6 +164,21 @@ class Session:
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
+
+    def set_system_message(self, message: str) -> None:
+        """Set a transient system message prepended to every :meth:`get_messages` call.
+
+        The message is held in memory only — it is never written to the JSONL
+        history files.  This means it is re-applied from the prompt file on
+        every session start rather than being baked into the history.
+
+        Pass an empty string to clear a previously set system message.
+        """
+        if not isinstance(message, str):
+            raise SessionError(
+                f"message must be a string; got {type(message).__name__!r}"
+            )
+        self._system_message = message.strip()
 
     def add_message(self, role: str, content: str) -> None:
         """
@@ -279,6 +299,21 @@ class Session:
             If the history file cannot be opened or read (e.g. permission
             error or non-UTF-8 content).
         """
+        prefix: list[dict] = (
+            [{"role": "system", "content": self._system_message}]
+            if self._system_message
+            else []
+        )
+        return prefix + self._load_history_messages()
+
+    def _load_history_messages(self) -> list[dict]:
+        """Read and return messages from ``history_current.jsonl`` without the transient system message.
+
+        Used internally by :meth:`get_messages` and :meth:`compact`.
+        ``compact`` calls this directly so the transient system prompt is not
+        included in the summarisation input (which wastes tokens and would
+        cause the prompt to be baked into the persisted summary).
+        """
         if not self._current_path.exists():
             return []
         messages: list[dict] = []
@@ -355,7 +390,7 @@ class Session:
             If the LLM call fails or returns an empty summary, or if the
             compacted history cannot be written to disk.
         """
-        messages = self.get_messages()
+        messages = self._load_history_messages()
         if not messages:
             return
 
@@ -776,6 +811,28 @@ class InMemorySession:
     def session_id(self) -> str:
         """Fixed identifier — this session has no on-disk representation."""
         return "in-memory"
+
+    def set_system_message(self, message: str) -> None:
+        """Set or clear the system message at position 0 of the in-memory history.
+
+        An empty string clears any existing system message (consistent with
+        :class:`Session` which omits the prefix when ``_system_message`` is
+        empty).  A non-empty string replaces the existing system message or
+        inserts one at the front.
+        """
+        if not isinstance(message, str):
+            raise SessionError(
+                f"message must be a string; got {type(message).__name__!r}"
+            )
+        stripped = message.strip()
+        has_system = bool(self._messages and self._messages[0].get("role") == "system")
+        if not stripped:
+            if has_system:
+                self._messages.pop(0)
+        elif has_system:
+            self._messages[0] = {"role": "system", "content": stripped}
+        else:
+            self._messages.insert(0, {"role": "system", "content": stripped})
 
     def add_message(self, role: str, content: str) -> None:
         """Append a simple role/content message to the in-memory history."""

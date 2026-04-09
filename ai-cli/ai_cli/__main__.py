@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -372,6 +373,47 @@ def _init_embedding_index(
         print(f"Warning: failed to initialise embedding index — {exc}", file=sys.stderr)
 
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _is_placeholder_only(text: str) -> bool:
+    """Return True if *text* consists only of HTML comments and whitespace."""
+    return not _HTML_COMMENT_RE.sub("", text).strip()
+
+
+def load_system_prompt(workspace_root: Path, global_dir: Path) -> str:
+    """Resolve the system prompt using a three-level lookup.
+
+    Checked in order:
+
+    1. ``<workspace_root>/.ai-cli/system_prompt.md`` — project-level override.
+    2. ``<workspace_root>/AGENTS.md`` — industry-standard convention.
+    3. ``<global_dir>/system_prompt.md`` — user-level default.
+
+    Each candidate is skipped if the file only contains HTML comments and
+    whitespace (placeholder-only), cannot be read, or contains non-UTF-8 bytes.
+
+    Returns an empty string when none of the candidates yield usable content,
+    which causes the system message to be omitted from the request entirely.
+    """
+    candidates: list[Path] = [
+        workspace_root / _DOT_AI_CLI / "system_prompt.md",
+        workspace_root / "AGENTS.md",
+        global_dir / "system_prompt.md",
+    ]
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _is_placeholder_only(text):
+            continue
+        stripped = text.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 def _cmd_repl(
     start: Path,
     global_dir: Path,
@@ -424,6 +466,14 @@ def _cmd_repl(
     except SessionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Resolve and apply the system prompt before the first LLM call.
+    system_prompt = load_system_prompt(root, global_dir)
+    if system_prompt:
+        session.set_system_message(system_prompt)
+        logger.debug("System prompt loaded (%d chars).", len(system_prompt))
+    else:
+        logger.debug("No system prompt found; omitting system message.")
 
     # Set up logging before tool loading so all subsequent activity is captured.
     setup_logging(config, session.session_dir)
