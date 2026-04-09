@@ -646,7 +646,14 @@ via `Agent.run()`.
 
 ```python
 class TaskOrchestrator:
-    """Deterministic plan → execute → review loop for /plan mode."""
+    """Deterministic plan → execute → review loop for /plan mode.
+
+    Note: the sample below calls ``self.agents.has(name)`` and
+    ``self.agents.get(name)``.  ``AgentRegistry`` currently exposes the
+    ``has_agents`` property and ``get_or_create(...)``.  Thin ``has(name)`` /
+    ``get(name)`` convenience wrappers will be added to ``AgentRegistry``
+    in PR 4 to match this interface.
+    """
 
     def __init__(
         self,
@@ -704,7 +711,7 @@ class TaskOrchestrator:
     # Main loop
     # ----------------------------------------------------------------
 
-    async def run(self, goal: str, max_iterations: int = 50) -> None:
+    def run(self, goal: str, max_iterations: int = 50) -> None:
         # Set the goal in the task file (idempotent)
         self.tm.set_goal(goal)
 
@@ -721,13 +728,13 @@ class TaskOrchestrator:
                     self.display.show_status(
                         f"Step {step}: reviewing '{task['name']}'"
                     )
-                    await self._run_reviewer(task)
+                    self._run_reviewer(task)
                     continue
 
             # 2. Planning phase
             if self._needs_planning():
                 self.display.show_status(f"Step {step}: planning")
-                await self._run_planner(goal)
+                self._run_planner(goal)
                 continue
 
             # 3. Execution phase
@@ -747,7 +754,7 @@ class TaskOrchestrator:
             self.display.show_status(
                 f"Step {step}: executing '{task['name']}'"
             )
-            await self._run_executor(task)
+            self._run_executor(task)
 
         self.display.show_status(
             f"Reached iteration limit ({max_iterations}). "
@@ -758,7 +765,7 @@ class TaskOrchestrator:
     # Agent dispatch helpers
     # ----------------------------------------------------------------
 
-    async def _run_planner(self, goal: str) -> None:
+    def _run_planner(self, goal: str) -> None:
         roots = self.tm.list_tasks(parent_id=None)
         blocked = self.tm.find(status="blocked")
         prompt = (
@@ -774,9 +781,9 @@ class TaskOrchestrator:
             "Break the goal into clear, actionable tasks. "
             "Ensure each task has a meaningful Definition of Done."
         )
-        await self.agents.get("planner").run(prompt)
+        self.agents.get("planner").run(prompt)
 
-    async def _run_executor(self, task: dict) -> None:
+    def _run_executor(self, task: dict) -> None:
         detail = self.tm.get_task(task["id"])
         prompt = (
             f"Execute the following task.\n\n"
@@ -791,7 +798,7 @@ class TaskOrchestrator:
             for note in detail["notes"][-5:]:  # last 5 notes to limit size
                 prompt += f"  - {note}\n"
 
-        result = await self.agents.get("executor").run(prompt)
+        result = self.agents.get("executor").run(prompt)
 
         if result.status == "context_limit":
             self.tm.add_note(
@@ -800,7 +807,7 @@ class TaskOrchestrator:
                 f"{result.text[:500]}"
             )
 
-    async def _run_reviewer(self, task: dict) -> None:
+    def _run_reviewer(self, task: dict) -> None:
         detail = self.tm.get_task(task["id"])
         prompt = (
             f"Review the following task.\n\n"
@@ -815,7 +822,7 @@ class TaskOrchestrator:
             "If yes, mark the task as done. "
             "If not, set it back to in_progress with a note explaining what is missing."
         )
-        await self.agents.get("reviewer").run(prompt)
+        self.agents.get("reviewer").run(prompt)
 
     # ----------------------------------------------------------------
 
@@ -1142,3 +1149,137 @@ changes are:
   not as bespoke classes.
 - Hardware constraints (single GPU, 90K–262K context) are explicitly
   accounted for in design decisions.
+
+---
+
+## Implementation Plan
+
+Four PRs, each independently reviewable and mergeable.  Later PRs depend on
+earlier ones but no PR mixes concerns across the boundary below.
+
+### PR 1 — `TaskManager` (zero wiring risk)
+
+**Files:** `ai_cli/core/task_manager.py` (new), `tests/test_task_manager.py` (new)
+
+**Scope:** Pure data layer.  No REPL changes, no tool registration, no agent
+integration — just the class that owns `tasks.json`.
+
+`TaskManager` implements:
+
+- `__init__(session_dir: Path)` — resolves `tasks.json` path; does not create
+  the file until first write.
+- `set_goal(goal: str)` — writes or updates the top-level `goal` field.
+- `get_goal() -> str | None`
+- `create_task(name, definition_of_done, description="", parent_id=None, priority="medium") -> dict` — generates a `task_<random6>` ID, validates DoD ≥ 5 chars, appends to `subtask_ids` of parent if given, persists, returns `task_detail`.
+- `get_task(task_id) -> dict` — returns `task_detail` (full record + subtask summaries).
+- `list_tasks(parent_id=None) -> list[dict]` — returns `task_summary` list for
+  direct children of `parent_id` (or root tasks if `None`).
+- `update_task(task_id, **fields) -> dict` — updates allowed fields, enforces
+  that `"done"` cannot be set via this method, persists, returns `task_detail`.
+- `add_note(task_id, note: str) -> dict` — prepends ISO timestamp, appends to
+  `notes`, persists, returns `task_detail`.
+- `mark_done(task_id) -> dict` — validates all subtasks done and DoD ≥ 5 chars;
+  raises `TaskValidationError` on failure. Tool wrappers translate that into canonical error responses.
+- `find(status: str) -> list[dict]` — returns `task_summary` list filtered by
+  status.  Used by the orchestrator to find blocked/in_review tasks.
+- `find_incomplete() -> list[dict]` — returns all tasks not in `done` status.
+- `all_tasks() -> list[dict]` — returns all tasks as full records (used by
+  `_pick_next_task()`).
+
+**Tests** cover: create/get/list round-trip; DoD validation at create and
+mark_done; subtask completion gate; status transition guards; add_note
+timestamp format; find/find_incomplete filtering; file not created until first
+write; concurrent-write safety is out of scope (single-process CLI).
+
+---
+
+### PR 2 — Task Tools (low risk)
+
+**Files:** `ai_cli/tools/tasks.py` (new), `tests/test_tasks_tools.py` (new)
+
+**Scope:** Six `Tool` subclasses that wrap `TaskManager`.  No REPL changes.
+The tools are not wired into any registry in this PR — they exist and are
+tested in isolation.
+
+Each tool class:
+
+| Class | `NAME` | Arguments | Returns |
+|---|---|---|---|
+| `TasksListTool` | `tasks_list` | `parent_id?` | `{"tasks": [task_summary, ...]}` |
+| `TasksGetTool` | `tasks_get` | `task_id` | `{"task": task_detail}` |
+| `TasksCreateTool` | `tasks_create` | `name`, `definition_of_done`, `description?`, `parent_id?`, `priority?` | `{"task": task_detail}` |
+| `TasksUpdateTool` | `tasks_update` | `task_id`, optional fields (no `"done"` in status enum) | `{"task": task_detail}` |
+| `TasksAddNoteTool` | `tasks_add_note` | `task_id`, `note` | `{"task": task_detail}` |
+| `TasksMarkDoneTool` | `tasks_mark_done` | `task_id` | `{"task": task_detail}` |
+
+All six classes live in one file and share a `TaskManager` instance passed to
+`__init__`.  They have non-standard constructors and must use
+`REGISTER_VIA_INSTANCE = True` so the three-tier file loader skips them.
+They are wired in PR 3.
+
+**Tests** cover: argument validation; each tool delegates correctly to
+`TaskManager`; error paths (unknown task_id, DoD too short, subtask not done)
+produce canonical error responses.
+
+---
+
+### PR 3 — Wire tools into REPL + slash commands (medium risk, touches existing files)
+
+**Files:** `ai_cli/__main__.py`, `ai_cli/core/repl.py`, `ai_cli/core/display.py`
+
+**Scope:** Makes the task tools available in a running session and adds the
+`/tasks` and `/tasks-clear` slash commands.  No orchestrator yet.
+
+Changes:
+
+- `__main__.py` — instantiate `TaskManager(session_dir)` after session is
+  resolved; instantiate all six task tool objects; register them via
+  `tool_registry.register_instance()` on both the coordinator registry and any
+  per-agent registries that list task tool names in their spec.
+
+- `repl.py` — add slash command handlers:
+  - `/tasks` → `display.show_task_tree(tm.list_tasks())`
+  - `/tasks <task_id>` → `display.show_task_detail(tm.get_task(task_id))`
+  - `/tasks --all` → `display.show_task_tree(tm.all_tasks(), indent=True)`
+  - `/tasks-clear` → confirm prompt → `tm.clear()` (already implemented in PR 1; PR 3 only wires the REPL command and confirmation prompt).
+
+- `display.py` — add two display methods:
+  - `show_task_tree(tasks, indent=False)` — renders a Rich table or indented tree of `task_summary` objects; columns: ID, name, status (coloured), priority, subtasks indicator.
+  - `show_task_detail(task)` — renders a Rich panel with all fields; notes shown newest-first (last 10); subtasks as a mini-table.
+
+**Tests** — integration test that wires a `TaskManager` to the tool instances,
+calls each tool's `execute()`, and verifies output shape.  Display methods are
+tested visually / not unit-tested.
+
+---
+
+### PR 4 — `TaskOrchestrator` + `/plan` command (medium risk, new file + REPL change)
+
+**Files:** `ai_cli/core/task_orchestrator.py` (new), `ai_cli/core/repl.py`
+
+**Scope:** Autonomous orchestration loop and the `/plan` slash command.  Builds
+on all three prior PRs.
+
+`TaskOrchestrator.__init__(task_manager, agent_registry, display)` — no LLM
+client; routing is pure Python.
+
+`TaskOrchestrator.run(goal, max_iterations=50)` — synchronous (matches
+`Agent.run()`); the full loop as specified in the Autonomous Orchestrator
+section above.  Key implementation notes:
+
+- Context overflow handling: after `result.status == "context_limit"`, call
+  `agent_registry.reset("executor")` (adds a `reset()` method to
+  `AgentRegistry` that clears cached session state for a named agent) and
+  increment a per-task counter; after 3 consecutive context limits on the same
+  task, `task_manager.update_task(task_id, status="blocked", blockers=[...])`.
+- Ctrl+C: `signal.signal(SIGINT, handler)` sets `self._interrupted = True`;
+  the loop checks it at the top of each iteration.
+
+`repl.py` changes:
+- `/plan [goal]` — instantiate or reuse `TaskOrchestrator`; call `orchestrator.run(goal or tm.get_goal())`.
+- Argument-less `/plan` resumes using the stored goal; errors clearly if no goal is set and none is provided.
+
+**Tests** cover: `_needs_planning()` logic; `_pick_next_task()` ordering
+(in_progress before not_started, high before low, created_at tie-breaker);
+context limit counter and blocked transition; iteration limit exit; interrupt
+flag exit.  Agent calls are mocked via a fake `AgentRegistry`.
