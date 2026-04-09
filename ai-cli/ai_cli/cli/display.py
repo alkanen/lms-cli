@@ -229,6 +229,39 @@ class Display(ABC):
         override this to render a table.
         """
 
+    def show_tasks_simple(self, tasks: list[dict]) -> None:  # noqa: B027
+        """Render a compact list of unfinished root tasks (for bare ``/tasks``).
+
+        Each dict has keys: ``id``, ``name``, ``status``, ``priority``,
+        ``description``, ``subtask_count``, ``done_subtask_count``.
+        Default: no-op.
+        """
+
+    def show_tasks_list(self, tasks: list[dict]) -> None:  # noqa: B027
+        """Render a detailed list of tasks (``/tasks list [path]``).
+
+        Same shape as :meth:`show_tasks_simple`.
+        Default: no-op.
+        """
+
+    def show_tasks_tree(self, nodes: list[dict], depth: int) -> None:  # noqa: B027
+        """Render the task hierarchy as a tree (``/tasks tree [path]``).
+
+        Each node dict has keys: ``id``, ``name``, ``status``, ``priority``,
+        ``description``, ``subtask_count``, ``done_subtask_count``,
+        ``children`` (list of child nodes or ``None`` if depth limit reached).
+        *depth* is the configured/requested max depth.
+        Default: no-op.
+        """
+
+    def show_task_info(self, task: dict) -> None:  # noqa: B027
+        """Render full detail for a single task (``/tasks info <path>``).
+
+        *task* is the ``task_detail`` dict returned by ``TaskManager.get_task()``
+        / ``find_by_path()``.
+        Default: no-op.
+        """
+
     # ------------------------------------------------------------------
     # Interactive prompts
     # ------------------------------------------------------------------
@@ -491,6 +524,80 @@ class PlainDisplay(Display):
                 f"persistence={row['persistence']}  "
                 f"max_rounds={row['max_tool_rounds']}  tools={tools_str}"
             )
+
+    def show_tasks_simple(self, tasks: list[dict]) -> None:
+        if not tasks:
+            print("No unfinished tasks.")
+            return
+        print()
+        for t in tasks:
+            done = t.get("done_subtask_count", 0)
+            total = t.get("subtask_count", 0)
+            sub = f"  [{done}/{total} subtasks done]" if total else ""
+            print(f"  [{t['status']}] {t['name']}  ({t['priority']}){sub}")
+            if t.get("description"):
+                print(f"    {t['description']}")
+
+    def show_tasks_list(self, tasks: list[dict]) -> None:
+        if not tasks:
+            print("No tasks.")
+            return
+        print()
+        for t in tasks:
+            done = t.get("done_subtask_count", 0)
+            total = t.get("subtask_count", 0)
+            sub = f"  [{done}/{total}]" if total else ""
+            print(f"  [{t['status']}] {t['name']}  ({t['priority']}){sub}")
+            if t.get("description"):
+                print(f"    {t['description']}")
+
+    def show_tasks_tree(self, nodes: list[dict], depth: int) -> None:
+        if not nodes:
+            print("No tasks.")
+            return
+
+        def _render(node: dict, prefix: str, is_last: bool) -> None:
+            connector = "└── " if is_last else "├── "
+            done = node.get("done_subtask_count", 0)
+            total = node.get("subtask_count", 0)
+            sub = f" [{done}/{total}]" if total else ""
+            print(f"{prefix}{connector}[{node['status']}] {node['name']}{sub}")
+            children = node.get("children")
+            if children is None:
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                print(f"{child_prefix}└── …")
+            elif children:
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                for i, child in enumerate(children):
+                    _render(child, child_prefix, i == len(children) - 1)
+
+        print()
+        for i, node in enumerate(nodes):
+            _render(node, "", i == len(nodes) - 1)
+
+    def show_task_info(self, task: dict) -> None:
+        print(f"\nTask: {task['name']}  [{task['status']}]  ({task['priority']})")
+        if task.get("description"):
+            print(f"Description:  {task['description']}")
+        if task.get("definition_of_done"):
+            print(f"DoD:          {task['definition_of_done']}")
+        if task.get("next_action"):
+            print(f"Next action:  {task['next_action']}")
+        blockers = task.get("blockers", [])
+        if blockers:
+            print("Blockers:")
+            for b in blockers:
+                print(f"  - {b}")
+        subtasks = task.get("subtasks", [])
+        if subtasks:
+            print("Subtasks:")
+            for s in subtasks:
+                print(f"  [{s['status']}] {s['name']}  ({s['priority']})")
+        notes = task.get("notes", [])
+        if notes:
+            print("Notes:")
+            for n in notes:
+                print(f"  {n}")
 
     def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
         if not sessions:
@@ -874,6 +981,131 @@ class RichDisplay(Display):
         self._console.print("\nConfigured agent types:")
         self._console.print(table)
 
+    def show_tasks_simple(self, tasks: list[dict]) -> None:
+        if not tasks:
+            self._console.print("No unfinished tasks.")
+            return
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("status", style="dim")
+        table.add_column("name", style="bold")
+        table.add_column("priority", style="dim")
+        table.add_column("progress", style="dim")
+        table.add_column("description")
+        for t in tasks:
+            done = t.get("done_subtask_count", 0)
+            total = t.get("subtask_count", 0)
+            sub = f"{done}/{total}" if total else ""
+            table.add_row(
+                f"[{t['status']}]",
+                t["name"],
+                t["priority"],
+                sub,
+                t.get("description", ""),
+            )
+        self._console.print()
+        self._console.print(table)
+
+    def show_tasks_list(self, tasks: list[dict]) -> None:
+        if not tasks:
+            self._console.print("No tasks.")
+            return
+        table = Table(show_header=True)
+        table.add_column("Status")
+        table.add_column("Name", style="bold")
+        table.add_column("Priority")
+        table.add_column("Progress", justify="right")
+        table.add_column("Description")
+        for t in tasks:
+            done = t.get("done_subtask_count", 0)
+            total = t.get("subtask_count", 0)
+            sub = f"{done}/{total}" if total else ""
+            table.add_row(
+                t["status"],
+                t["name"],
+                t["priority"],
+                sub,
+                t.get("description", ""),
+            )
+        self._console.print()
+        self._console.print(table)
+
+    def show_tasks_tree(self, nodes: list[dict], depth: int) -> None:
+        from rich.tree import Tree
+
+        if not nodes:
+            self._console.print("No tasks.")
+            return
+
+        def _add_children(tree: Tree, children: list[dict] | None) -> None:
+            if children is None:
+                tree.add(Text("…", style="dim"))
+                return
+            for child in children:
+                done = child.get("done_subtask_count", 0)
+                total = child.get("subtask_count", 0)
+                sub = f" [{done}/{total}]" if total else ""
+                label = Text()
+                label.append(f"[{child['status']}] ", style="dim")
+                label.append(child["name"], style="bold")
+                label.append(f"  ({child['priority']}){sub}", style="dim")
+                branch = tree.add(label)
+                _add_children(branch, child.get("children"))
+
+        root_tree = Tree("Tasks")
+        for node in nodes:
+            done = node.get("done_subtask_count", 0)
+            total = node.get("subtask_count", 0)
+            sub = f" [{done}/{total}]" if total else ""
+            label = Text()
+            label.append(f"[{node['status']}] ", style="dim")
+            label.append(node["name"], style="bold")
+            label.append(f"  ({node['priority']}){sub}", style="dim")
+            branch = root_tree.add(label)
+            _add_children(branch, node.get("children"))
+        self._console.print()
+        self._console.print(root_tree)
+
+    def show_task_info(self, task: dict) -> None:
+        header = Text("\n")
+        header.append(task["name"], style="bold")
+        header.append("  ")
+        header.append(f"[{task['status']}]  ({task['priority']})", style="dim")
+        self._console.print(header)
+        if task.get("description"):
+            line = Text()
+            line.append("Description:", style="bold")
+            line.append(f"  {task['description']}")
+            self._console.print(line)
+        if task.get("definition_of_done"):
+            line = Text()
+            line.append("DoD:", style="bold")
+            line.append(f"          {task['definition_of_done']}")
+            self._console.print(line)
+        if task.get("next_action"):
+            line = Text()
+            line.append("Next action:", style="bold")
+            line.append(f"  {task['next_action']}")
+            self._console.print(line)
+        blockers = task.get("blockers", [])
+        if blockers:
+            self._console.print(Text("Blockers:", style="bold"))
+            for b in blockers:
+                self._console.print(f"  \u2022 {b}")
+        subtasks = task.get("subtasks", [])
+        if subtasks:
+            self._console.print(Text("Subtasks:", style="bold"))
+            for s in subtasks:
+                subtask = Text()
+                subtask.append(f"  [{s['status']}] ")
+                subtask.append(s["name"])
+                subtask.append(f"  ({s['priority']})")
+                self._console.print(subtask)
+        notes = task.get("notes", [])
+        if notes:
+            self._console.print(Text("Notes:", style="bold"))
+            for n in notes:
+                self._console.print(f"  {n}")
+
     def show_tool_info(self, tool_info: dict) -> None:
         name = tool_info.get("name", "")
         self._console.print(f"\nTool: {name}", style="bold")
@@ -1100,6 +1332,18 @@ class SubAgentDisplay(Display):
         pass
 
     def show_agents(self, rows: list[dict]) -> None:
+        pass
+
+    def show_tasks_simple(self, tasks: list[dict]) -> None:
+        pass
+
+    def show_tasks_list(self, tasks: list[dict]) -> None:
+        pass
+
+    def show_tasks_tree(self, nodes: list[dict], depth: int) -> None:
+        pass
+
+    def show_task_info(self, task: dict) -> None:
         pass
 
     # -- Interactive prompts -----------------------------------------------

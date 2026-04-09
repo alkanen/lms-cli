@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import string
 import tempfile
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 _MIN_DOD_CHARS = 5
 _ID_CHARS = string.ascii_lowercase + string.digits
 _ID_LENGTH = 6
+_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _generate_id() -> str:
@@ -66,7 +68,7 @@ class TaskValidationError(ValueError):
     """Raised when a task operation violates a business rule."""
 
 
-class TaskNotFoundError(KeyError):
+class TaskNotFoundError(LookupError):
     """Raised when a referenced task_id does not exist."""
 
 
@@ -300,8 +302,19 @@ class TaskManager:
         if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
             raise TaskStorageError(f"Task {task_id!r} has a corrupted 'notes' field.")
 
+        parent_id = task.get("parent_id")
+        if parent_id is not None and not isinstance(parent_id, str):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'parent_id' field."
+            )
+        if parent_id is not None and parent_id not in data["tasks"]:
+            raise TaskStorageError(
+                f"Task {task_id!r} references a missing parent task: {parent_id!r}"
+            )
+
         return {
             "id": task_id,
+            "parent_id": parent_id,
             "name": task["name"],
             "description": task.get("description", ""),
             "definition_of_done": task.get("definition_of_done", ""),
@@ -347,6 +360,11 @@ class TaskManager:
         """Create a new task and return its ``task_detail``."""
         if not isinstance(name, str) or not name.strip():
             raise TaskValidationError("'name' must be a non-empty string.")
+        name = name.strip()
+        if not _NAME_RE.match(name):
+            raise TaskValidationError(
+                "'name' must contain only letters, digits, and underscores."
+            )
         if not isinstance(description, str):
             raise TaskValidationError("'description' must be a string.")
         if (
@@ -368,6 +386,26 @@ class TaskManager:
                 raise TaskValidationError("'parent_id' must be a string or None.")
             if parent_id not in data["tasks"]:
                 raise TaskNotFoundError(f"Parent task not found: {parent_id!r}")
+
+        # Enforce sibling-scoped name uniqueness.
+        sibling_names: set[str] = set()
+        for t in data["tasks"].values():
+            if not isinstance(t, dict):
+                raise TaskStorageError(
+                    "Malformed task store: each task record must be a JSON object."
+                )
+            if t.get("parent_id") != parent_id:
+                continue
+            sibling_name = t.get("name")
+            if not isinstance(sibling_name, str):
+                raise TaskStorageError(
+                    "Malformed task record in storage: sibling task is missing a valid 'name'."
+                )
+            sibling_names.add(sibling_name)
+        if name in sibling_names:
+            raise TaskValidationError(
+                f"A task named {name!r} already exists under this parent."
+            )
 
         # Generate a unique ID (collision is astronomically unlikely but guard anyway).
         for _ in range(10):
@@ -461,6 +499,35 @@ class TaskManager:
             not isinstance(fields["name"], str) or not fields["name"].strip()
         ):
             raise TaskValidationError("'name' must be a non-empty string.")
+        if "name" in fields and isinstance(fields["name"], str):
+            new_name = fields["name"].strip()
+            if not _NAME_RE.match(new_name):
+                raise TaskValidationError(
+                    "'name' must contain only letters, digits, and underscores."
+                )
+            parent_id = task.get("parent_id")
+            sibling_names_upd: set[str] = set()
+            for tid, t in data["tasks"].items():
+                if tid == task_id:
+                    continue
+                if not isinstance(t, dict):
+                    raise TaskStorageError(
+                        f"Stored task {tid!r} is malformed: expected object."
+                    )
+                if t.get("parent_id") != parent_id:
+                    continue
+                sibling_name = t.get("name")
+                if not isinstance(sibling_name, str) or not sibling_name.strip():
+                    raise TaskStorageError(
+                        f"Stored task {tid!r} is malformed: missing valid 'name'."
+                    )
+                sibling_names_upd.add(sibling_name)
+            if new_name in sibling_names_upd:
+                raise TaskValidationError(
+                    f"A task named {new_name!r} already exists under this parent."
+                )
+            fields = dict(fields)
+            fields["name"] = new_name
 
         for str_field in ("description", "next_action"):
             if str_field in fields and not isinstance(fields[str_field], str):
@@ -603,6 +670,38 @@ class TaskManager:
         )
         return results
 
+    def list_task_details(self, parent_id: str | None = None) -> list[dict]:
+        """Return full ``task_detail`` dicts for direct children of *parent_id*.
+
+        Like :meth:`list_tasks` but loads the store only once and returns
+        full detail rather than lightweight summaries.  Sorted by created_at
+        ascending, then id.
+        """
+        data = self._load()
+        results = []
+        for raw in data["tasks"].values():
+            task = self._validate_task_record(raw)
+            if task.get("parent_id") == parent_id:
+                results.append(self._task_detail(data, task))
+        results.sort(
+            key=lambda t: (
+                str(data["tasks"][t["id"]].get("created_at") or ""),
+                t["id"],
+            )
+        )
+        return results
+
+    def get_all_task_details_map(self) -> dict[str, dict]:
+        """Return a ``{task_id: task_detail}`` mapping for all tasks in one load.
+
+        Useful for building display trees without N+1 disk reads.
+        """
+        data = self._load()
+        return {
+            task_id: self._task_detail(data, self._validate_task_record(raw))
+            for task_id, raw in data["tasks"].items()
+        }
+
     def all_tasks(self) -> list[dict]:
         """Return all tasks as full task records (not summaries).
 
@@ -616,6 +715,146 @@ class TaskManager:
         for raw in data["tasks"].values():
             tasks.append(dict(self._validate_task_record(raw)))
         return tasks
+
+    # ------------------------------------------------------------------
+    # Path addressing
+    # ------------------------------------------------------------------
+
+    def find_by_path(self, path: str) -> dict:
+        """Resolve a dot-separated name path to a full ``task_detail``.
+
+        Each segment is validated against ``_NAME_RE``.  Raises
+        :exc:`TaskValidationError` for invalid segments and
+        :exc:`TaskNotFoundError` if any segment is not found.
+        """
+        if not isinstance(path, str) or not path.strip():
+            raise TaskValidationError("'path' must be a non-empty string.")
+        segments = path.strip().split(".")
+        for seg in segments:
+            if not _NAME_RE.match(seg):
+                raise TaskValidationError(
+                    f"Invalid path segment {seg!r}: must match ^[A-Za-z0-9_]+$."
+                )
+        data = self._load()
+        tasks = data["tasks"]
+        # Validate every record up-front so malformed entries always raise TaskStorageError
+        # rather than silently appearing as TaskNotFoundError.
+        for t in tasks.values():
+            self._validate_task_record(t)  # raises TaskStorageError if malformed
+            pid = t.get("parent_id")
+            if pid is not None:
+                if not isinstance(pid, str):
+                    raise TaskStorageError(
+                        f"Task {t.get('id')!r} has a corrupted 'parent_id' field."
+                    )
+                if pid not in tasks:
+                    raise TaskStorageError(
+                        f"Task {t.get('id')!r} references missing parent {pid!r}."
+                    )
+        current_parent_id: str | None = None
+        found: dict | None = None
+        for seg in segments:
+            found = None
+            for t in tasks.values():
+                if t.get("parent_id") == current_parent_id and t["name"] == seg:
+                    found = t
+                    break
+            if found is None:
+                raise TaskNotFoundError(f"Task not found at path segment {seg!r}")
+            current_parent_id = found["id"]
+        assert found is not None  # guaranteed by loop above (segments is non-empty)
+        return self._task_detail(data, found)
+
+    def delete_task(self, task_id: str) -> None:
+        """Delete *task_id* and all its descendants.
+
+        Removes the task from its parent's ``subtask_ids`` and saves atomically.
+        """
+        data = self._load()
+        task = self._get_or_raise(data, task_id)
+
+        # Collect all descendant IDs, guarding against cycles and corrupted subtask_ids.
+        ids_to_delete: list[str] = []
+        visited: set[str] = set()
+        stack = [task_id]
+        while stack:
+            tid = stack.pop()
+            if tid in visited:
+                continue
+            visited.add(tid)
+            ids_to_delete.append(tid)
+            t = data["tasks"].get(tid)
+            if t is None:
+                continue
+            if not isinstance(t, dict):
+                raise TaskStorageError(
+                    f"Corrupted task store: record {tid!r} is not a JSON object."
+                )
+            raw_subtask_ids = t.get("subtask_ids", [])
+            if not isinstance(raw_subtask_ids, list) or not all(
+                isinstance(s, str) for s in raw_subtask_ids
+            ):
+                raise TaskStorageError(
+                    f"Task {tid!r} has a corrupted 'subtask_ids' field."
+                )
+            stack.extend(s for s in raw_subtask_ids if s not in visited)
+
+        # Cross-check parent_id links using a full BFS so orphaned descendants at
+        # any depth are caught, regardless of dict iteration order or subtask_ids
+        # corruption.  Build a parent->children index first, then traverse from
+        # every already-queued ID.
+        ids_to_delete_set = set(ids_to_delete)
+        children_by_parent: dict[str, list[str]] = {}
+        for tid, t in data["tasks"].items():
+            if not isinstance(t, dict):
+                continue
+            pid = t.get("parent_id")
+            if isinstance(pid, str):
+                children_by_parent.setdefault(pid, []).append(tid)
+
+        parent_stack = list(ids_to_delete)
+        while parent_stack:
+            pid = parent_stack.pop()
+            for child_id in children_by_parent.get(pid, []):
+                if child_id in ids_to_delete_set:
+                    continue
+                ids_to_delete.append(child_id)
+                ids_to_delete_set.add(child_id)
+                parent_stack.append(child_id)
+
+        # Remove the root task from its parent's subtask_ids list.
+        parent_id = task.get("parent_id")
+        if parent_id is not None and not isinstance(parent_id, str):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'parent_id' field."
+            )
+        if parent_id is not None and parent_id not in data["tasks"]:
+            raise TaskStorageError(
+                f"Corrupted task store: parent task {parent_id!r} referenced by"
+                f" {task_id!r} is missing."
+            )
+        if parent_id is not None and parent_id in data["tasks"]:
+            parent = data["tasks"][parent_id]
+            if not isinstance(parent, dict):
+                raise TaskStorageError(
+                    f"Corrupted task store: parent record {parent_id!r} is not a JSON object."
+                )
+            subtask_ids = parent.get("subtask_ids", [])
+            if not isinstance(subtask_ids, list) or not all(
+                isinstance(s, str) for s in subtask_ids
+            ):
+                raise TaskStorageError(
+                    f"Task {parent_id!r} has a corrupted 'subtask_ids' field."
+                )
+            new_subtask_ids = [s for s in subtask_ids if s != task_id]
+            if new_subtask_ids != subtask_ids:
+                parent["subtask_ids"] = new_subtask_ids
+                parent["updated_at"] = self._now_iso()
+
+        for tid in ids_to_delete:
+            data["tasks"].pop(tid, None)
+
+        self._save(data)
 
     # ------------------------------------------------------------------
     # Lifecycle

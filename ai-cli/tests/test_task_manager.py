@@ -130,8 +130,8 @@ class TestGoal:
 class TestCreateTask:
     def test_basic_create_returns_task_detail(self, tmp_path):
         tm = _make_tm(tmp_path)
-        detail = tm.create_task(name="Write tests", definition_of_done="All tests pass")
-        assert detail["name"] == "Write tests"
+        detail = tm.create_task(name="Write_tests", definition_of_done="All tests pass")
+        assert detail["name"] == "Write_tests"
         assert detail["definition_of_done"] == "All tests pass"
         assert detail["status"] == "not_started"
         assert detail["priority"] == "medium"
@@ -636,3 +636,369 @@ class TestQueries:
         fetched["blockers"].append("injected")
         # Re-fetch should be unaffected
         assert tm.get_task(detail["id"])["blockers"] == ["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Name validation
+# ---------------------------------------------------------------------------
+
+
+class TestNameValidation:
+    def test_valid_name_alphanumeric(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="abc123", definition_of_done="DoD here")
+        assert t["name"] == "abc123"
+
+    def test_valid_name_with_underscore(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="my_task_1", definition_of_done="DoD here")
+        assert t["name"] == "my_task_1"
+
+    def test_name_with_space_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskValidationError, match="underscores"):
+            tm.create_task(name="has space", definition_of_done="DoD here")
+
+    def test_name_with_dot_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskValidationError, match="underscores"):
+            tm.create_task(name="a.b", definition_of_done="DoD here")
+
+    def test_name_with_hyphen_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskValidationError, match="underscores"):
+            tm.create_task(name="a-b", definition_of_done="DoD here")
+
+    def test_update_name_invalid_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        with pytest.raises(TaskValidationError, match="underscores"):
+            tm.update_task(t["id"], name="bad name")
+
+    def test_update_name_valid(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        updated = tm.update_task(t["id"], name="New_Name")
+        assert updated["name"] == "New_Name"
+
+
+# ---------------------------------------------------------------------------
+# Sibling-scoped name uniqueness
+# ---------------------------------------------------------------------------
+
+
+class TestSiblingUniqueness:
+    def test_duplicate_root_name_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        tm.create_task(name="Alpha", definition_of_done="DoD A")
+        with pytest.raises(TaskValidationError, match="already exists"):
+            tm.create_task(name="Alpha", definition_of_done="DoD B")
+
+    def test_same_name_under_different_parents_allowed(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        p1 = tm.create_task(name="Parent1", definition_of_done="DoD P1")
+        p2 = tm.create_task(name="Parent2", definition_of_done="DoD P2")
+        c1 = tm.create_task(
+            name="Child", definition_of_done="DoD C1", parent_id=p1["id"]
+        )
+        c2 = tm.create_task(
+            name="Child", definition_of_done="DoD C2", parent_id=p2["id"]
+        )
+        assert c1["name"] == "Child"
+        assert c2["name"] == "Child"
+
+    def test_duplicate_child_name_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD P")
+        tm.create_task(name="Sub", definition_of_done="DoD S1", parent_id=parent["id"])
+        with pytest.raises(TaskValidationError, match="already exists"):
+            tm.create_task(
+                name="Sub", definition_of_done="DoD S2", parent_id=parent["id"]
+            )
+
+    def test_rename_to_existing_sibling_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        tm.create_task(name="Alpha", definition_of_done="DoD A")
+        b = tm.create_task(name="Beta", definition_of_done="DoD B")
+        with pytest.raises(TaskValidationError, match="already exists"):
+            tm.update_task(b["id"], name="Alpha")
+
+    def test_rename_to_own_name_is_noop(self, tmp_path):
+        # Renaming to the same name should succeed (it is excluded from sibling check).
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Alpha", definition_of_done="DoD A")
+        updated = tm.update_task(t["id"], name="Alpha")
+        assert updated["name"] == "Alpha"
+
+
+# ---------------------------------------------------------------------------
+# find_by_path
+# ---------------------------------------------------------------------------
+
+
+class TestFindByPath:
+    def test_single_segment(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Root", definition_of_done="DoD R")
+        found = tm.find_by_path("Root")
+        assert found["id"] == t["id"]
+        assert found["name"] == "Root"
+
+    def test_two_segments(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=parent["id"]
+        )
+        found = tm.find_by_path("Root.Child")
+        assert found["id"] == child["id"]
+
+    def test_three_segments(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        mid = tm.create_task(
+            name="Mid", definition_of_done="DoD M", parent_id=root["id"]
+        )
+        leaf = tm.create_task(
+            name="Leaf", definition_of_done="DoD L", parent_id=mid["id"]
+        )
+        found = tm.find_by_path("Root.Mid.Leaf")
+        assert found["id"] == leaf["id"]
+
+    def test_missing_segment_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        tm.create_task(name="Root", definition_of_done="DoD R")
+        with pytest.raises(TaskNotFoundError):
+            tm.find_by_path("Root.Missing")
+
+    def test_empty_path_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskValidationError):
+            tm.find_by_path("")
+
+    def test_invalid_segment_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskValidationError, match="Invalid path segment"):
+            tm.find_by_path("bad segment")
+
+    def test_path_not_found_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskNotFoundError):
+            tm.find_by_path("Nonexistent")
+
+    def test_corrupted_record_during_scan_raises_storage_error(self, tmp_path):
+        """A malformed record encountered while scanning should raise TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        tm.create_task(name="Good", definition_of_done="DoD here")
+        # Inject a corrupted sibling record (missing required fields) directly into storage.
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"]["corrupt-id"] = {
+            "id": "corrupt-id"
+        }  # missing name, status, priority
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError):
+            tm.find_by_path("Good")
+
+    def test_non_string_parent_id_in_store_raises_storage_error(self, tmp_path):
+        """A record with a non-string parent_id raises TaskStorageError up-front."""
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Root", definition_of_done="DoD here")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][t["id"]]["parent_id"] = 123
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="corrupted 'parent_id'"):
+            tm.find_by_path("Root")
+
+    def test_missing_parent_id_in_store_raises_storage_error(self, tmp_path):
+        """A record whose parent_id references a missing task raises TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Root", definition_of_done="DoD here")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][t["id"]]["parent_id"] = "nonexistent-parent"
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="references missing parent"):
+            tm.find_by_path("Root")
+
+
+# ---------------------------------------------------------------------------
+# delete_task
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteTask:
+    def test_delete_leaf(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.delete_task(t["id"])
+        with pytest.raises(TaskNotFoundError):
+            tm.get_task(t["id"])
+
+    def test_delete_removes_from_parent_subtask_ids(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD P")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=parent["id"]
+        )
+        tm.delete_task(child["id"])
+        updated_parent = tm.get_task(parent["id"])
+        assert updated_parent["subtasks"] == []
+
+    def test_delete_cascades_to_descendants(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        grandchild = tm.create_task(
+            name="Grand", definition_of_done="DoD G", parent_id=child["id"]
+        )
+        tm.delete_task(root["id"])
+        for tid in (root["id"], child["id"], grandchild["id"]):
+            with pytest.raises(TaskNotFoundError):
+                tm.get_task(tid)
+
+    def test_delete_cascades_via_parent_id_when_subtask_ids_out_of_sync(self, tmp_path):
+        """Descendants with correct parent_id but missing from parent's subtask_ids are deleted."""
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        # Corrupt the root's subtask_ids to remove the child reference, simulating
+        # a desync between parent's subtask_ids and child's parent_id.
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][root["id"]]["subtask_ids"] = []
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        # Deleting root should still cascade to child via parent_id cross-check.
+        tm.delete_task(root["id"])
+        with pytest.raises(TaskNotFoundError):
+            tm.get_task(child["id"])
+
+    def test_delete_cascades_multi_level_orphans_via_parent_id(self, tmp_path):
+        """Multi-level orphan chain is fully deleted even when all subtask_ids are cleared."""
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        grandchild = tm.create_task(
+            name="Grand", definition_of_done="DoD G", parent_id=child["id"]
+        )
+        # Clear ALL subtask_ids at every level — only parent_id links remain.
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][root["id"]]["subtask_ids"] = []
+        raw["tasks"][child["id"]]["subtask_ids"] = []
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        # BFS from root via parent_id index should reach child and grandchild.
+        tm.delete_task(root["id"])
+        for tid in (root["id"], child["id"], grandchild["id"]):
+            with pytest.raises(TaskNotFoundError):
+                tm.get_task(tid)
+
+    def test_delete_nonexistent_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskNotFoundError):
+            tm.delete_task("task_xxxxxx")
+
+    def test_delete_allows_reuse_of_name(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Alpha", definition_of_done="DoD A")
+        tm.delete_task(t["id"])
+        # Should be able to create a new task with the same name after deletion.
+        t2 = tm.create_task(name="Alpha", definition_of_done="DoD A2")
+        assert t2["name"] == "Alpha"
+
+    def test_delete_corrupted_subtask_ids_raises_storage_error(self, tmp_path):
+        """Malformed subtask_ids on a descendant must raise TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        # Corrupt the child's subtask_ids directly in storage.
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][child["id"]]["subtask_ids"] = "not-a-list"
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError):
+            tm.delete_task(root["id"])
+
+    def test_delete_corrupted_parent_subtask_ids_raises_storage_error(self, tmp_path):
+        """Malformed subtask_ids on the parent record raises TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD P")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=parent["id"]
+        )
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][parent["id"]]["subtask_ids"] = {"bad": "type"}
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="corrupted 'subtask_ids'"):
+            tm.delete_task(child["id"])
+
+    def test_delete_corrupted_parent_id_raises_storage_error(self, tmp_path):
+        """Non-string parent_id on the task being deleted raises TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD P")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=parent["id"]
+        )
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][child["id"]]["parent_id"] = 99
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="corrupted 'parent_id'"):
+            tm.delete_task(child["id"])
+
+    def test_delete_missing_parent_raises_storage_error(self, tmp_path):
+        """A valid string parent_id that points to a missing task raises TaskStorageError."""
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD P")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=parent["id"]
+        )
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        # Remove the parent from storage to simulate a dangling reference.
+        del raw["tasks"][parent["id"]]
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="missing"):
+            tm.delete_task(child["id"])
+
+    def test_delete_empty_string_parent_id_raises_storage_error(self, tmp_path):
+        """An empty-string parent_id is not None so must also trigger the missing-parent check."""
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Task", definition_of_done="DoD here")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][t["id"]]["parent_id"] = ""
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="missing"):
+            tm.delete_task(t["id"])
+
+
+# ---------------------------------------------------------------------------
+# _task_detail parent_id validation
+# ---------------------------------------------------------------------------
+
+
+class TestTaskDetailParentIdValidation:
+    def test_non_string_parent_id_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="Done criteria")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][t["id"]]["parent_id"] = 42
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="corrupted 'parent_id'"):
+            tm.get_task(t["id"])
+
+    def test_missing_parent_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="Done criteria")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][t["id"]]["parent_id"] = "nonexistent-id"
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="missing parent task"):
+            tm.get_task(t["id"])
+
+    def test_none_parent_id_is_valid(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="Root", definition_of_done="Done criteria")
+        detail = tm.get_task(t["id"])
+        assert detail["parent_id"] is None
