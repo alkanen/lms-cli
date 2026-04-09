@@ -687,6 +687,109 @@ class TestSessionCompact:
 
 
 # ---------------------------------------------------------------------------
+# Session.set_system_message
+# ---------------------------------------------------------------------------
+
+
+class TestSetSystemMessage:
+    def test_system_message_prepended_to_get_messages(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hello")
+        session.set_system_message("You are a helpful assistant.")
+        messages = session.get_messages()
+        assert messages[0] == {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        }
+        assert messages[1] == {"role": "user", "content": "Hello"}
+
+    def test_system_message_stripped(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.set_system_message("  Be concise.  ")
+        messages = session.get_messages()
+        assert messages[0]["content"] == "Be concise."
+
+    def test_system_message_not_written_to_current_jsonl(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hi")
+        session.set_system_message("Do not write me.")
+        current = (session.session_dir / "history_current.jsonl").read_text()
+        assert "Do not write me." not in current
+
+    def test_system_message_not_written_to_full_jsonl(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hi")
+        session.set_system_message("Do not write me.")
+        full = (session.session_dir / "history_full.jsonl").read_text()
+        assert "Do not write me." not in full
+
+    def test_system_message_not_in_compact_input(self, tmp_path):
+        """compact() must not include the transient system prompt in its LLM request."""
+        llm = _make_llm(text_response="Summary.")
+        session = _make_session(tmp_path, llm)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hello")
+        session.set_system_message("Transient prompt.")
+
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "Summary."},
+                {"type": "done", "stop_reason": "stop", "usage": {}},
+            ]
+        )
+        session.compact()
+
+        call_messages = llm.send.call_args[0][0]
+        contents = [m.get("content", "") for m in call_messages]
+        assert not any("Transient prompt." in str(c) for c in contents)
+
+    def test_system_message_not_persisted_after_compact(self, tmp_path):
+        """The summary written by compact() must not contain the system prompt text."""
+        llm = _make_llm(text_response="Summary.")
+        session = _make_session(tmp_path, llm)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hello")
+        session.set_system_message("Transient prompt.")
+
+        llm.send.return_value = iter(
+            [
+                {"type": "text", "delta": "Summary."},
+                {"type": "done", "stop_reason": "stop", "usage": {}},
+            ]
+        )
+        session.compact()
+
+        current = (session.session_dir / "history_current.jsonl").read_text()
+        assert "Transient prompt." not in current
+
+    def test_empty_system_message_omits_prefix(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hi")
+        session.set_system_message("Some prompt.")
+        session.set_system_message("")  # clear
+        messages = session.get_messages()
+        assert messages[0]["role"] == "user"
+
+    def test_set_system_message_rejects_non_string(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        with pytest.raises(SessionError, match="must be a string"):
+            session.set_system_message(42)  # type: ignore[arg-type]
+
+    def test_no_system_message_by_default(self, tmp_path):
+        session = _make_session(tmp_path)
+        session._write_meta({"message_count": 0})
+        session.add_message("user", "Hi")
+        messages = session.get_messages()
+        assert messages[0]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
 # SessionManager — new / load / list / most_recent
 # ---------------------------------------------------------------------------
 
