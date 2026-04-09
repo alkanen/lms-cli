@@ -33,6 +33,12 @@ _UPDATABLE_STATUSES = _VALID_STATUSES - frozenset({"done"})
 
 _VALID_PRIORITIES = frozenset({"low", "medium", "high"})
 
+# Public aliases — importable by task tools so their ToolSchema enums stay
+# in sync with TaskManager's validation without duplicating the sets.
+VALID_STATUSES: frozenset[str] = _VALID_STATUSES
+UPDATABLE_STATUSES: frozenset[str] = _UPDATABLE_STATUSES
+VALID_PRIORITIES: frozenset[str] = _VALID_PRIORITIES
+
 # Allowed status transitions for update_task().  Self-transitions are included
 # so that setting the same status is a no-op rather than an error.
 # "done" has no outbound transitions — only mark_done() can reach it.
