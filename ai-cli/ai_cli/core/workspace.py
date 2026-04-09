@@ -164,6 +164,13 @@ _INIT_TEMPLATES: dict[str, str] = {
         #     # backend:                 # omit to inherit the coordinator's backend
         #     #   base_url: http://localhost:11434/v1
         #     #   api_key_env: OLLAMA_KEY  # name of env-var holding the API key
+        #
+        # ---------------------------------------------------------------------------
+        # Task system
+        # ---------------------------------------------------------------------------
+        # tasks:
+        #   tree_depth: 3             # depth limit for /tasks tree (default: 3)
+        #                             # overridable per call with --depth <n>
     """),
     "tools/example_tool.py": textwrap.dedent("""\
         \"\"\"example_tool — echoes a message a number of times.

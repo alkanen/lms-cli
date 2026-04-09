@@ -107,7 +107,7 @@ ai-cli/
 │   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
 │   │   ├── agent.py               # ✅ Agent, AgentSpec, AgentResult, BackendConfig, build_agent_tool_registry()
 │   │   ├── agent_registry.py      # ✅ AgentSpec loading from config, lazy instance caching (get_or_create)
-│   │   ├── task_manager.py        # 🔲 Task tree persistence, validation, queries
+│   │   ├── task_manager.py        # ✅ Task tree persistence, validation, queries, CRUD
 │   │   ├── task_orchestrator.py   # 🔲 Deterministic plan→execute→review loop (/plan)
 │   │   ├── embedding_provider.py  # ✅ EmbeddingProvider ABC + OpenAIEmbeddingProvider
 │   │   ├── vector_store.py        # ✅ VectorStore ABC + SQLiteVectorStore
@@ -121,7 +121,7 @@ ai-cli/
 │   │   ├── tool_manager.py         # ✅ Context-saving tool gatekeeper
 │   │   ├── search_files.py         # ✅ search_files tool — semantic search over indexed corpus
 │   │   ├── call_agent.py          # ✅ CallAgentTool, CallAgentsParallelTool (coordinator → sub-agent dispatch)
-│   │   └── tasks.py               # 🔲 Task tools (list, get, create, update, add_note, mark_done)
+│   │   └── tasks.py               # ✅ Task tools (tasks_list, tasks_get, tasks_create, tasks_update, tasks_add_note, tasks_mark_done)
 │   ├── cli/                        # CLI interface and user-facing components
 │   │   ├── repl.py                 # ✅ REPL loop; all slash commands; keyboard shortcuts; streaming abort
 │   │   ├── display.py              # ✅ Display ABC + PlainDisplay + RichDisplay
@@ -268,6 +268,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - **Text files**: the `@ref` token is replaced with a `[file: …]\ncontent\n[/file]` block inline; message stays a plain string.
      - **Image files** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`) 🔲: the file is base64-encoded and the user message is converted to a content block array (`{"type": "text", …}` + `{"type": "image_url", …}`). `_preprocess_at_references()` returns `str | list[dict]`; the REPL calls `add_raw_message` when the result is a list. The backend adapter is responsible for translating canonical `image_url` blocks to the wire format required by its endpoint (e.g. `input_image` for the OpenAI Responses API). See `docs/technical_requirements.md` — Multimodal Messages.
    - Implemented slash commands: `/help`, `/exit`, `/clear`, `/verbose`, `/compact`, `/markdown`, `/tools`, `/session`, `/history`, `/agents`, `/rounds`, `/index`.
+   - `/tasks` ✅ — see design_task_system.md § Slash Commands for full subcommand spec (replaces old `/tasks-clear`).
    - RichDisplay prerequisite REPL changes ✅:
      - Route `{"type": "reasoning", "delta": str}` chunks to `display.stream_reasoning()`.
      - Capture `usage` from `"done"` chunk and call `display.update_usage(usage, context_window)`.
@@ -337,14 +338,16 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Context overflow: token monitoring → stream loop breaks (assistant message persisted first) → dangling tool_call stubs injected → `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")` returned → coordinator decides how to proceed.
    - `/agents` slash command: lists configured agent types with model, persistence, tools, and max_tool_rounds.
 
-2. **Task System** 🔲
+2. **Task System** ⚠️ (partial)
    - See [design_task_system.md](design_task_system.md) for full design.
-   - `task_manager.py` — persistent task tree (`<session_dir>/tasks.json`). Enforces status transitions, parent–child integrity, completion validation (all subtasks must be `done`).
-   - Six task tools in `tasks.py`: `tasks_list`, `tasks_get`, `tasks_create`, `tasks_update`, `tasks_add_note`, `tasks_mark_done`. See [design_task_system.md](design_task_system.md) for the canonical per-role tool-access table (planner / executor / reviewer).
+   - `task_manager.py` ✅ — CRUD, status transitions, parent–child integrity, completion validation, `delete_task()`, `find_by_path()`, name constraint (`^[A-Za-z0-9_]+$`), sibling uniqueness enforcement.
+   - Six task tools in `tasks.py` ✅: `tasks_list`, `tasks_get`, `tasks_create`, `tasks_update`, `tasks_add_note`, `tasks_mark_done`.  Always registered via `_wire_tasks()` in `__main__.py` ✅.
+   - `/tasks` slash command ✅ design, ✅ implementation — full subcommand set: `list`, `list <path>`, `tree`, `tree <path>`, `info`, `add`, `add <path>`, `edit`, `delete`, `close` (stub), `open` (stub). Tasks addressed by dot-path of names (e.g., `root.child.leaf`). See design_task_system.md § Slash Commands.
+   - `/tasks delete [<path>]` handles both cases — omitting the path deletes everything; always confirms.
+   - `tasks.tree_depth` config key ✅ — controls `/tasks tree` render depth (default 3, overridable with `--depth <n>`).
    - Hybrid orchestration:
      - **Interactive mode** — coordinator LLM uses task tools + `call_agent` during normal conversation. No Python orchestrator involved.
-     - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
-   - `/tasks [task_id]` slash command for viewing the task tree without an LLM call.
+     - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` 🔲 drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
    - Progressive disclosure: `tasks_list` returns ~10 tokens per task; `tasks_get` returns full detail on demand. Keeps agents focused even when context windows are large (90K–262K).
    - Three agent roles: planner (read-only, creates task structure), executor (reads/writes files, updates tasks), reviewer (optional, validates DoD and marks done).
    - Reviewer is optional — when not configured, the executor marks tasks done directly via `tasks_mark_done`.

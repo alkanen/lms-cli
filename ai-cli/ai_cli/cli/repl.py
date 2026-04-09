@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from ai_cli.core.config_manager import ConfigManager
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.session_manager import Session
+    from ai_cli.core.task_manager import TaskManager
     from ai_cli.core.tool_registry import ToolRegistry
     from ai_cli.core.workspace import Workspace
 
@@ -115,6 +116,13 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "Index files for semantic search; [path] adds a root, --file indexes a single file",
     ),
     ("/agents", "List configured agent types"),
+    ("/tasks", "List unfinished root tasks"),
+    ("/tasks list [<path>]", "List all tasks (or children of <path>) with detail"),
+    ("/tasks tree [<path>] [--depth <n>]", "Show task tree"),
+    ("/tasks info <path>", "Show full detail for a task"),
+    ("/tasks add [<path>]", "Wizard: create a task (or subtask under <path>)"),
+    ("/tasks edit <path>", "Wizard: edit a task"),
+    ("/tasks delete [<path>]", "Delete task (or all tasks+goal if no path)"),
 ]
 
 
@@ -321,6 +329,7 @@ class REPL:
         workspace: Workspace,
         config: ConfigManager | None = None,
         agent_registry: AgentRegistry | None = None,
+        task_manager: TaskManager | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
@@ -329,6 +338,7 @@ class REPL:
         self._workspace = workspace
         self._config = config
         self._agent_registry = agent_registry
+        self._task_manager = task_manager
         # Maximum tool-call rounds per user turn — readable from config and
         # overridable at runtime via /rounds.
         self._max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS
@@ -518,6 +528,10 @@ class REPL:
         elif cmd == "agents":
             self._handle_agents_command()
 
+        elif cmd == "tasks":
+            remainder = command[len(cmd) :].strip()
+            self._handle_tasks_subcommand(remainder)
+
         elif cmd == "":
             self._display.show_error(
                 "No command provided. Type /help for a list of commands."
@@ -626,6 +640,517 @@ class REPL:
                 }
             )
         self._display.show_agents(rows)
+
+    # ------------------------------------------------------------------
+    # /tasks subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_tasks_subcommand(self, remainder: str) -> None:
+        """Dispatch /tasks [subcommand] [args]."""
+        from ai_cli.core.task_manager import TaskStorageError
+
+        if self._task_manager is None:
+            self._display.show_error("Task manager is not available in this session.")
+            return
+
+        try:
+            self._run_tasks_dispatch(remainder)
+        except TaskStorageError as exc:
+            self._display.show_error(f"Task storage error: {exc}")
+
+    def _run_tasks_dispatch(self, remainder: str) -> None:
+        """Inner /tasks dispatcher; separated so TaskStorageError can be caught at one site."""
+        from ai_cli.core.task_manager import TaskNotFoundError, TaskValidationError
+
+        assert self._task_manager is not None  # guaranteed by _handle_tasks_subcommand
+
+        parts = remainder.split()
+        sub = parts[0].lower() if parts else ""
+
+        # bare /tasks — simple list of unfinished root tasks
+        if not sub:
+            try:
+                details = self._task_manager.list_task_details(parent_id=None)
+                unfinished = [d for d in details if d["status"] != "done"]
+                nodes = [self._task_to_node(d) for d in unfinished]
+                goal = self._task_manager.get_goal()
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            if goal:
+                self._display.show_status(f"Goal: {goal}")
+            self._display.show_tasks_simple(nodes)
+            return
+
+        # Known subcommands — reject anything else as a usage error.
+        _KNOWN_SUBS = {
+            "list",
+            "tree",
+            "info",
+            "add",
+            "edit",
+            "delete",
+            "close",
+            "open",
+        }
+        if sub not in _KNOWN_SUBS:
+            self._display.show_error(
+                f"Unknown /tasks subcommand: '{sub}'. "
+                "Try /tasks, /tasks list, /tasks tree, /tasks info <path>, "
+                "/tasks add, /tasks edit <path>, /tasks delete [<path>]."
+            )
+            return
+
+        args = parts[1:]  # everything after the subcommand
+
+        if sub == "list":
+            # /tasks list [<path>]
+            if len(args) > 1:
+                self._display.show_error("Usage: /tasks list [<path>]")
+                return
+            path = args[0] if args else None
+            try:
+                detail_map = self._task_manager.get_all_task_details_map()
+                if path:
+                    parent = self._find_in_detail_map(path, detail_map)
+                    parent_id = parent["id"]
+                else:
+                    parent_id = None
+                details = [
+                    d for d in detail_map.values() if d.get("parent_id") == parent_id
+                ]
+                nodes = [self._task_to_node(d) for d in details]
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            self._display.show_tasks_list(nodes)
+            return
+
+        if sub == "tree":
+            # /tasks tree [<path>] [--depth <n>]
+            depth = self._get_tree_depth()
+            # Parse --depth override
+            clean_args = []
+            i = 0
+            while i < len(args):
+                if args[i] == "--depth":
+                    if i + 1 >= len(args):
+                        self._display.show_error(
+                            "Usage: /tasks tree [<path>] [--depth <n>]"
+                        )
+                        return
+                    try:
+                        parsed_depth = int(args[i + 1])
+                        if parsed_depth < 1:
+                            raise ValueError
+                        depth = parsed_depth
+                    except ValueError:
+                        self._display.show_error(
+                            f"Invalid --depth value: {args[i + 1]!r}"
+                            " (must be a positive integer)"
+                        )
+                        return
+                    i += 2
+                else:
+                    clean_args.append(args[i])
+                    i += 1
+            if len(clean_args) > 1:
+                self._display.show_error("Usage: /tasks tree [<path>] [--depth <n>]")
+                return
+            path = clean_args[0] if clean_args else None
+            try:
+                detail_map = self._task_manager.get_all_task_details_map()
+                if path:
+                    parent = self._find_in_detail_map(path, detail_map)
+                    nodes = [self._build_task_tree(parent["id"], detail_map, depth, 1)]
+                else:
+                    nodes = [
+                        self._build_task_tree(t["id"], detail_map, depth, 1)
+                        for t in detail_map.values()
+                        if t.get("parent_id") is None
+                    ]
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            goal = self._task_manager.get_goal()
+            if goal:
+                self._display.show_status(f"Goal: {goal}")
+            self._display.show_tasks_tree(nodes, depth)
+            return
+
+        if sub == "info":
+            if len(args) != 1:
+                self._display.show_error("Usage: /tasks info <path>")
+                return
+            path = args[0]
+            try:
+                task = self._task_manager.find_by_path(path)
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            self._display.show_task_info(task)
+            return
+
+        if sub == "add":
+            if len(args) > 1:
+                self._display.show_error("Usage: /tasks add [<path>]")
+                return
+            path = args[0] if args else None
+            try:
+                parent_task = self._task_manager.find_by_path(path) if path else None
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            fields = self._tasks_add_wizard(parent_task)
+            if fields is None:
+                return
+            try:
+                task = self._task_manager.create_task(
+                    name=fields["name"],
+                    definition_of_done=fields["definition_of_done"],
+                    description=fields.get("description", ""),
+                    parent_id=parent_task["id"] if parent_task else None,
+                    priority=fields.get("priority", "medium"),
+                )
+                self._display.show_status(f"Task '{task['name']}' created.")
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+            return
+
+        if sub == "edit":
+            if len(args) != 1:
+                self._display.show_error("Usage: /tasks edit <path>")
+                return
+            path = args[0]
+            try:
+                task = self._task_manager.find_by_path(path)
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
+            fields = self._tasks_edit_wizard(task)
+            if fields is None:
+                return
+            if not fields:
+                self._display.show_status("No changes made.")
+                return
+            try:
+                updated = self._task_manager.update_task(task["id"], **fields)
+                self._display.show_status(f"Task '{updated['name']}' updated.")
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+            return
+
+        if sub == "delete":
+            if len(args) > 1:
+                self._display.show_error(
+                    "Usage: /tasks delete [<path>]  (too many arguments)"
+                )
+                return
+            path = args[0] if args else None
+            if path:
+                try:
+                    task = self._task_manager.find_by_path(path)
+                except (TaskNotFoundError, TaskValidationError) as exc:
+                    self._display.show_error(str(exc))
+                    return
+                confirm_msg = (
+                    f"Delete task '{task['name']}' and all its subtasks? [y/N] "
+                )
+            else:
+                confirm_msg = "Delete ALL tasks and the goal (full reset)? [y/N] "
+            try:
+                from prompt_toolkit import prompt as _pt_prompt
+
+                answer = _pt_prompt(confirm_msg).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self._display.show_status("Cancelled.")
+                return
+            if answer not in ("y", "yes"):
+                self._display.show_status("Cancelled.")
+                return
+            try:
+                if path:
+                    self._task_manager.delete_task(task["id"])
+                    self._display.show_status(f"Task '{task['name']}' deleted.")
+                else:
+                    self._task_manager.clear()
+                    self._display.show_status("All tasks and goal cleared.")
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+            return
+
+        if sub == "close":
+            if len(args) != 1:
+                self._display.show_error(
+                    "Usage: /tasks close <path>  (requires exactly one argument)"
+                )
+                return
+            self._display.show_status("/tasks close is not yet implemented.")
+            return
+
+        if sub == "open":
+            if len(args) != 1:
+                self._display.show_error(
+                    "Usage: /tasks open <path>  (requires exactly one argument)"
+                )
+                return
+            self._display.show_status("/tasks open is not yet implemented.")
+            return
+
+    def _get_tree_depth(self) -> int:
+        """Return the configured tasks.tree_depth (default 3)."""
+        default = 3
+        if self._config is None:
+            return default
+        tasks_cfg = self._config.get("tasks")
+        if not isinstance(tasks_cfg, dict):
+            return default
+        raw = tasks_cfg.get("tree_depth", default)
+        try:
+            depth = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid tasks.tree_depth value %r; using default %d.", raw, default
+            )
+            return default
+        if depth < 1:
+            logger.warning(
+                "Invalid tasks.tree_depth value %r; using default %d.", raw, default
+            )
+            return default
+        return depth
+
+    def _task_to_node(self, full: dict) -> dict:
+        """Build a display node from a ``task_detail`` dict."""
+        subtasks = full.get("subtasks", [])
+        return {
+            "id": full["id"],
+            "name": full["name"],
+            "status": full["status"],
+            "priority": full["priority"],
+            "description": full.get("description", ""),
+            "subtask_count": len(subtasks),
+            "done_subtask_count": sum(1 for s in subtasks if s["status"] == "done"),
+        }
+
+    def _build_task_tree(
+        self, task_id: str, detail_map: dict, max_depth: int, current: int
+    ) -> dict:
+        """Recursively build a tree node dict for display from a pre-loaded detail map.
+
+        *detail_map* is ``{task_id: task_detail}`` returned by
+        ``TaskManager.get_all_task_details_map()`` — avoids N+1 disk reads.
+        """
+        full = detail_map.get(task_id, {})
+        subtasks = full.get("subtasks", [])
+        done_count = sum(1 for s in subtasks if s["status"] == "done")
+        node: dict = {
+            "id": task_id,
+            "name": full.get("name", "?"),
+            "status": full.get("status", "?"),
+            "priority": full.get("priority", "?"),
+            "description": full.get("description", ""),
+            "subtask_count": len(subtasks),
+            "done_subtask_count": done_count,
+            "children": None,
+        }
+        if current < max_depth and subtasks:
+            node["children"] = [
+                self._build_task_tree(s["id"], detail_map, max_depth, current + 1)
+                for s in subtasks
+            ]
+        elif not subtasks:
+            node["children"] = []
+        # else: children remains None → depth limit reached
+        return node
+
+    @staticmethod
+    def _find_in_detail_map(path: str, detail_map: dict) -> dict:
+        """Resolve a dot-separated name path against an already-loaded detail_map.
+
+        Raises :exc:`TaskValidationError` for invalid segments and
+        :exc:`TaskNotFoundError` if any segment is not found.
+        Avoids a second ``_load()`` when the caller already has the full map.
+        """
+        from ai_cli.core.task_manager import (
+            TaskNotFoundError,
+            TaskValidationError,
+        )
+
+        segments = path.strip().split(".")
+        for seg in segments:
+            if not seg or re.fullmatch(r"[A-Za-z0-9_]+", seg) is None:
+                raise TaskValidationError(
+                    f"Invalid path segment {seg!r}: must match ^[A-Za-z0-9_]+$."
+                )
+        current_parent_id: str | None = None
+        found: dict | None = None
+        for seg in segments:
+            found = None
+            for task in detail_map.values():
+                if (
+                    task.get("parent_id") == current_parent_id
+                    and task.get("name") == seg
+                ):
+                    found = task
+                    break
+            if found is None:
+                raise TaskNotFoundError(f"Task not found at path segment {seg!r}")
+            current_parent_id = found["id"]
+        assert found is not None
+        return found
+
+    def _tasks_add_wizard(self, parent_task: dict | None) -> dict | None:
+        """Prompt for new task fields.  Returns field dict or None if cancelled."""
+        from prompt_toolkit import prompt as _pt_prompt
+
+        scope = f"under '{parent_task['name']}'" if parent_task else "at root"
+        self._display.show_status(f"Creating task {scope}. Press Ctrl+C to cancel.")
+
+        try:
+            name = _pt_prompt("  Name (required): ").strip()
+            if not name:
+                self._display.show_status("Cancelled (name is required).")
+                return None
+
+            description = _pt_prompt("  Description (optional): ").strip()
+
+            dod = ""
+            while len(dod.strip()) < 5:
+                dod = _pt_prompt(
+                    "  Definition of done (required, min 5 non-whitespace chars): "
+                ).strip()
+                if len(dod.strip()) < 5:
+                    self._display.show_error(
+                        "Definition of done must be at least 5 non-whitespace characters."
+                    )
+
+            raw_prio = (
+                _pt_prompt("  Priority [low/medium/high] (default: medium): ")
+                .strip()
+                .lower()
+            )
+            priority = raw_prio if raw_prio in ("low", "medium", "high") else "medium"
+
+        except (EOFError, KeyboardInterrupt):
+            self._display.show_status("Cancelled.")
+            return None
+
+        return {
+            "name": name,
+            "description": description,
+            "definition_of_done": dod,
+            "priority": priority,
+        }
+
+    def _tasks_edit_wizard(self, task: dict) -> dict | None:
+        """Prompt for updated task fields.  Returns changed fields or None if cancelled.
+
+        Enter ``~`` at any optional field to clear it to its empty/default value.
+        Leave blank to keep the current value.  Ctrl+C cancels the whole wizard.
+        """
+        from prompt_toolkit import prompt as _pt_prompt
+
+        _CLEAR = object()  # sentinel: user typed "~" to clear the field
+
+        self._display.show_status(
+            f"Editing '{task['name']}'. "
+            "Leave blank to keep current value, ~ to clear, Ctrl+C to cancel."
+        )
+
+        def _ask(label: str, current: str, clearable: bool = False) -> object:
+            """Prompt with current value shown.
+
+            Returns:
+              - *current* if input is blank (keep unchanged)
+              - ``_CLEAR`` sentinel if input is ``~`` and *clearable* is True
+              - the new string value otherwise
+              - ``None`` if the user cancelled (EOFError / KeyboardInterrupt)
+            """
+            hint = " (~ to clear)" if clearable else ""
+            try:
+                raw = _pt_prompt(f"  {label}{hint} [{current!r}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if clearable and raw == "~":
+                return _CLEAR
+            return raw if raw else current
+
+        try:
+            name = _ask("Name", task.get("name", ""))
+            if name is None:
+                self._display.show_status("Cancelled.")
+                return None
+
+            description = _ask(
+                "Description", task.get("description", ""), clearable=True
+            )
+            if description is None:
+                self._display.show_status("Cancelled.")
+                return None
+
+            dod = _ask("Definition of done", task.get("definition_of_done", ""))
+            if dod is None:
+                self._display.show_status("Cancelled.")
+                return None
+
+            raw_prio = _ask(
+                "Priority [low/medium/high]", task.get("priority", "medium")
+            )
+            if raw_prio is None:
+                self._display.show_status("Cancelled.")
+                return None
+            assert isinstance(raw_prio, str)
+            priority = (
+                raw_prio.lower()
+                if raw_prio.lower() in ("low", "medium", "high")
+                else task.get("priority", "medium")
+            )
+
+            next_action = _ask(
+                "Next action", task.get("next_action", ""), clearable=True
+            )
+            if next_action is None:
+                self._display.show_status("Cancelled.")
+                return None
+
+            raw_blockers = _ask(
+                "Blockers (comma-separated)",
+                ", ".join(task.get("blockers", [])),
+                clearable=True,
+            )
+            if raw_blockers is None:
+                self._display.show_status("Cancelled.")
+                return None
+
+        except (EOFError, KeyboardInterrupt):
+            self._display.show_status("Cancelled.")
+            return None
+
+        # Resolve clearable fields.
+        description_val: str = "" if description is _CLEAR else str(description)
+        next_action_val: str = "" if next_action is _CLEAR else str(next_action)
+        if raw_blockers is _CLEAR:
+            blockers: list[str] = []
+        else:
+            blockers = [b.strip() for b in str(raw_blockers).split(",") if b.strip()]
+
+        # Collect only changed fields.
+        fields: dict = {}
+        if name != task.get("name", ""):
+            fields["name"] = str(name)
+        if description_val != task.get("description", ""):
+            fields["description"] = description_val
+        if dod != task.get("definition_of_done", ""):
+            fields["definition_of_done"] = str(dod)
+        if priority != task.get("priority", "medium"):
+            fields["priority"] = priority
+        if next_action_val != task.get("next_action", ""):
+            fields["next_action"] = next_action_val
+        if blockers != task.get("blockers", []):
+            fields["blockers"] = blockers
+
+        return fields
 
     # ------------------------------------------------------------------
     # /session subcommand handler

@@ -35,6 +35,7 @@ _AT_PARTIAL_RE = re.compile(r"@(!?)((?:\\.|[^\s\\,;:!?()\[\]{}'\"<>])*)$")
 
 _INDEX_FLAGS = ["--file", "--full", "--label", "--remove"]
 _TOOLS_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
+_TASKS_SUBCOMMANDS = ["add", "close", "delete", "edit", "info", "list", "open", "tree"]
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +231,8 @@ class REPLCompleter(Completer):
         cmd = parts[0][1:].lower()
         if cmd == "tools":
             yield from self._complete_tools(parts, text)
+        elif cmd == "tasks":
+            yield from self._complete_tasks(parts, text)
         elif cmd == "session":
             yield from self._complete_session(parts, text)
         elif cmd == "rounds":
@@ -284,6 +287,15 @@ class REPLCompleter(Completer):
         for name in self._tool_names():
             if name.startswith(prefix):
                 yield Completion(name, start_position=-len(prefix))
+
+    def _complete_tasks(self, parts: list[str], text: str) -> Iterable[Completion]:
+        trailing = text.endswith(" ")
+        if len(parts) == 1 or (len(parts) == 2 and not trailing):
+            prefix = (parts[1] if len(parts) > 1 else "").lower()
+            raw_len = len(parts[1]) if len(parts) > 1 else 0
+            for sub in _TASKS_SUBCOMMANDS:
+                if sub.startswith(prefix):
+                    yield Completion(sub, start_position=-raw_len)
 
     def _complete_session(self, parts: list[str], text: str) -> Iterable[Completion]:
         trailing = text.endswith(" ")
