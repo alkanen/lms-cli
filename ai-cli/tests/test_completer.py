@@ -205,6 +205,50 @@ class TestSessionSubcommands:
 
 
 # ---------------------------------------------------------------------------
+# /tasks
+# ---------------------------------------------------------------------------
+
+
+class TestTasksSubcommands:
+    def test_tasks_space_offers_all_subcommands(self):
+        result = _completions(_completer(), "/tasks ")
+        assert set(result) == {
+            "add",
+            "close",
+            "delete",
+            "edit",
+            "info",
+            "list",
+            "open",
+            "tree",
+        }
+
+    def test_tasks_partial_subcommand(self):
+        result = _completions(_completer(), "/tasks l")
+        assert result == ["list"]
+
+    def test_tasks_partial_matches_close(self):
+        result = _completions(_completer(), "/tasks c")
+        assert set(result) == {"close"}
+
+    def test_tasks_partial_d(self):
+        result = _completions(_completer(), "/tasks d")
+        assert result == ["delete"]
+
+    def test_tasks_uppercase_prefix(self):
+        result = _completions(_completer(), "/tasks T")
+        assert result == ["tree"]
+
+    def test_tasks_no_match(self):
+        result = _completions(_completer(), "/tasks z")
+        assert result == []
+
+    def test_tasks_subcommand_no_further_completions(self):
+        result = _completions(_completer(), "/tasks list ")
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
 # /rounds
 # ---------------------------------------------------------------------------
 

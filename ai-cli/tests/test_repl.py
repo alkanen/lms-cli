@@ -39,6 +39,7 @@ def _make_repl(
     llm=None,
     display=None,
     workspace=None,
+    task_manager=None,
 ) -> REPL:
     return REPL(
         session=session or MagicMock(),
@@ -46,6 +47,7 @@ def _make_repl(
         llm_client=llm or _make_llm(),
         display=display or MagicMock(),
         workspace=workspace or MagicMock(),
+        task_manager=task_manager,
     )
 
 
@@ -2064,3 +2066,389 @@ class TestAgentsCommand:
         repl._handle_slash_command("agents")
         rows = display.show_agents.call_args[0][0]
         assert [r["name"] for r in rows] == ["alpha", "zebra"]
+
+
+# ---------------------------------------------------------------------------
+# /tasks slash command
+# ---------------------------------------------------------------------------
+
+
+def _make_task_manager(
+    *,
+    root_tasks=None,
+    detail_map=None,
+    goal=None,
+):
+    """Return a MagicMock TaskManager with sensible defaults."""
+    tm = MagicMock()
+    tm.list_tasks.return_value = root_tasks or []
+    tm.list_task_details.return_value = root_tasks or []
+    tm.get_all_task_details_map.return_value = detail_map or {}
+    tm.get_goal.return_value = goal
+    return tm
+
+
+def _make_task_detail(
+    name="MyTask", status="not_started", priority="medium", parent_id=None
+):
+    return {
+        "id": f"task_{name.lower()}",
+        "parent_id": parent_id,
+        "name": name,
+        "status": status,
+        "priority": priority,
+        "description": "A description",
+        "definition_of_done": "Done criteria",
+        "next_action": "",
+        "blockers": [],
+        "notes": [],
+        "subtasks": [],
+    }
+
+
+class TestTasksCommand:
+    # ------------------------------------------------------------------
+    # No task_manager → error
+    # ------------------------------------------------------------------
+
+    def test_no_task_manager_shows_error(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)  # task_manager=None
+        repl._handle_slash_command("tasks")
+        display.show_error.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # bare /tasks
+    # ------------------------------------------------------------------
+
+    def test_bare_tasks_calls_show_tasks_simple(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager(root_tasks=[detail])
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks")
+        display.show_tasks_simple.assert_called_once()
+
+    def test_bare_tasks_filters_done(self):
+        display = MagicMock()
+        done = _make_task_detail("Done", status="done")
+        active = _make_task_detail("Active", status="in_progress")
+        tm = _make_task_manager(root_tasks=[done, active])
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks")
+        nodes = display.show_tasks_simple.call_args[0][0]
+        assert all(n["status"] != "done" for n in nodes)
+
+    def test_bare_tasks_shows_goal(self):
+        display = MagicMock()
+        tm = _make_task_manager(goal="My project goal")
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks")
+        status_calls = [str(c) for c in display.show_status.call_args_list]
+        assert any("My project goal" in c for c in status_calls)
+
+    def test_bare_tasks_validation_error_shows_error(self):
+        from ai_cli.core.task_manager import TaskValidationError
+
+        display = MagicMock()
+        tm = _make_task_manager()
+        tm.list_task_details.side_effect = TaskValidationError("missing subtask")
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks")
+        display.show_error.assert_called_once()
+        display.show_tasks_simple.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # /tasks list
+    # ------------------------------------------------------------------
+
+    def test_list_calls_show_tasks_list(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager(detail_map={detail["id"]: detail})
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks list")
+        display.show_tasks_list.assert_called_once()
+        # Single load via detail_map — list_task_details must not be called
+        tm.list_task_details.assert_not_called()
+
+    def test_list_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks list Root Extra")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+        tm.get_all_task_details_map.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # /tasks tree
+    # ------------------------------------------------------------------
+
+    def test_tree_calls_show_tasks_tree(self):
+        display = MagicMock()
+        detail = _make_task_detail("X")  # parent_id=None → root task
+        tm = _make_task_manager(detail_map={detail["id"]: detail})
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree")
+        display.show_tasks_tree.assert_called_once()
+        # list_tasks should NOT be called — roots come from the detail_map
+        tm.list_tasks.assert_not_called()
+
+    def test_tree_depth_flag_missing_value_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree --depth")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+
+    def test_tree_depth_invalid_value_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree --depth abc")
+        display.show_error.assert_called_once()
+
+    def test_tree_depth_zero_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree --depth 0")
+        display.show_error.assert_called_once()
+        assert "positive integer" in display.show_error.call_args[0][0]
+
+    def test_tree_depth_negative_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree --depth -1")
+        display.show_error.assert_called_once()
+        assert "positive integer" in display.show_error.call_args[0][0]
+
+    def test_tree_extra_positional_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks tree Root Extra")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+        tm.get_all_task_details_map.assert_not_called()
+
+    def test_tree_depth_zero_in_config_falls_back_to_default(self):
+        """tree_depth: 0 is invalid and should fall back to default (3) with a warning."""
+        repl = _make_repl()
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"tree_depth": 0} if key == "tasks" else default
+        )
+        repl._config = config
+        assert repl._get_tree_depth() == 3
+
+    def test_tree_depth_negative_in_config_falls_back_to_default(self):
+        repl = _make_repl()
+        config = MagicMock()
+        config.get.side_effect = lambda key, default=None: (
+            {"tree_depth": -5} if key == "tasks" else default
+        )
+        repl._config = config
+        assert repl._get_tree_depth() == 3
+
+    # ------------------------------------------------------------------
+    # /tasks info
+    # ------------------------------------------------------------------
+
+    def test_info_without_path_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks info")
+        display.show_error.assert_called_once()
+
+    def test_info_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks info Root Extra")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    def test_info_calls_show_task_info(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks info MyTask")
+        display.show_task_info.assert_called_once_with(detail)
+
+    # ------------------------------------------------------------------
+    # /tasks edit
+    # ------------------------------------------------------------------
+
+    def test_edit_without_path_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks edit")
+        display.show_error.assert_called_once()
+
+    def test_edit_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks edit Root Extra")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # /tasks delete
+    # ------------------------------------------------------------------
+
+    def test_delete_no_path_confirms_and_clears(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        with patch("ai_cli.cli.repl.REPL._handle_tasks_subcommand") as mock_sub:
+            # Bypass the actual confirm prompt — just test dispatch works
+            repl._handle_slash_command("tasks delete")
+            mock_sub.assert_called_once_with("delete")
+
+    def test_delete_cancels_on_non_yes(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        with patch("prompt_toolkit.prompt", return_value="n"):
+            repl._handle_slash_command("tasks delete")
+        tm.clear.assert_not_called()
+        display.show_status.assert_called()
+
+    def test_delete_clears_on_yes(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        with patch("prompt_toolkit.prompt", return_value="y"):
+            repl._handle_slash_command("tasks delete")
+        tm.clear.assert_called_once()
+
+    def test_delete_storage_error_shows_storage_error_prefix(self):
+        """TaskStorageError from clear() propagates to the top-level handler."""
+        from ai_cli.core.task_manager import TaskStorageError
+
+        display = MagicMock()
+        tm = _make_task_manager()
+        tm.clear.side_effect = TaskStorageError("disk full")
+        repl = _make_repl(display=display, task_manager=tm)
+        with patch("prompt_toolkit.prompt", return_value="y"):
+            repl._handle_slash_command("tasks delete")
+        display.show_error.assert_called_once()
+        assert "Task storage error:" in display.show_error.call_args[0][0]
+
+    def test_delete_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks delete Foo Bar")
+        display.show_error.assert_called_once()
+        assert "too many arguments" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    def test_add_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks add Parent Extra")
+        display.show_error.assert_called_once()
+        assert "Usage" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # /tasks close and open (stubs)
+    # ------------------------------------------------------------------
+
+    def test_close_shows_stub_message(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks close MyTask")
+        display.show_status.assert_called()
+        assert "not yet" in display.show_status.call_args[0][0]
+
+    def test_close_no_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks close")
+        display.show_error.assert_called_once()
+        assert "requires exactly one argument" in display.show_error.call_args[0][0]
+
+    def test_close_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks close Foo Bar")
+        display.show_error.assert_called_once()
+        assert "requires exactly one argument" in display.show_error.call_args[0][0]
+
+    def test_open_shows_stub_message(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks open MyTask")
+        display.show_status.assert_called()
+        assert "not yet" in display.show_status.call_args[0][0]
+
+    def test_open_no_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks open")
+        display.show_error.assert_called_once()
+        assert "requires exactly one argument" in display.show_error.call_args[0][0]
+
+    def test_open_extra_args_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks open Foo Bar")
+        display.show_error.assert_called_once()
+        assert "requires exactly one argument" in display.show_error.call_args[0][0]
+
+    # ------------------------------------------------------------------
+    # Unknown subcommand
+    # ------------------------------------------------------------------
+
+    def test_unknown_subcommand_shows_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks frobnicate")
+        display.show_error.assert_called_once()
+        assert "Unknown" in display.show_error.call_args[0][0]
+
+    # ------------------------------------------------------------------
+    # Add wizard — DoD minimum-length validation
+    # ------------------------------------------------------------------
+
+    def test_add_wizard_reprompts_when_dod_too_short(self, monkeypatch):
+        """Short DoD shows error and re-prompts; valid DoD on third try proceeds."""
+        display = MagicMock()
+        tm = _make_task_manager()
+        created = _make_task_detail("NewTask")
+        tm.create_task.return_value = created
+
+        # Simulate: name → description → empty dod → short dod → valid dod → priority
+        responses = iter(["NewTask", "", "", "hi", "at least five chars", "medium"])
+        monkeypatch.setattr("prompt_toolkit.prompt", lambda *_a, **_kw: next(responses))
+
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks add")
+
+        # Error shown twice (empty and "hi" are both < 5 non-whitespace chars)
+        assert display.show_error.call_count == 2
+        # Task eventually created with valid DoD
+        tm.create_task.assert_called_once()
+        _, kwargs = tm.create_task.call_args
+        assert kwargs.get("definition_of_done") == "at least five chars"

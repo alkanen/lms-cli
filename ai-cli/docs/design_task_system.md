@@ -94,6 +94,34 @@ Each task contains:
 Tasks act as the shared working memory across all agents.  No agent needs to
 hold the full tree in context — it queries what it needs via the task tools.
 
+### Name Constraints
+
+Task names must match `^[A-Za-z0-9_]+$` (letters, digits, and underscores only,
+at least one character).  This constraint is enforced by `TaskManager` at create
+time and on rename.
+
+Names must also be **unique within sibling scope**: no two direct children of
+the same parent (or two root tasks) may share a name.  This enables dot-path
+addressing from REPL commands.
+
+### Path Addressing
+
+REPL slash commands (`/tasks`) identify tasks by a dot-separated path of names
+rather than opaque IDs:
+
+```
+root_task                       → root task named "root_task"
+root_task.sub_task              → child of root_task named "sub_task"
+root_task.sub_task.detail       → grandchild
+```
+
+`TaskManager.find_by_path(path: str)` resolves a dot-path to a full
+`task_detail` dict.  Each segment is validated against the name regex before
+lookup; a missing segment raises `TaskNotFoundError`.
+
+LLM-facing tools (`tasks_list`, `tasks_get`, etc.) continue to use opaque
+`task_id` strings — path addressing is a human convenience layer.
+
 ### Status Model
 
 ```
@@ -270,7 +298,7 @@ In interactive mode, tasks may be created without a top-level goal.
       "properties": {
         "id":                 { "type": "string", "pattern": "^task_[a-zA-Z0-9]+$" },
         "parent_id":          { "type": ["string", "null"] },
-        "name":               { "type": "string", "minLength": 1 },
+        "name":               { "type": "string", "pattern": "^[A-Za-z0-9_]+$", "minLength": 1 },
         "description":        { "type": "string" },
         "definition_of_done": { "type": "string", "minLength": 5 },
         "status":             { "type": "string", "enum": ["not_started", "in_progress", "blocked", "in_review", "done"] },
@@ -323,6 +351,18 @@ In interactive mode, tasks may be created without a top-level goal.
 
 ---
 
+## TaskManager API (non-tool methods)
+
+The following `TaskManager` methods are used by the REPL slash commands but are
+**not** exposed as LLM tools:
+
+| Method | Description |
+|---|---|
+| `find_by_path(path: str) → dict` | Resolve dot-path to a `task_detail`.  Raises `TaskNotFoundError` if any segment is not found; raises `TaskValidationError` if a segment contains invalid characters. |
+| `delete_task(task_id: str) → None` | Recursively delete a task and all descendants.  Removes the task from its parent's `subtask_ids` and saves atomically. |
+
+---
+
 ## Task Tools
 
 Six tools, consolidated from the original eight.  The `tasks_` prefix groups
@@ -363,7 +403,7 @@ Returns (data):
 Create a new task.  If `parent_id` is provided, the task is attached as a
 subtask (replaces the separate `add_subtask` tool from the original design).
 
-`definition_of_done` is **required** and must be at least 5 characters.
+`definition_of_done` is **required** and must contain at least 5 non-whitespace characters (checked via `len(value.strip()) >= 5`).
 `TaskManager` enforces this at create time and rejects the call with a
 `validation_error` if the field is missing or too short.  This prevents tasks
 from entering the tree without actionable completion criteria.
@@ -873,6 +913,31 @@ resume with `/plan`.
 
 ---
 
+## Tool Registration
+
+The six task tools are **always registered** via `_wire_tasks()` in
+`__main__.py` after session selection (because `TaskManager` requires a
+`session_dir`).  They appear in `/tools list` and can be enabled, disabled,
+allowed, or disallowed like any other tool.
+
+There is no coarse `tasks.enabled` config flag — use the standard per-tool
+mechanism (e.g. add `tasks_create: {disabled: true}` under the `tools:` config
+key) if you want to restrict LLM access to the task system.
+
+## Configuration
+
+```yaml
+# tasks section in .ai-cli/config.yaml (or global config)
+tasks:
+  tree_depth: 3   # how many levels to render in /tasks tree (default: 3)
+                  # overridable per call with --depth <n>
+```
+
+`tree_depth` must be a positive integer ≥ 1.  Invalid values are ignored and
+the default (3) is used with a warning.
+
+---
+
 ## Slash Commands
 
 ### `/plan [goal]`
@@ -885,19 +950,62 @@ Start or resume autonomous orchestration.
 - Ctrl+C interrupts cleanly after the current step finishes.  The task tree
   is always in a consistent state on disk.
 
-### `/tasks [task_id]`
+### `/tasks` subcommands
 
-View the task tree without consuming an LLM call.
+All task-tree operations are routed through `/tasks <subcommand>`.
+Tasks are addressed by dot-path (see Path Addressing above).
 
-- `/tasks` — shows all root tasks as a summary table.
-- `/tasks task_abc123` — shows full detail for one task including subtasks.
-- `/tasks --all` — shows the full tree, indented by depth.
+| Subcommand | Description |
+|---|---|
+| `/tasks` | Simple list of all **unfinished** root tasks with one-line descriptions. |
+| `/tasks list` | Detailed list of all root tasks (finished + unfinished) with description and subtask progress (`done/total`). |
+| `/tasks list <path>` | Same as above but for direct children of the task at `<path>`. |
+| `/tasks tree` | Rich tree of the full task hierarchy, depth-limited by `tasks.tree_depth` config (default 3).  Truncated branches shown with `…`. |
+| `/tasks tree <path>` | Same tree view starting from the task at `<path>`. |
+| `/tasks tree [<path>] --depth <n>` | Override configured depth for this call. |
+| `/tasks info <path>` | Full detail for a single task (all fields, notes, subtask list). |
+| `/tasks add` | Interactive wizard to create a new root task. |
+| `/tasks add <path>` | Interactive wizard to create a subtask under the task at `<path>`. |
+| `/tasks edit <path>` | Interactive wizard to edit name, description, DoD, priority, next action, or blockers. |
+| `/tasks delete [<path>]` | Delete a task and all its descendants.  Omit `<path>` to delete all tasks **and the goal** (full reset).  Always prompts for confirmation. |
+| `/tasks close <path>` | *Stub — not yet implemented.* Will force-close a task and all its subtasks regardless of DoD validation. |
+| `/tasks open <path>` | *Stub — not yet implemented.* Will re-open a `done` task. |
 
-Rendered through `Display.show_task_tree()` / `Display.show_task_detail()`.
+The wizard for `add` and `edit` is a simple sequential series of `prompt()` calls, skipping auto-managed fields (`id`, `parent_id`, `status`, `subtask_ids`, `created_at`, `updated_at`, `notes`):
 
-### `/tasks-clear`
+- **`/tasks add [<path>]`**: `name` (required) → `description` (optional) → `definition_of_done` (required) → `priority` (optional, default `medium`)
+- **`/tasks edit <path>`**: same four fields plus `next_action` (optional) and `blockers` (optional, comma-separated).  Pre-fills current values so the user can accept or overwrite.
 
-Delete all tasks and the goal.  Requires confirmation.
+**Subcommand disambiguation:** If the first token after `/tasks` is not a known subcommand keyword, the command is rejected with a usage error rather than silently treating the token as a path.
+
+#### Display methods
+
+The REPL builds a tree data structure before calling display:
+
+```python
+{
+    "id": ...,
+    "name": ...,
+    "status": ...,
+    "priority": ...,
+    "description": ...,
+    "subtask_count": int,
+    "done_subtask_count": int,
+    "children": [...] | None,   # None = depth limit reached
+}
+```
+
+Display methods:
+
+| Method | Used by |
+|---|---|
+| `show_tasks_simple(tasks: list[dict])` | `/tasks` |
+| `show_tasks_list(tasks: list[dict])` | `/tasks list [path]` |
+| `show_tasks_tree(nodes: list[dict], depth: int)` | `/tasks tree [path]` |
+| `show_task_info(task: dict)` | `/tasks info <path>` |
+
+All four are non-abstract on `Display` (default: no-op), overridden in `PlainDisplay` and `RichDisplay`.
+
 
 ---
 

@@ -29,6 +29,7 @@ from ai_cli.core.config_manager import ConfigError, ConfigManager
 from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
 from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
+from ai_cli.core.task_manager import TaskManager
 from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
 from ai_cli.utils.logging_utils import setup_logging
@@ -485,6 +486,10 @@ def _cmd_repl(
         agent_registry, tool_registry, workspace, permission_manager, config, llm_client
     )
 
+    # Wire up task tools — always registered, session-scoped.
+    task_manager = TaskManager(session.session_dir)
+    _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
+
     if resumed:
         _show_resume_context(session, ui)
 
@@ -496,6 +501,7 @@ def _cmd_repl(
         workspace,
         config,
         agent_registry=agent_registry,
+        task_manager=task_manager,
     )
     repl.run()
 
@@ -572,6 +578,39 @@ def _wire_agents(
                     agent_name,
                     tool_name,
                 )
+
+
+def _wire_tasks(
+    task_manager: TaskManager,
+    tool_registry: ToolRegistry,
+    workspace: Workspace,
+    permission_manager: PermissionManager,
+) -> None:
+    """Register all six task tools against *tool_registry*.
+
+    Task tools are always registered (no config gate).  Individual tools can
+    be disabled or disallowed via the standard per-tool mechanism.
+    """
+    from ai_cli.tools.tasks import (
+        TasksAddNoteTool,
+        TasksCreateTool,
+        TasksGetTool,
+        TasksListTool,
+        TasksMarkDoneTool,
+        TasksUpdateTool,
+    )
+
+    for tool_cls in (
+        TasksListTool,
+        TasksGetTool,
+        TasksCreateTool,
+        TasksUpdateTool,
+        TasksAddNoteTool,
+        TasksMarkDoneTool,
+    ):
+        tool_registry.register_instance(
+            tool_cls(task_manager, workspace, permission_manager)
+        )
 
 
 def _ensure_global_dir(global_dir: Path) -> bool:
