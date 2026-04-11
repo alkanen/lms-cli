@@ -231,6 +231,21 @@ class AgentRegistry:
         """True when at least one agent spec is loaded."""
         return bool(self._specs)
 
+    def has(self, name: str) -> bool:
+        """Return ``True`` when a spec named *name* is registered."""
+        return name in self._specs
+
+    def reset(self, name: str) -> None:
+        """Clear the cached session instance for *name*.
+
+        The next :meth:`get_or_create` call for a ``persistence == "session"``
+        agent with this name will build a fresh instance, discarding the prior
+        conversation history.  Has no effect for ephemeral agents or unknown
+        names.
+        """
+        with self._lock:
+            self._instances.pop(name, None)
+
     def get_or_create(
         self,
         name: str,

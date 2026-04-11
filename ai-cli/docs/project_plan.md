@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1219 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1469 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -146,6 +146,7 @@ ai-cli/
 │   ├── test_display.py
 │   ├── test_completer.py
 │   ├── test_main.py
+│   ├── test_task_manager.py       # ✅
 │   ├── test_agent.py              # ✅
 │   ├── test_agent_registry.py     # ✅
 │   ├── test_call_agent.py         # ✅

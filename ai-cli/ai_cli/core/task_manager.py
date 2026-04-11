@@ -640,6 +640,122 @@ class TaskManager:
         self._save(data)
         return self._task_detail(data, task)
 
+    def close_task(self, task_id: str) -> dict:
+        """Force-close *task_id* and all its descendants.
+
+        Sets ``status = "done"`` on the target and every descendant regardless
+        of DoD validation.  Unlike :meth:`mark_done`, no structural checks are
+        enforced — this is an override for human use.
+
+        Returns the updated detail dict for the target task.
+        """
+        data = self._load()
+        task = self._get_or_raise(data, task_id)
+
+        now = self._now_iso()
+
+        # DFS to collect the target + all descendants.
+        ids_to_close: list[str] = []
+        visited: set[str] = set()
+        stack = [task_id]
+        while stack:
+            tid = stack.pop()
+            if tid in visited:
+                continue
+            visited.add(tid)
+            ids_to_close.append(tid)
+            t = data["tasks"].get(tid)
+            if t is None:
+                raise TaskStorageError(
+                    f"Task {tid!r} is referenced in the task tree but missing from storage"
+                )
+            if not isinstance(t, dict):
+                raise TaskStorageError(
+                    f"Task {tid!r} has invalid record: expected dict, "
+                    f"got {type(t).__name__}"
+                )
+            raw_subs = t.get("subtask_ids", [])
+            if not isinstance(raw_subs, list):
+                raise TaskStorageError(
+                    f"Task {tid!r} has invalid subtask_ids: expected list, "
+                    f"got {type(raw_subs).__name__}"
+                )
+            for sub_id in raw_subs:
+                if not isinstance(sub_id, str):
+                    raise TaskStorageError(
+                        f"Task {tid!r} has invalid subtask_ids entry: "
+                        f"expected str, got {type(sub_id).__name__}"
+                    )
+                if sub_id not in visited:
+                    stack.append(sub_id)
+
+        for tid in ids_to_close:
+            t = data["tasks"].get(tid)
+            if isinstance(t, dict):
+                t["status"] = "done"
+                t["updated_at"] = now
+
+        self._save(data)
+        return self._task_detail(data, self._validate_task_record(task))
+
+    def open_task(self, task_id: str) -> dict:
+        """Re-open *task_id* and all of its ``done`` ancestors.
+
+        Sets ``status = "not_started"`` on the target task, then walks up the
+        ancestor chain and re-opens every ancestor whose status is ``"done"``,
+        ensuring no ``done`` task has an unfinished descendant.
+
+        Returns the updated detail dict for the target task.
+        """
+        data = self._load()
+        task = self._get_or_raise(data, task_id)
+
+        if task["status"] != "done":
+            raise TaskValidationError(
+                f"Task {task_id!r} is not done (status={task['status']!r}); "
+                f"only done tasks can be re-opened."
+            )
+
+        now = self._now_iso()
+        task["status"] = "not_started"
+        task["updated_at"] = now
+
+        # Walk up the parent chain, re-opening any "done" ancestor.
+        current = task
+        while True:
+            parent_id = current.get("parent_id")
+            if parent_id is None:
+                break
+            if not isinstance(parent_id, str):
+                raise TaskStorageError(
+                    f"Task {current['id']!r} has invalid parent_id: "
+                    f"expected str or None, got {type(parent_id).__name__}"
+                )
+            if not parent_id:
+                raise TaskStorageError(
+                    f"Task {current['id']!r} has invalid parent_id: "
+                    f"empty string is not allowed"
+                )
+            parent_raw = data["tasks"].get(parent_id)
+            if parent_raw is None:
+                raise TaskStorageError(
+                    f"Task {current['id']!r} references missing parent {parent_id!r}"
+                )
+            if not isinstance(parent_raw, dict):
+                raise TaskStorageError(
+                    f"Task {current['id']!r} references invalid parent {parent_id!r}: "
+                    f"expected dict, got {type(parent_raw).__name__}"
+                )
+            parent = self._validate_task_record(parent_raw)
+            if parent["status"] != "done":
+                break
+            parent["status"] = "not_started"
+            parent["updated_at"] = now
+            current = parent
+
+        self._save(data)
+        return self._task_detail(data, self._validate_task_record(task))
+
     # ------------------------------------------------------------------
     # Queries (used by the orchestrator)
     # ------------------------------------------------------------------
