@@ -352,6 +352,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Hybrid orchestration:
      - **Interactive mode** — coordinator LLM uses task tools + `call_agent` during normal conversation. No Python orchestrator involved.
      - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` ✅ drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
+     - **Plan checkpoint** ✅ — after the first planning round, `/plan` pauses by default, renders the task tree, and asks the user to confirm before executing anything. `/plan --autonomous` bypasses the checkpoint for unattended runs. See design_task_system.md § Plan Checkpoint.
    - Progressive disclosure: `tasks_list` returns ~10 tokens per task; `tasks_get` returns full detail on demand. Keeps agents focused even when context windows are large (90K–262K).
    - Three agent roles: planner (read-only, creates task structure), executor (reads/writes files, updates tasks), reviewer (optional, validates DoD and marks done).
    - Reviewer is optional — when not configured, the executor marks tasks done directly via `tasks_mark_done`.
