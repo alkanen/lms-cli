@@ -199,16 +199,26 @@ review steps invoke sub-agents.
 
 The orchestrator:
 
-1. Creates an initial root task from the goal (if no tasks exist yet).
-2. Enters a loop: plan if needed → pick a task → execute → review.
-3. Shows progress via `Display.show_status()` after each step.
-4. Stops when all root tasks are `done`, when no executable tasks remain,
+1. Enters a loop: plan if needed → **plan checkpoint** → pick a task → execute → review.
+2. Shows progress via `Display.show_status()` after each step.
+3. Stops when all root tasks are `done`, when no executable tasks remain,
    or when interrupted by the user (Ctrl+C).
-5. Persists all state to `tasks.json` — resumable at any time with `/plan`.
+4. Persists all state to `tasks.json` — resumable at any time with `/plan`.
 
-**Best for:** larger tasks (10+ steps), autonomous operation, situations where
-the user wants to walk away and check results later, and smaller models that
-benefit from deterministic routing.
+**Plan checkpoint (default):** after the first planning round, the orchestrator
+pauses, renders the task tree (depth-limited), and asks the user to confirm before
+executing anything.  This lets the user review, edit, or cancel the plan before
+any files are written.  See § Plan Checkpoint in the Slash Commands section.
+
+Pass `--autonomous` to skip the checkpoint and run the full loop unattended:
+
+```
+/plan "implement the agent system" --autonomous
+```
+
+**Best for:** larger tasks (10+ steps), situations where the user wants to walk
+away and check results later, and smaller models that benefit from deterministic
+routing.
 
 ### Mode Interaction
 
@@ -940,15 +950,49 @@ the default (3) is used with a warning.
 
 ## Slash Commands
 
-### `/plan [goal]`
+### `/plan [goal] [--autonomous]`
 
-Start or resume autonomous orchestration.
+Start or resume orchestration.
 
-- `/plan "implement the agent system"` — sets the goal and starts the loop.
+- `/plan "implement the agent system"` — sets the goal and starts the loop
+  in **interactive mode** (default): the planner runs first, then the
+  orchestrator pauses at the plan checkpoint before executing anything.
 - `/plan` (no argument) — resumes from the current task tree state.  The
-  goal from the previous `/plan` invocation is reused.
+  goal from the previous `/plan` invocation is reused.  In interactive mode,
+  the orchestrator will show the plan checkpoint again before executing
+  tasks.
+- `/plan --autonomous` (or `/plan "<goal>" --autonomous`) — skips the plan
+  checkpoint entirely and runs the full loop unattended until all tasks are
+  done, no executable tasks remain, or Ctrl+C is pressed.
 - Ctrl+C interrupts cleanly after the current step finishes.  The task tree
   is always in a consistent state on disk.
+
+#### Plan Checkpoint (default behaviour)
+
+After the first planning round completes — when `_needs_planning()` returns
+`False` for the first time — the orchestrator pauses before executing any
+task.  The display renders the task tree (depth-limited to 3 by default) and prompts the user:
+
+```
+Plan ready. Review the tasks above, then:
+  • Press Enter (or type 'y') to begin execution
+  • Type 'n' or Ctrl+C to cancel (you can edit tasks with /tasks, then run /plan again)
+```
+
+If the user confirms, the orchestrator continues into the execution phase
+and does not show the checkpoint again for the same `/plan` invocation
+(subsequent planning rounds caused by blocked tasks proceed directly to the
+next iteration without another pause).
+
+If the user cancels, the orchestrator stops cleanly.  The task tree is saved
+and the user can inspect it with `/tasks`, adjust tasks manually, then run
+`/plan` again.  Because the plan already exists and `_needs_planning()` will
+return `False`, the checkpoint will be shown again immediately — giving the
+user another chance to review their edits before execution begins.
+
+The flag `--autonomous` suppresses the checkpoint entirely, allowing the loop
+to run unattended.  This is suitable when the user has already reviewed the
+plan interactively and is confident in it.
 
 ### `/tasks` subcommands
 
@@ -1391,3 +1435,54 @@ section above.  Key implementation notes:
 (in_progress before not_started, high before low, created_at tie-breaker);
 context limit counter and blocked transition; iteration limit exit; interrupt
 flag exit.  Agent calls are mocked via a fake `AgentRegistry`.
+
+---
+
+### PR 5 — Plan Checkpoint (low risk, extends orchestrator + REPL)
+
+**Files:** `ai_cli/core/task_orchestrator.py`, `ai_cli/cli/repl.py`,
+`ai_cli/cli/display.py`, `tests/test_task_orchestrator.py`, `tests/test_repl.py`
+
+**Scope:** Adds the plan checkpoint to the default `/plan` behaviour and the
+`--autonomous` flag to bypass it.  Builds directly on PR 4 with no schema
+changes.
+
+**`TaskOrchestrator` changes:**
+
+- `run(goal, max_iterations=50, autonomous=False)` — adds the `autonomous`
+  parameter.
+- New instance variable `self._plan_approved: bool = False` — tracks whether
+  the user has already approved the plan in the current `run()` call.  Reset
+  to `False` at the start of each `run()` invocation so a fresh call always
+  shows the checkpoint.
+- In the execution phase, when `autonomous` is `False` and
+  `self._plan_approved` is `False`: pause and call
+  `self.display.confirm_plan(nodes, goal)`.  If the user declines, show a
+  cancel message and `return`.  If confirmed, set `self._plan_approved = True`
+  and continue.
+
+**`Display` changes:**
+
+- New non-abstract method `confirm_plan(nodes: list[dict], goal: str | None) -> bool`
+  with a default implementation that returns `True` (auto-approve for
+  non-interactive backends such as `SubAgentDisplay`).
+- `PlainDisplay.confirm_plan` — renders the task tree via `show_tasks_tree`,
+  then prompts via `prompt_toolkit` (`pt_prompt`).  Returns `True` on `""` or
+  `"y"`/`"Y"`, `False` on `"n"`/`"N"` or `KeyboardInterrupt`.
+- `RichDisplay.confirm_plan` — same signature and confirmation semantics,
+  using Rich-styled output and `pt_prompt`.
+
+**`repl.py` changes:**
+
+- `_handle_plan_command` — tokenize `remainder` with `shlex.split` (handles
+  quoted goals correctly), extract an exact `--autonomous` token, pass
+  `autonomous=True/False` to `orchestrator.run(...)`.
+
+**Tests** cover:
+- Checkpoint shown after first planning round when `autonomous=False`.
+- Checkpoint skipped when `autonomous=True`.
+- User decline stops loop without executing any tasks.
+- User confirm proceeds to execution.
+- Checkpoint not shown again on subsequent planning rounds (e.g. after a task
+  is blocked and re-planned) within the same `run()` call.
+- `_plan_approved` reset between separate `run()` calls.

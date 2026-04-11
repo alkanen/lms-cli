@@ -262,6 +262,26 @@ class Display(ABC):
         Default: no-op.
         """
 
+    def confirm_plan(  # noqa: B027
+        self, nodes: list[dict], goal: str | None, *, depth: int = 3
+    ) -> bool:
+        """Show the planned task tree and ask the user to confirm before execution.
+
+        *nodes* is the list of root tree-node dicts as produced by
+        ``TaskOrchestrator._build_tree_nodes()``.  *goal* is the current goal
+        string (may be ``None``).  *depth* is the tree render depth (should
+        match the configured ``tasks.tree_depth``).
+
+        Returns ``True`` if the user confirms execution should proceed, ``False``
+        if they cancel.
+
+        The default implementation returns ``True`` (auto-approve) so that
+        non-interactive display backends (e.g. :class:`SubAgentDisplay`) do not
+        need to override this method.  Interactive backends should override to
+        render the tree and prompt the user.
+        """
+        return True
+
     # ------------------------------------------------------------------
     # Interactive prompts
     # ------------------------------------------------------------------
@@ -598,6 +618,26 @@ class PlainDisplay(Display):
             print("Notes:")
             for n in notes:
                 print(f"  {n}")
+
+    def confirm_plan(
+        self, nodes: list[dict], goal: str | None, *, depth: int = 3
+    ) -> bool:
+        if goal:
+            print(f"\nGoal: {goal}")
+        self.show_tasks_tree(nodes, depth=depth)
+        print("\nPlan ready — review the tasks above.")
+        print("  Press Enter or 'y' to begin execution")
+        print("  'n' or Ctrl+C to cancel (edit with /tasks, then run /plan again)")
+        while True:
+            try:
+                raw = pt_prompt("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return False
+            if raw in ("", "y", "yes"):
+                return True
+            if raw in ("n", "no"):
+                return False
+            print("Please enter 'y' to continue or 'n' to cancel.")
 
     def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
         if not sessions:
@@ -1208,6 +1248,31 @@ class RichDisplay(Display):
             except ValueError:
                 pass
             self._console.print("Invalid choice, please try again.", style="dim red")
+
+    def confirm_plan(
+        self, nodes: list[dict], goal: str | None, *, depth: int = 3
+    ) -> bool:
+        if goal:
+            self._console.print(f"\nGoal: {goal}", style="bold")
+        self.show_tasks_tree(nodes, depth=depth)
+        self._console.print("\nPlan ready — review the tasks above.", style="bold")
+        self._console.print("  [Enter / y]  Begin execution")
+        self._console.print(
+            "  [n / Ctrl+C]  Cancel (edit with /tasks, then run /plan again)",
+            style="dim",
+        )
+        while True:
+            try:
+                raw = pt_prompt("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return False
+            if raw in ("", "y", "yes"):
+                return True
+            if raw in ("n", "no"):
+                return False
+            self._console.print(
+                "Please enter 'y' to continue or 'n' to cancel.", style="dim red"
+            )
 
     def show_session_list(self, sessions: list[SessionMeta]) -> SessionMeta | None:
         if not sessions:
