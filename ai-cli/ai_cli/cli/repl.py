@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.session_manager import Session
     from ai_cli.core.task_manager import TaskManager
+    from ai_cli.core.task_orchestrator import TaskOrchestrator
     from ai_cli.core.tool_registry import ToolRegistry
     from ai_cli.core.workspace import Workspace
 
@@ -116,6 +117,7 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "Index files for semantic search; [path] adds a root, --file indexes a single file",
     ),
     ("/agents", "List configured agent types"),
+    ("/plan [goal]", "Start or resume autonomous plan → execute → review loop"),
     ("/tasks", "List unfinished root tasks"),
     ("/tasks list [<path>]", "List all tasks (or children of <path>) with detail"),
     ("/tasks tree [<path>] [--depth <n>]", "Show task tree"),
@@ -339,6 +341,8 @@ class REPL:
         self._config = config
         self._agent_registry = agent_registry
         self._task_manager = task_manager
+        # Orchestrator instance — created on first /plan and reused across calls.
+        self._orchestrator: TaskOrchestrator | None = None
         # Maximum tool-call rounds per user turn — readable from config and
         # overridable at runtime via /rounds.
         self._max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS
@@ -528,6 +532,10 @@ class REPL:
         elif cmd == "agents":
             self._handle_agents_command()
 
+        elif cmd == "plan":
+            remainder = command[len(cmd) :].strip()
+            self._handle_plan_command(remainder)
+
         elif cmd == "tasks":
             remainder = command[len(cmd) :].strip()
             self._handle_tasks_subcommand(remainder)
@@ -640,6 +648,71 @@ class REPL:
                 }
             )
         self._display.show_agents(rows)
+
+    # ------------------------------------------------------------------
+    # /plan command handler
+    # ------------------------------------------------------------------
+
+    def _handle_plan_command(self, remainder: str) -> None:
+        """Start or resume the autonomous plan → execute → review loop.
+
+        ``/plan "goal"``  — sets goal and starts.
+        ``/plan``         — resumes using the stored goal; errors if none set.
+        """
+        from ai_cli.core.task_manager import TaskStorageError, TaskValidationError
+        from ai_cli.core.task_orchestrator import TaskOrchestrator
+
+        if self._task_manager is None:
+            self._display.show_error("Task manager is not available in this session.")
+            return
+        if self._agent_registry is None or not self._agent_registry.has_agents:
+            self._display.show_error(
+                "No agents configured. Add an 'agents:' section to config.yaml."
+            )
+            return
+        if not self._agent_registry.has("executor"):
+            self._display.show_error(
+                "No 'executor' agent configured. /plan requires at least an executor."
+            )
+            return
+        if not self._agent_registry.has("planner"):
+            self._display.show_error(
+                "No 'planner' agent configured. /plan requires both an executor and a planner."
+            )
+            return
+
+        try:
+            goal = remainder.strip().strip("\"'") or None
+            if goal is None:
+                goal = self._task_manager.get_goal()
+                if not goal:
+                    self._display.show_error('No goal set. Provide one: /plan "<goal>"')
+                    return
+
+            if self._orchestrator is None:
+                if self._config is None:
+                    self._display.show_error(
+                        "Configuration is not available in this session. "
+                        "/plan requires a loaded config."
+                    )
+                    return
+                self._orchestrator = TaskOrchestrator(
+                    self._task_manager,
+                    self._agent_registry,
+                    self._display,
+                    workspace=self._workspace,
+                    config=self._config,
+                    coordinator_llm=self._llm,
+                    global_tool_registry=self._tool_registry,
+                )
+
+            self._orchestrator.run(goal)
+        except TaskStorageError as exc:
+            self._display.show_error(f"Task storage error: {exc}")
+        except TaskValidationError as exc:
+            self._display.show_error(f"Task validation error: {exc}")
+        except KeyError as exc:
+            self._display.show_error(f"Agent not found: {exc}")
 
     # ------------------------------------------------------------------
     # /tasks subcommand handler
@@ -885,7 +958,15 @@ class REPL:
                     "Usage: /tasks close <path>  (requires exactly one argument)"
                 )
                 return
-            self._display.show_status("/tasks close is not yet implemented.")
+            path = args[0]
+            try:
+                task = self._task_manager.find_by_path(path)
+                updated = self._task_manager.close_task(task["id"])
+                self._display.show_status(
+                    f"Task '{updated['name']}' and all its subtasks closed."
+                )
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
             return
 
         if sub == "open":
@@ -894,7 +975,13 @@ class REPL:
                     "Usage: /tasks open <path>  (requires exactly one argument)"
                 )
                 return
-            self._display.show_status("/tasks open is not yet implemented.")
+            path = args[0]
+            try:
+                task = self._task_manager.find_by_path(path)
+                updated = self._task_manager.open_task(task["id"])
+                self._display.show_status(f"Task '{updated['name']}' re-opened.")
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
             return
 
     def _get_tree_depth(self) -> int:
