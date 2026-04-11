@@ -73,11 +73,23 @@ class TaskNotFoundError(LookupError):
 
 
 class TaskStorageError(OSError):
-    """Raised when tasks.json exists but cannot be read or parsed.
+    """Raised for any unrecoverable I/O or data-integrity failure on tasks.json.
 
-    A missing file is *not* an error — callers receive an empty store.
-    A corrupt or unreadable file raises this so callers can distinguish
-    "no tasks yet" from "storage is broken" and avoid overwriting data.
+    Covers both read-side and write-side failures:
+
+    * **Read** — the file exists but cannot be read (permissions, I/O error),
+      contains invalid JSON, or has unexpected top-level structure.  The file
+      is quarantined in the last case so the manager does not overwrite it.
+    * **Write** — an ``OSError`` (disk full, permission denied, fsync failure,
+      rename failure) raised during an atomic save is wrapped and re-raised as
+      ``TaskStorageError`` so callers receive a single, consistent error type
+      for all storage failures.
+    * **Corruption** — a structurally invalid task record is detected during
+      normal operation (malformed field types, dangling references, duplicate
+      sibling names).
+
+    A *missing* file is **not** an error — callers receive an empty store so
+    they can distinguish "no tasks created yet" from "storage is broken".
     """
 
 
@@ -86,11 +98,19 @@ class TaskManager:
 
     All public methods that mutate state write atomically via a temp-file
     rename so the file is never left in a partial state.
+
+    The loaded store is kept in ``_cache`` after the first read.  Within a
+    single ``TaskManager`` instance in a single process, every ``_save``
+    updates both the file and the cache atomically from that caller's
+    perspective.  This does not provide cross-process or cross-instance cache
+    coherence if multiple writers point at the same ``session_dir`` — see
+    VULN-011 in ``docs/vulnerabilities.md``.
     """
 
     def __init__(self, session_dir: Path) -> None:
         self._path = session_dir / "tasks.json"
         self._last_ts: str = ""
+        self._cache: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -129,14 +149,21 @@ class TaskManager:
         return ts
 
     def _load(self) -> dict[str, Any]:
-        """Load the task store from disk, returning an empty store if absent.
+        """Return the in-memory store, reading ``tasks.json`` only on the first call.
 
         A missing file is normal (no tasks created yet) and returns
         ``{"tasks": {}}``.  A file that exists but cannot be read or parsed
         raises :exc:`TaskStorageError` to prevent silent data loss.
+
+        The result is cached in ``_cache`` after the first disk read.
+        Subsequent calls return the cache directly — no I/O is performed.
+        ``_save`` keeps the cache in sync on every write.
         """
+        if self._cache is not None:
+            return self._cache
         if not self._path.exists():
-            return {"tasks": {}}
+            self._cache = {"tasks": {}}
+            return self._cache
         try:
             text = self._path.read_text(encoding="utf-8")
             data = json.loads(text)
@@ -175,7 +202,8 @@ class TaskManager:
                 )
             detail = f" A backup was saved to {corrupt_path}." if quarantined else ""
             raise TaskStorageError(f"tasks.json has unexpected structure.{detail}")
-        return cast(dict[str, Any], data)
+        self._cache = cast(dict[str, Any], data)
+        return self._cache
 
     def _save(self, data: dict[str, Any]) -> None:
         """Write *data* to disk atomically.
@@ -184,9 +212,9 @@ class TaskManager:
         atomic rename so that cleanup (unlink) never races with an open
         handle — important on Windows where unlinking an open file fails.
         """
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path: Path | None = None
         try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -208,11 +236,22 @@ class TaskManager:
                     os.fsync(dir_fd)
                 finally:
                     os.close(dir_fd)
-        except Exception:
+        except Exception as exc:
             if tmp_path is not None:
                 with contextlib.suppress(OSError):
                     tmp_path.unlink(missing_ok=True)
+            # Invalidate the cache so the next read reloads from disk, keeping
+            # in-memory state consistent with what was actually persisted.
+            self._cache = None
+            # Wrap bare OSError (disk full, permission denied, etc.) in
+            # TaskStorageError so callers get a consistent error type for all
+            # storage failures — mirroring what _load() already does.
+            if isinstance(exc, OSError) and not isinstance(exc, TaskStorageError):
+                raise TaskStorageError(
+                    f"tasks.json could not be written: {exc}"
+                ) from exc
             raise
+        self._cache = data
 
     def _get_or_raise(self, data: dict[str, Any], task_id: str) -> dict[str, Any]:
         task = data["tasks"].get(task_id)
@@ -836,12 +875,24 @@ class TaskManager:
     # Path addressing
     # ------------------------------------------------------------------
 
-    def find_by_path(self, path: str) -> dict:
-        """Resolve a dot-separated name path to a full ``task_detail``.
+    def _resolve_path_segments(
+        self, path: str
+    ) -> tuple[list[str], dict[str, Any], dict[str | None, dict[str, str]]]:
+        """Validate *path*, validate every task record, and return
+        ``(segments, loaded_data, name_index)``.
 
-        Each segment is validated against ``_NAME_RE``.  Raises
-        :exc:`TaskValidationError` for invalid segments and
-        :exc:`TaskNotFoundError` if any segment is not found.
+        *name_index* maps each ``parent_id`` (or ``None`` for root tasks) to a
+        ``{task_name: task_id}`` dict built during the single validation pass,
+        so callers can resolve each path segment in O(1) instead of scanning
+        all tasks per segment.
+
+        Shared by :meth:`resolve_path_to_id` and :meth:`find_by_path` so both
+        methods perform identical validation without duplicating code.
+
+        Raises :exc:`TaskValidationError` for invalid path segments and
+        :exc:`TaskStorageError` for malformed or structurally inconsistent
+        task records (missing required fields, non-string ``parent_id``,
+        dangling ``parent_id`` references).
         """
         if not isinstance(path, str) or not path.strip():
             raise TaskValidationError("'path' must be a non-empty string.")
@@ -853,8 +904,11 @@ class TaskManager:
                 )
         data = self._load()
         tasks = data["tasks"]
-        # Validate every record up-front so malformed entries always raise TaskStorageError
-        # rather than silently appearing as TaskNotFoundError.
+        # Validate every record up-front so malformed entries always raise
+        # TaskStorageError rather than a raw KeyError or a silent TaskNotFoundError.
+        # Build a {parent_id: {name: task_id}} index in the same pass so callers
+        # can resolve path segments in O(1) without a second full scan.
+        name_index: dict[str | None, dict[str, str]] = {}
         for t in tasks.values():
             self._validate_task_record(t)  # raises TaskStorageError if malformed
             pid = t.get("parent_id")
@@ -867,19 +921,57 @@ class TaskManager:
                     raise TaskStorageError(
                         f"Task {t.get('id')!r} references missing parent {pid!r}."
                     )
+            if not _NAME_RE.match(t["name"]):
+                raise TaskStorageError(
+                    f"Task {t['id']!r} has an invalid name {t['name']!r}: "
+                    f"must match ^[A-Za-z0-9_]+$."
+                )
+            siblings = name_index.setdefault(pid, {})
+            if t["name"] in siblings:
+                raise TaskStorageError(
+                    f"Duplicate sibling task name detected for parent {pid!r}: "
+                    f"{t['name']!r}."
+                )
+            siblings[t["name"]] = t["id"]
+        return segments, data, name_index
+
+    def resolve_path_to_id(self, path: str) -> str:
+        """Resolve a dot-separated name path to a task ID.
+
+        Like :meth:`find_by_path` but skips building a full ``task_detail``
+        and returns only the ``id`` string.  Use this when only the ID is
+        needed (e.g. to pass to ``update_task``, ``add_note``, ``mark_done``).
+
+        Raises :exc:`TaskValidationError` for invalid path segments and
+        :exc:`TaskNotFoundError` if any segment is not found.
+        """
+        segments, _data, name_index = self._resolve_path_segments(path)
         current_parent_id: str | None = None
-        found: dict | None = None
         for seg in segments:
-            found = None
-            for t in tasks.values():
-                if t.get("parent_id") == current_parent_id and t["name"] == seg:
-                    found = t
-                    break
-            if found is None:
+            task_id = name_index.get(current_parent_id, {}).get(seg)
+            if task_id is None:
                 raise TaskNotFoundError(f"Task not found at path segment {seg!r}")
-            current_parent_id = found["id"]
-        assert found is not None  # guaranteed by loop above (segments is non-empty)
-        return self._task_detail(data, found)
+            current_parent_id = task_id
+        assert current_parent_id is not None  # guaranteed: segments is non-empty
+        return current_parent_id
+
+    def find_by_path(self, path: str) -> dict:
+        """Resolve a dot-separated name path to a full ``task_detail``.
+
+        Each segment is validated against ``_NAME_RE``.  Raises
+        :exc:`TaskValidationError` for invalid segments and
+        :exc:`TaskNotFoundError` if any segment is not found.
+        """
+        segments, data, name_index = self._resolve_path_segments(path)
+        tasks = data["tasks"]
+        current_parent_id: str | None = None
+        for seg in segments:
+            task_id = name_index.get(current_parent_id, {}).get(seg)
+            if task_id is None:
+                raise TaskNotFoundError(f"Task not found at path segment {seg!r}")
+            current_parent_id = task_id
+        assert current_parent_id is not None  # guaranteed: segments is non-empty
+        return self._task_detail(data, tasks[current_parent_id])
 
     def delete_task(self, task_id: str) -> None:
         """Delete *task_id* and all its descendants.
@@ -983,3 +1075,4 @@ class TaskManager:
         except OSError as exc:
             logger.error("Failed to delete tasks.json: %s", exc)
             raise
+        self._cache = None
