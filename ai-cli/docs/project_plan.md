@@ -108,7 +108,7 @@ ai-cli/
 │   │   ├── agent.py               # ✅ Agent, AgentSpec, AgentResult, BackendConfig, build_agent_tool_registry()
 │   │   ├── agent_registry.py      # ✅ AgentSpec loading from config, lazy instance caching (get_or_create)
 │   │   ├── task_manager.py        # ✅ Task tree persistence, validation, queries, CRUD
-│   │   ├── task_orchestrator.py   # 🔲 Deterministic plan→execute→review loop (/plan)
+│   │   ├── task_orchestrator.py   # ✅ Deterministic plan→execute→review loop (/plan)
 │   │   ├── embedding_provider.py  # ✅ EmbeddingProvider ABC + OpenAIEmbeddingProvider
 │   │   ├── vector_store.py        # ✅ VectorStore ABC + SQLiteVectorStore
 │   │   ├── chunker.py             # ✅ Chunk, ChunkStrategy ABC, all chunker impls, make_chunker()
@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1469 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1534 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -147,6 +147,7 @@ ai-cli/
 │   ├── test_completer.py
 │   ├── test_main.py
 │   ├── test_task_manager.py       # ✅
+│   ├── test_task_orchestrator.py  # ✅
 │   ├── test_agent.py              # ✅
 │   ├── test_agent_registry.py     # ✅
 │   ├── test_call_agent.py         # ✅
@@ -339,16 +340,18 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Context overflow: token monitoring → stream loop breaks (assistant message persisted first) → dangling tool_call stubs injected → `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")` returned → coordinator decides how to proceed.
    - `/agents` slash command: lists configured agent types with model, persistence, tools, and max_tool_rounds.
 
-2. **Task System** ⚠️ (partial)
+2. **Task System** ✅
    - See [design_task_system.md](design_task_system.md) for full design.
-   - `task_manager.py` ✅ — CRUD, status transitions, parent–child integrity, completion validation, `delete_task()`, `find_by_path()`, name constraint (`^[A-Za-z0-9_]+$`), sibling uniqueness enforcement.
+   - `task_manager.py` ✅ — CRUD, status transitions, parent–child integrity, completion validation, `delete_task()`, `find_by_path()`, `close_task()`, `open_task()`, name constraint (`^[A-Za-z0-9_]+$`), sibling uniqueness enforcement.
    - Six task tools in `tasks.py` ✅: `tasks_list`, `tasks_get`, `tasks_create`, `tasks_update`, `tasks_add_note`, `tasks_mark_done`.  Always registered via `_wire_tasks()` in `__main__.py` ✅.
-   - `/tasks` slash command ✅ design, ✅ implementation — full subcommand set: `list`, `list <path>`, `tree`, `tree <path>`, `info`, `add`, `add <path>`, `edit`, `delete`, `close` (stub), `open` (stub). Tasks addressed by dot-path of names (e.g., `root.child.leaf`). See design_task_system.md § Slash Commands.
+   - `/tasks` slash command ✅ design, ✅ implementation — full subcommand set: `list`, `list <path>`, `tree`, `tree <path>`, `info`, `add`, `add <path>`, `edit`, `delete`, `close`, `open`. Tasks addressed by dot-path of names (e.g., `root.child.leaf`). See design_task_system.md § Slash Commands.
    - `/tasks delete [<path>]` handles both cases — omitting the path deletes everything; always confirms.
+   - `/tasks close <path>` — force-closes target and all descendants regardless of DoD validation.
+   - `/tasks open <path>` — re-opens a `done` task and walks the ancestor chain re-opening any `done` ancestors to preserve tree consistency.
    - `tasks.tree_depth` config key ✅ — controls `/tasks tree` render depth (default 3, overridable with `--depth <n>`).
    - Hybrid orchestration:
      - **Interactive mode** — coordinator LLM uses task tools + `call_agent` during normal conversation. No Python orchestrator involved.
-     - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` 🔲 drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
+     - **Autonomous mode** (`/plan <goal>`) — `task_orchestrator.py` ✅ drives a deterministic plan→execute→review loop. Routing decisions are pure Python; only sub-agent work consumes the GPU. Ctrl+C interrupts cleanly; `/plan` resumes from task tree state.
    - Progressive disclosure: `tasks_list` returns ~10 tokens per task; `tasks_get` returns full detail on demand. Keeps agents focused even when context windows are large (90K–262K).
    - Three agent roles: planner (read-only, creates task structure), executor (reads/writes files, updates tasks), reviewer (optional, validates DoD and marks done).
    - Reviewer is optional — when not configured, the executor marks tasks done directly via `tasks_mark_done`.
