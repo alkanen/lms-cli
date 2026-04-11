@@ -2368,13 +2368,26 @@ class TestTasksCommand:
     # /tasks close and open (stubs)
     # ------------------------------------------------------------------
 
-    def test_close_shows_stub_message(self):
+    def test_close_calls_close_task(self):
         display = MagicMock()
+        detail = _make_task_detail()
         tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.close_task.return_value = detail
         repl = _make_repl(display=display, task_manager=tm)
         repl._handle_slash_command("tasks close MyTask")
-        display.show_status.assert_called()
-        assert "not yet" in display.show_status.call_args[0][0]
+        tm.close_task.assert_called_once_with(detail["id"])
+        display.show_status.assert_called_once()
+
+    def test_close_not_found_shows_error(self):
+        from ai_cli.core.task_manager import TaskNotFoundError
+
+        display = MagicMock()
+        tm = _make_task_manager()
+        tm.find_by_path.side_effect = TaskNotFoundError("not found")
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks close bad.path")
+        display.show_error.assert_called_once()
 
     def test_close_no_args_shows_error(self):
         display = MagicMock()
@@ -2392,13 +2405,26 @@ class TestTasksCommand:
         display.show_error.assert_called_once()
         assert "requires exactly one argument" in display.show_error.call_args[0][0]
 
-    def test_open_shows_stub_message(self):
+    def test_open_calls_open_task(self):
         display = MagicMock()
+        detail = _make_task_detail()
         tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.open_task.return_value = detail
         repl = _make_repl(display=display, task_manager=tm)
         repl._handle_slash_command("tasks open MyTask")
-        display.show_status.assert_called()
-        assert "not yet" in display.show_status.call_args[0][0]
+        tm.open_task.assert_called_once_with(detail["id"])
+        display.show_status.assert_called_once()
+
+    def test_open_not_found_shows_error(self):
+        from ai_cli.core.task_manager import TaskNotFoundError
+
+        display = MagicMock()
+        tm = _make_task_manager()
+        tm.find_by_path.side_effect = TaskNotFoundError("not found")
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks open bad.path")
+        display.show_error.assert_called_once()
 
     def test_open_no_args_shows_error(self):
         display = MagicMock()

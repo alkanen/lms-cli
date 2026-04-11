@@ -968,8 +968,8 @@ Tasks are addressed by dot-path (see Path Addressing above).
 | `/tasks add <path>` | Interactive wizard to create a subtask under the task at `<path>`. |
 | `/tasks edit <path>` | Interactive wizard to edit name, description, DoD, priority, next action, or blockers. |
 | `/tasks delete [<path>]` | Delete a task and all its descendants.  Omit `<path>` to delete all tasks **and the goal** (full reset).  Always prompts for confirmation. |
-| `/tasks close <path>` | *Stub — not yet implemented.* Will force-close a task and all its subtasks regardless of DoD validation. |
-| `/tasks open <path>` | *Stub — not yet implemented.* Will re-open a `done` task. |
+| `/tasks close <path>` | Force-close a task and all its subtasks regardless of DoD validation.  Sets `status = "done"` on the target and every descendant. |
+| `/tasks open <path>` | Re-open a `done` task.  Sets `status = "not_started"` on the target task, then walks up the ancestor chain and re-opens every ancestor that is currently `done`, ensuring no `done` task has an unfinished descendant. |
 
 The wizard for `add` and `edit` is a simple sequential series of `prompt()` calls, skipping auto-managed fields (`id`, `parent_id`, `status`, `subtask_ids`, `created_at`, `updated_at`, `notes`):
 

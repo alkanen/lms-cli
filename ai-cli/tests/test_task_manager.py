@@ -1002,3 +1002,220 @@ class TestTaskDetailParentIdValidation:
         t = tm.create_task(name="Root", definition_of_done="Done criteria")
         detail = tm.get_task(t["id"])
         assert detail["parent_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# close_task
+# ---------------------------------------------------------------------------
+
+
+class TestCloseTask:
+    def test_close_leaf_task(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        result = tm.close_task(t["id"])
+        assert result["status"] == "done"
+
+    def test_close_cascades_to_subtasks(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        grandchild = tm.create_task(
+            name="Grand", definition_of_done="DoD G", parent_id=child["id"]
+        )
+        tm.close_task(root["id"])
+        for tid in (root["id"], child["id"], grandchild["id"]):
+            assert tm.get_task(tid)["status"] == "done"
+
+    def test_close_does_not_affect_siblings(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        c1 = tm.create_task(
+            name="C1", definition_of_done="DoD C1", parent_id=root["id"]
+        )
+        c2 = tm.create_task(
+            name="C2", definition_of_done="DoD C2", parent_id=root["id"]
+        )
+        tm.close_task(c1["id"])
+        assert tm.get_task(c1["id"])["status"] == "done"
+        assert tm.get_task(c2["id"])["status"] == "not_started"
+
+    def test_close_bypasses_dod_validation(self, tmp_path):
+        """close_task succeeds even when DoD would fail mark_done checks."""
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        # child is not done — mark_done(root) would raise, but close_task must not
+        result = tm.close_task(root["id"])
+        assert result["status"] == "done"
+        assert tm.get_task(child["id"])["status"] == "done"
+
+    def test_close_nonexistent_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskNotFoundError):
+            tm.close_task("nonexistent")
+
+    def test_close_corrupted_subtask_ids_non_list_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][root["id"]]["subtask_ids"] = "not-a-list"
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="invalid subtask_ids"):
+            tm.close_task(root["id"])
+
+    def test_close_corrupted_subtask_ids_non_str_entry_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][root["id"]]["subtask_ids"] = [42]
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="invalid subtask_ids entry"):
+            tm.close_task(root["id"])
+
+
+# ---------------------------------------------------------------------------
+# open_task
+# ---------------------------------------------------------------------------
+
+
+class TestOpenTask:
+    def test_open_done_task(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.close_task(t["id"])
+        result = tm.open_task(t["id"])
+        assert result["status"] == "not_started"
+
+    def test_open_reopens_done_parent(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        tm.close_task(root["id"])
+        tm.open_task(child["id"])
+        assert tm.get_task(child["id"])["status"] == "not_started"
+        assert tm.get_task(root["id"])["status"] == "not_started"
+
+    def test_open_reopens_ancestor_chain(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        grandchild = tm.create_task(
+            name="Grand", definition_of_done="DoD G", parent_id=child["id"]
+        )
+        tm.close_task(root["id"])
+        tm.open_task(grandchild["id"])
+        for tid in (root["id"], child["id"], grandchild["id"]):
+            assert tm.get_task(tid)["status"] == "not_started"
+
+    def test_open_stops_at_non_done_parent(self, tmp_path):
+        """Ancestor chain walk stops when it reaches a parent that is not done."""
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        grandchild = tm.create_task(
+            name="Grand", definition_of_done="DoD G", parent_id=child["id"]
+        )
+        # Only close child + grandchild; root stays not_started
+        tm.close_task(child["id"])
+        assert tm.get_task(root["id"])["status"] == "not_started"
+
+        tm.open_task(grandchild["id"])
+        assert tm.get_task(grandchild["id"])["status"] == "not_started"
+        assert tm.get_task(child["id"])["status"] == "not_started"
+        assert tm.get_task(root["id"])["status"] == "not_started"
+
+    def test_open_does_not_affect_siblings(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        c1 = tm.create_task(
+            name="C1", definition_of_done="DoD C1", parent_id=root["id"]
+        )
+        c2 = tm.create_task(
+            name="C2", definition_of_done="DoD C2", parent_id=root["id"]
+        )
+        tm.close_task(root["id"])
+        tm.open_task(c1["id"])
+        assert tm.get_task(c1["id"])["status"] == "not_started"
+        assert tm.get_task(c2["id"])["status"] == "done"  # sibling unchanged
+
+    def test_open_nonexistent_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskNotFoundError):
+            tm.open_task("nonexistent")
+
+    def test_open_not_done_raises_validation_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        with pytest.raises(TaskValidationError, match="not done"):
+            tm.open_task(t["id"])
+
+    def test_open_in_progress_raises_validation_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        t = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.update_task(t["id"], status="in_progress")
+        with pytest.raises(TaskValidationError, match="not done"):
+            tm.open_task(t["id"])
+
+    def test_open_corrupted_parent_id_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        tm.close_task(child["id"])
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][child["id"]]["parent_id"] = 99
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="invalid parent_id"):
+            tm.open_task(child["id"])
+
+    def test_close_missing_descendant_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        # Remove child from store while leaving root's subtask_ids intact
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        del raw["tasks"][child["id"]]
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="missing from storage"):
+            tm.close_task(root["id"])
+
+    def test_open_empty_string_parent_id_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        tm.close_task(child["id"])
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        raw["tasks"][child["id"]]["parent_id"] = ""
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="empty string"):
+            tm.open_task(child["id"])
+
+    def test_open_missing_parent_raises_storage_error(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD R")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD C", parent_id=root["id"]
+        )
+        tm.close_task(child["id"])
+        raw = json.loads((tmp_path / "tasks.json").read_text())
+        # Remove parent from store while child's parent_id still references it
+        del raw["tasks"][root["id"]]
+        (tmp_path / "tasks.json").write_text(json.dumps(raw))
+        with pytest.raises(TaskStorageError, match="missing parent"):
+            tm.open_task(child["id"])
