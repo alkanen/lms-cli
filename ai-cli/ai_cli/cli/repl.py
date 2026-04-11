@@ -117,7 +117,10 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "Index files for semantic search; [path] adds a root, --file indexes a single file",
     ),
     ("/agents", "List configured agent types"),
-    ("/plan [goal]", "Start or resume autonomous plan → execute → review loop"),
+    (
+        "/plan [goal] [--autonomous]",
+        "Start or resume plan → execute → review loop (--autonomous skips plan review checkpoint)",
+    ),
     ("/tasks", "List unfinished root tasks"),
     ("/tasks list [<path>]", "List all tasks (or children of <path>) with detail"),
     ("/tasks tree [<path>] [--depth <n>]", "Show task tree"),
@@ -654,10 +657,12 @@ class REPL:
     # ------------------------------------------------------------------
 
     def _handle_plan_command(self, remainder: str) -> None:
-        """Start or resume the autonomous plan → execute → review loop.
+        """Start or resume the plan → execute → review loop.
 
-        ``/plan "goal"``  — sets goal and starts.
-        ``/plan``         — resumes using the stored goal; errors if none set.
+        ``/plan "goal"``             — sets goal, plans, then pauses for review.
+        ``/plan``                    — resumes using the stored goal.
+        ``/plan --autonomous``       — skip plan checkpoint; run unattended.
+        ``/plan "goal" --autonomous``— set goal and run unattended.
         """
         from ai_cli.core.task_manager import TaskStorageError, TaskValidationError
         from ai_cli.core.task_orchestrator import TaskOrchestrator
@@ -682,7 +687,27 @@ class REPL:
             return
 
         try:
-            goal = remainder.strip().strip("\"'") or None
+            try:
+                tokens = shlex.split(remainder)
+            except ValueError as exc:
+                self._display.show_error(f"Invalid /plan arguments: {exc}")
+                return
+
+            autonomous = False
+            goal_tokens: list[str] = []
+            for token in tokens:
+                if token == "--autonomous":
+                    autonomous = True
+                elif token.startswith("--"):
+                    self._display.show_error(
+                        f"Unknown flag {token!r}. "
+                        'Usage: /plan ["<goal>"] [--autonomous]'
+                    )
+                    return
+                else:
+                    goal_tokens.append(token)
+
+            goal: str | None = " ".join(goal_tokens) or None
             if goal is None:
                 goal = self._task_manager.get_goal()
                 if not goal:
@@ -706,7 +731,7 @@ class REPL:
                     global_tool_registry=self._tool_registry,
                 )
 
-            self._orchestrator.run(goal)
+            self._orchestrator.run(goal, autonomous=autonomous)
         except TaskStorageError as exc:
             self._display.show_error(f"Task storage error: {exc}")
         except TaskValidationError as exc:

@@ -808,7 +808,9 @@ class TestPlanCommand:
             repl._handle_slash_command('plan "implement the feature"')
 
             MockOrchestrator.assert_called_once()
-            mock_orch.run.assert_called_once_with("implement the feature")
+            mock_orch.run.assert_called_once_with(
+                "implement the feature", autonomous=False
+            )
 
     def test_plan_without_goal_uses_stored_goal(self):
         tm = MagicMock()
@@ -827,7 +829,7 @@ class TestPlanCommand:
 
             repl._handle_slash_command("plan")
 
-            mock_orch.run.assert_called_once_with("stored goal")
+            mock_orch.run.assert_called_once_with("stored goal", autonomous=False)
 
     def test_plan_reuses_existing_orchestrator(self):
         """Second /plan call reuses the same orchestrator instance."""
@@ -903,3 +905,272 @@ class TestPlanCommand:
 
         names = [cmd.lstrip("/").split()[0] for cmd, _ in _SLASH_COMMANDS]
         assert "plan" in names
+
+    def test_autonomous_flag_passed_to_run(self):
+        """``/plan --autonomous`` passes autonomous=True to orchestrator.run()."""
+        tm = MagicMock()
+        tm.get_goal.return_value = "goal"
+
+        repl = self._make_repl_with_plan(
+            task_manager=tm,
+            agent_registry=self._make_full_registry(),
+        )
+
+        with patch(
+            "ai_cli.core.task_orchestrator.TaskOrchestrator"
+        ) as MockOrchestrator:
+            mock_orch = MagicMock()
+            MockOrchestrator.return_value = mock_orch
+
+            repl._handle_slash_command("plan --autonomous")
+
+            mock_orch.run.assert_called_once_with("goal", autonomous=True)
+
+    def test_autonomous_flag_with_goal(self):
+        """``/plan "goal" --autonomous`` strips the flag and passes both correctly."""
+        tm = MagicMock()
+
+        repl = self._make_repl_with_plan(
+            task_manager=tm,
+            agent_registry=self._make_full_registry(),
+        )
+
+        with patch(
+            "ai_cli.core.task_orchestrator.TaskOrchestrator"
+        ) as MockOrchestrator:
+            mock_orch = MagicMock()
+            MockOrchestrator.return_value = mock_orch
+
+            repl._handle_slash_command('plan "build the thing" --autonomous')
+
+            mock_orch.run.assert_called_once_with("build the thing", autonomous=True)
+
+
+# ---------------------------------------------------------------------------
+# Plan checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _make_single_executable_tm() -> MagicMock:
+    """TaskManager with a root task containing one executable leaf — no planning needed.
+
+    Structure:
+      root  (has_subtasks=True, subtask_ids=["leaf"]) — not a candidate for execution
+      └── leaf  (has_subtasks=False, subtask_ids=[])  — picked by _pick_next_task
+    """
+    root = _make_task_summary(
+        "root", status="not_started", has_subtasks=True, subtask_ids=["leaf"]
+    )
+    leaf = _make_task_summary(
+        "leaf", status="not_started", has_subtasks=False, subtask_ids=[]
+    )
+    tm = _make_task_manager(
+        root_tasks=[root],
+        all_tasks=[root, leaf],
+        find_results={"blocked": [], "in_review": []},
+        find_incomplete=[root, leaf],
+        task_detail=_make_task_detail("leaf"),
+        goal="test goal",
+    )
+    tm.get_all_task_details_map.return_value = {
+        "root": {
+            "id": "root",
+            "name": "Root Task",
+            "status": "not_started",
+            "priority": "medium",
+            "description": "Root",
+            "parent_id": None,
+            "subtasks": [{"id": "leaf", "status": "not_started"}],
+        },
+        "leaf": {
+            "id": "leaf",
+            "name": "Leaf Task",
+            "status": "not_started",
+            "priority": "medium",
+            "description": "A task",
+            "parent_id": "root",
+            "subtasks": [],
+        },
+    }
+    return tm
+
+
+class TestPlanCheckpoint:
+    def _make_orch_with_executor(self, tm, display):
+        registry = _make_agent_registry(has={"executor": True})
+        executor = MagicMock()
+        executor.run.return_value = _ok_result()
+        registry.get_or_create.return_value = executor
+        return _make_orchestrator(
+            task_manager=tm, agent_registry=registry, display=display
+        )
+
+    def test_checkpoint_shown_before_first_execution(self):
+        """confirm_plan is called before the first executor call when not autonomous."""
+        tm = _make_single_executable_tm()
+        display = MagicMock()
+        display.confirm_plan.return_value = True
+        orch = self._make_orch_with_executor(tm, display)
+
+        orch.run("goal")
+
+        display.confirm_plan.assert_called_once()
+
+    def test_checkpoint_skipped_when_autonomous(self):
+        """confirm_plan is never called when autonomous=True."""
+        tm = _make_single_executable_tm()
+        display = MagicMock()
+        orch = self._make_orch_with_executor(tm, display)
+
+        orch.run("goal", autonomous=True)
+
+        display.confirm_plan.assert_not_called()
+
+    def test_user_decline_stops_loop_before_execution(self):
+        """When the user declines the checkpoint, no executor call is made."""
+        tm = _make_single_executable_tm()
+        display = MagicMock()
+        display.confirm_plan.return_value = False
+        registry = _make_agent_registry(has={"executor": True})
+        executor = MagicMock()
+        registry.get_or_create.return_value = executor
+        orch = _make_orchestrator(
+            task_manager=tm, agent_registry=registry, display=display
+        )
+
+        orch.run("goal")
+
+        executor.run.assert_not_called()
+
+    def test_user_decline_shows_cancel_message(self):
+        """Declining the checkpoint shows a status message with 'Cancelled'."""
+        tm = _make_single_executable_tm()
+        display = MagicMock()
+        display.confirm_plan.return_value = False
+        orch = self._make_orch_with_executor(tm, display)
+
+        orch.run("goal")
+
+        status_msgs = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("Cancelled" in m for m in status_msgs)
+
+    def test_user_confirm_proceeds_to_execution(self):
+        """Confirming the checkpoint allows the executor to run."""
+        root = _make_task_summary(
+            "root", status="not_started", has_subtasks=True, subtask_ids=["leaf"]
+        )
+        leaf = _make_task_summary(
+            "leaf", status="not_started", has_subtasks=False, subtask_ids=[]
+        )
+        tm = _make_single_executable_tm()
+        # Return root+leaf once, then nothing — stops the loop after one execution.
+        tm.all_tasks.side_effect = [
+            [root, leaf],  # first _pick_next_task call
+            [],  # second call → no more tasks → loop exits
+        ]
+
+        display = MagicMock()
+        display.confirm_plan.return_value = True
+        registry = _make_agent_registry(has={"executor": True})
+        executor = MagicMock()
+        executor.run.return_value = _ok_result()
+        registry.get_or_create.return_value = executor
+        orch = _make_orchestrator(
+            task_manager=tm, agent_registry=registry, display=display
+        )
+
+        orch.run("goal")
+
+        executor.run.assert_called_once()
+
+    def test_checkpoint_not_shown_again_after_approval(self):
+        """Once approved, confirm_plan is not called again for subsequent tasks."""
+        # Consistent structure: one root with two leaf children.
+        root = _make_task_summary(
+            "root", status="not_started", has_subtasks=True, subtask_ids=["t1", "t2"]
+        )
+        leaf1 = _make_task_summary(
+            "t1", status="not_started", has_subtasks=False, subtask_ids=[]
+        )
+        leaf2 = _make_task_summary(
+            "t2", status="not_started", has_subtasks=False, subtask_ids=[]
+        )
+
+        call_count = {"n": 0}
+
+        def _all_tasks_side_effect():
+            call_count["n"] += 1
+            # First two calls: all three tasks (root + both leaves).
+            # Subsequent calls: only root + leaf2 (simulates leaf1 being done).
+            if call_count["n"] <= 2:
+                return [root, leaf1, leaf2]
+            return [root, leaf2]
+
+        tm = _make_task_manager(
+            root_tasks=[root],
+            find_results={"blocked": [], "in_review": []},
+            find_incomplete=[root, leaf1, leaf2],
+            task_detail=_make_task_detail("t1"),
+            goal="test goal",
+        )
+        tm.all_tasks.side_effect = _all_tasks_side_effect
+        tm.get_all_task_details_map.return_value = {
+            "root": {
+                "id": "root",
+                "name": "Root",
+                "status": "not_started",
+                "priority": "medium",
+                "description": "",
+                "parent_id": None,
+                "subtasks": [
+                    {"id": "t1", "status": "not_started"},
+                    {"id": "t2", "status": "not_started"},
+                ],
+            },
+            "t1": {
+                "id": "t1",
+                "name": "Task1",
+                "status": "not_started",
+                "priority": "medium",
+                "description": "",
+                "parent_id": "root",
+                "subtasks": [],
+            },
+            "t2": {
+                "id": "t2",
+                "name": "Task2",
+                "status": "not_started",
+                "priority": "medium",
+                "description": "",
+                "parent_id": "root",
+                "subtasks": [],
+            },
+        }
+
+        display = MagicMock()
+        display.confirm_plan.return_value = True
+        registry = _make_agent_registry(has={"executor": True})
+        executor = MagicMock()
+        executor.run.return_value = _ok_result()
+        registry.get_or_create.return_value = executor
+        orch = _make_orchestrator(
+            task_manager=tm, agent_registry=registry, display=display
+        )
+
+        orch.run("goal", max_iterations=10)
+
+        # confirm_plan called exactly once despite multiple executor invocations
+        assert display.confirm_plan.call_count == 1
+
+    def test_plan_approved_reset_between_run_calls(self):
+        """_plan_approved is reset at the start of each run() call."""
+        tm = _make_single_executable_tm()
+        display = MagicMock()
+        display.confirm_plan.return_value = True
+        orch = self._make_orch_with_executor(tm, display)
+
+        orch.run("goal")
+        orch.run("goal")
+
+        # checkpoint shown once per run() call
+        assert display.confirm_plan.call_count == 2
