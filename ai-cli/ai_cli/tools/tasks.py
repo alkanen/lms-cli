@@ -14,6 +14,12 @@ All six share a :class:`~ai_cli.core.task_manager.TaskManager` instance
 injected at construction time.  They use ``REGISTER_VIA_INSTANCE = True``
 because their constructors are non-standard; they are wired into registries
 in PR 3 via :meth:`~ai_cli.core.tool_registry.ToolRegistry.register_instance`.
+
+Tasks are referenced by **name path** — a dot-separated string of task names
+from the root to the target (e.g. ``"root_task.sub_task.leaf_task"``).
+A single segment (e.g. ``"root_task"``) addresses a root-level task.
+Name characters are restricted to ``[A-Za-z0-9_]``, so dots unambiguously
+act as separators.
 """
 
 from __future__ import annotations
@@ -84,25 +90,27 @@ class _TaskTool(Tool):
         except TaskStorageError as exc:
             return self._err("storage_error", str(exc), code=500)
 
-    def _parse_task_id(self, kwargs: dict[str, Any]) -> tuple[str, dict | None]:
-        """Return ``(stripped_task_id, None)`` or ``("", error_dict)``."""
-        raw = kwargs.get("task_id", "")
+    def _parse_task_path(
+        self, kwargs: dict[str, Any], key: str = "task_path"
+    ) -> tuple[str, dict | None]:
+        """Return ``(stripped_path, None)`` or ``("", error_dict)``."""
+        raw = kwargs.get(key, "")
         if not isinstance(raw, str) or not raw.strip():
             return "", self._err(
-                "validation_error", "'task_id' must be a non-empty string.", code=400
+                "validation_error", f"'{key}' must be a non-empty string.", code=400
             )
         return raw.strip(), None
 
-    def _parse_parent_id(
+    def _parse_parent_path(
         self, kwargs: dict[str, Any]
     ) -> tuple[str | None, dict | None]:
-        """Return ``(parent_id_or_None, None)`` or ``(None, error_dict)``."""
-        raw = kwargs.get("parent_id")
+        """Return ``(parent_path_or_None, None)`` or ``(None, error_dict)``."""
+        raw = kwargs.get("parent_path")
         if raw is None or raw == "":
             return None, None
         if not isinstance(raw, str):
             return None, self._err(
-                "validation_error", "'parent_id' must be a string.", code=400
+                "validation_error", "'parent_path' must be a string.", code=400
             )
         return raw.strip() or None, None
 
@@ -113,12 +121,12 @@ class _TaskTool(Tool):
 
 
 class TasksListTool(_TaskTool):
-    """List task summaries for direct children of *parent_id* (or root)."""
+    """List task summaries for direct children of *parent_path* (or root)."""
 
     NAME = "tasks_list"
     DESCRIPTION = (
         "List tasks as lightweight summaries. "
-        "Pass parent_id to list subtasks; omit it for root-level tasks."
+        "Pass parent_path to list subtasks; omit it for root-level tasks."
     )
 
     def definition(self) -> ToolSchema:
@@ -127,8 +135,11 @@ class TasksListTool(_TaskTool):
             description=self.description,
             arguments=[
                 ToolArgument(
-                    "parent_id",
-                    "Parent task ID whose subtasks to list, or omit for root tasks.",
+                    "parent_path",
+                    (
+                        "Dot-separated name path of the parent task whose subtasks "
+                        "to list (e.g. 'root_task.sub_task'). Omit for root tasks."
+                    ),
                     "string",
                     required=False,
                 ),
@@ -136,10 +147,17 @@ class TasksListTool(_TaskTool):
         )
 
     def execute(self, **kwargs: Any) -> dict:
-        parent_id, err = self._parse_parent_id(kwargs)
+        parent_path, err = self._parse_parent_path(kwargs)
         if err:
             return err
-        return self._handle(lambda: {"tasks": self._tm.list_tasks(parent_id=parent_id)})
+
+        def _go() -> dict:
+            parent_id = (
+                self._tm.resolve_path_to_id(parent_path) if parent_path else None
+            )
+            return {"tasks": self._tm.list_tasks(parent_id=parent_id)}
+
+        return self._handle(_go)
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +177,11 @@ class TasksGetTool(_TaskTool):
             description=self.description,
             arguments=[
                 ToolArgument(
-                    "task_id",
-                    "The ID of the task to retrieve.",
+                    "task_path",
+                    (
+                        "Dot-separated name path to the task "
+                        "(e.g. 'root_task' or 'root_task.sub_task.leaf_task')."
+                    ),
                     "string",
                     required=True,
                 ),
@@ -168,10 +189,10 @@ class TasksGetTool(_TaskTool):
         )
 
     def execute(self, **kwargs: Any) -> dict:
-        task_id, err = self._parse_task_id(kwargs)
+        path, err = self._parse_task_path(kwargs)
         if err:
             return err
-        return self._handle(lambda: {"task": self._tm.get_task(task_id)})
+        return self._handle(lambda: {"task": self._tm.find_by_path(path)})
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +205,7 @@ class TasksCreateTool(_TaskTool):
 
     NAME = "tasks_create"
     DESCRIPTION = (
-        "Create a new task. Provide parent_id to attach it as a subtask. "
+        "Create a new task. Provide parent_path to attach it as a subtask. "
         "definition_of_done is required and must be at least 5 non-whitespace characters."
     )
 
@@ -195,7 +216,7 @@ class TasksCreateTool(_TaskTool):
             arguments=[
                 ToolArgument(
                     "name",
-                    "Short task name.",
+                    "Short task name (letters, digits, underscores only).",
                     "string",
                     required=True,
                 ),
@@ -212,8 +233,12 @@ class TasksCreateTool(_TaskTool):
                     required=False,
                 ),
                 ToolArgument(
-                    "parent_id",
-                    "Parent task ID to attach this task as a subtask (omit for root).",
+                    "parent_path",
+                    (
+                        "Dot-separated name path of the parent task to attach this "
+                        "task as a subtask (e.g. 'root_task.sub_task'). "
+                        "Omit to create a root-level task."
+                    ),
                     "string",
                     required=False,
                 ),
@@ -233,7 +258,7 @@ class TasksCreateTool(_TaskTool):
         description: str = kwargs.get("description", "")
         priority: str = kwargs.get("priority", "medium")
 
-        parent_id, err = self._parse_parent_id(kwargs)
+        parent_path, err = self._parse_parent_path(kwargs)
         if err:
             return err
 
@@ -254,8 +279,11 @@ class TasksCreateTool(_TaskTool):
                 "validation_error", "'priority' must be a string.", code=400
             )
 
-        return self._handle(
-            lambda: {
+        def _go() -> dict:
+            parent_id = (
+                self._tm.resolve_path_to_id(parent_path) if parent_path else None
+            )
+            return {
                 "task": self._tm.create_task(
                     name=name,
                     definition_of_done=dod,
@@ -264,7 +292,8 @@ class TasksCreateTool(_TaskTool):
                     priority=priority,
                 )
             }
-        )
+
+        return self._handle(_go)
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +317,11 @@ class TasksUpdateTool(_TaskTool):
             description=self.description,
             arguments=[
                 ToolArgument(
-                    "task_id",
-                    "The ID of the task to update.",
+                    "task_path",
+                    (
+                        "Dot-separated name path to the task to update "
+                        "(e.g. 'root_task' or 'root_task.sub_task.leaf_task')."
+                    ),
                     "string",
                     required=True,
                 ),
@@ -342,12 +374,12 @@ class TasksUpdateTool(_TaskTool):
         )
 
     def execute(self, **kwargs: Any) -> dict:
-        task_id, err = self._parse_task_id(kwargs)
+        path, err = self._parse_task_path(kwargs)
         if err:
             return err
 
         update_fields: dict[str, Any] = {
-            k: v for k, v in kwargs.items() if k != "task_id"
+            k: v for k, v in kwargs.items() if k != "task_path"
         }
         if not update_fields:
             return self._err(
@@ -356,9 +388,11 @@ class TasksUpdateTool(_TaskTool):
                 code=400,
             )
 
-        return self._handle(
-            lambda: {"task": self._tm.update_task(task_id, **update_fields)}
-        )
+        def _go() -> dict:
+            task_id = self._tm.resolve_path_to_id(path)
+            return {"task": self._tm.update_task(task_id, **update_fields)}
+
+        return self._handle(_go)
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +412,11 @@ class TasksAddNoteTool(_TaskTool):
             description=self.description,
             arguments=[
                 ToolArgument(
-                    "task_id",
-                    "The ID of the task to annotate.",
+                    "task_path",
+                    (
+                        "Dot-separated name path to the task to annotate "
+                        "(e.g. 'root_task' or 'root_task.sub_task.leaf_task')."
+                    ),
                     "string",
                     required=True,
                 ),
@@ -393,7 +430,7 @@ class TasksAddNoteTool(_TaskTool):
         )
 
     def execute(self, **kwargs: Any) -> dict:
-        task_id, err = self._parse_task_id(kwargs)
+        path, err = self._parse_task_path(kwargs)
         if err:
             return err
         note: str = kwargs.get("note", "")
@@ -401,7 +438,12 @@ class TasksAddNoteTool(_TaskTool):
             return self._err(
                 "validation_error", "'note' must be a non-empty string.", code=400
             )
-        return self._handle(lambda: {"task": self._tm.add_note(task_id, note)})
+
+        def _go() -> dict:
+            task_id = self._tm.resolve_path_to_id(path)
+            return {"task": self._tm.add_note(task_id, note)}
+
+        return self._handle(_go)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +467,11 @@ class TasksMarkDoneTool(_TaskTool):
             description=self.description,
             arguments=[
                 ToolArgument(
-                    "task_id",
-                    "The ID of the task to mark as done.",
+                    "task_path",
+                    (
+                        "Dot-separated name path to the task to mark as done "
+                        "(e.g. 'root_task' or 'root_task.sub_task.leaf_task')."
+                    ),
                     "string",
                     required=True,
                 ),
@@ -434,7 +479,12 @@ class TasksMarkDoneTool(_TaskTool):
         )
 
     def execute(self, **kwargs: Any) -> dict:
-        task_id, err = self._parse_task_id(kwargs)
+        path, err = self._parse_task_path(kwargs)
         if err:
             return err
-        return self._handle(lambda: {"task": self._tm.mark_done(task_id)})
+
+        def _go() -> dict:
+            task_id = self._tm.resolve_path_to_id(path)
+            return {"task": self._tm.mark_done(task_id)}
+
+        return self._handle(_go)
