@@ -661,9 +661,9 @@ class TestAgentRun:
         assert result.status == "error"
         assert "prior tool cycle" in result.error_message.lower()
         # The user message must not have been persisted.
-        assert all(
-            c[0][0] != "user" for c in session.add_message.call_args_list
-        ), "User message must not be appended when prior tool cycle close fails"
+        assert all(c[0][0] != "user" for c in session.add_message.call_args_list), (
+            "User message must not be appended when prior tool cycle close fails"
+        )
 
     def test_llm_error_returns_error_result(self):
         llm = MagicMock()

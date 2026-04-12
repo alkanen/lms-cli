@@ -27,6 +27,7 @@ from ai_cli.cli.repl import REPL
 from ai_cli.core.agent_registry import AgentRegistry, load_agent_specs
 from ai_cli.core.config_manager import ConfigError, ConfigManager
 from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
+from ai_cli.core.mcp_manager import MCPManager
 from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
 from ai_cli.core.task_manager import TaskManager
@@ -490,6 +491,11 @@ def _cmd_repl(
     task_manager = TaskManager(session.session_dir)
     _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
 
+    # Wire up MCP servers (connect, discover tools, register proxies).
+    mcp_manager = _wire_mcp(
+        global_dir, root, tool_registry, workspace, permission_manager
+    )
+
     if resumed:
         _show_resume_context(session, ui)
 
@@ -502,8 +508,13 @@ def _cmd_repl(
         config,
         agent_registry=agent_registry,
         task_manager=task_manager,
+        mcp_manager=mcp_manager,
     )
-    repl.run()
+    try:
+        repl.run()
+    finally:
+        if mcp_manager is not None:
+            mcp_manager.close_all()
 
 
 def _wire_agents(
@@ -611,6 +622,36 @@ def _wire_tasks(
         tool_registry.register_instance(
             tool_cls(task_manager, workspace, permission_manager)
         )
+
+
+def _wire_mcp(
+    global_dir: Path,
+    project_root: Path,
+    tool_registry: ToolRegistry,
+    workspace: Workspace,
+    permission_manager: PermissionManager,
+) -> MCPManager | None:
+    """Connect to all configured MCP servers and register their tools.
+
+    Returns the :class:`MCPManager` instance (even if no servers are configured
+    or all fail to connect), or ``None`` only when both config files are absent.
+    Errors are logged as warnings; the CLI continues regardless.
+    """
+    global_mcp = global_dir / "mcp.yaml"
+    project_mcp = project_root / _DOT_AI_CLI / "mcp.yaml"
+
+    if not global_mcp.is_file() and not project_mcp.is_file():
+        return None
+
+    manager = MCPManager(
+        global_config_path=global_mcp,
+        project_config_path=project_mcp,  # always pass so --persist can create it
+        tool_registry=tool_registry,
+        workspace=workspace,
+        permission_manager=permission_manager,
+    )
+    manager.connect_all()
+    return manager
 
 
 def _ensure_global_dir(global_dir: Path) -> bool:

@@ -2478,3 +2478,32 @@ class TestTasksCommand:
         tm.create_task.assert_called_once()
         _, kwargs = tm.create_task.call_args
         assert kwargs.get("definition_of_done") == "at least five chars"
+
+
+# ---------------------------------------------------------------------------
+# /mcp — MCPError handling
+# ---------------------------------------------------------------------------
+
+
+class TestMcpCommandErrorHandling:
+    """MCPError during /mcp --persist should be shown, not crash the REPL."""
+
+    def test_persist_mcp_error_shown(self):
+        from ai_cli.core.mcp_manager import MCPError
+
+        display = MagicMock()
+        mcp_mgr = MagicMock()
+        mcp_mgr.server_names.return_value = ["srv"]
+        mcp_mgr.disable_server.side_effect = MCPError("corrupt mcp.yaml")
+
+        repl = REPL(
+            session=MagicMock(),
+            tool_registry=MagicMock(),
+            llm_client=_make_llm(),
+            display=display,
+            workspace=MagicMock(),
+            mcp_manager=mcp_mgr,
+        )
+        repl._handle_mcp_subcommand("disable --persist srv")
+        display.show_error.assert_called_once()
+        assert "corrupt mcp.yaml" in display.show_error.call_args[0][0]

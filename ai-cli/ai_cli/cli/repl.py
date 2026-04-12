@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from ai_cli.core.agent_registry import AgentRegistry
     from ai_cli.core.config_manager import ConfigManager
     from ai_cli.core.llm_client import LLMClient
+    from ai_cli.core.mcp_manager import MCPManager
     from ai_cli.core.session_manager import Session
     from ai_cli.core.task_manager import TaskManager
     from ai_cli.core.task_orchestrator import TaskOrchestrator
@@ -70,6 +71,16 @@ _DEFAULT_MAX_PIXELS: int = 1920 * 1080
 # Overridable via config key ``max_tool_rounds``, ``--max-tool-rounds`` CLI
 # flag, or the ``/rounds`` slash command.
 _DEFAULT_MAX_TOOL_ROUNDS = 10
+
+# Past-tense labels for /tools and /mcp enable/disable/allow/disallow status
+# messages. Hoisted to module scope so tool- and server-level branches cannot
+# drift apart if wording changes later.
+_PERMISSION_PAST_TENSE: dict[str, str] = {
+    "enable": "enabled",
+    "disable": "disabled",
+    "allow": "allowed",
+    "disallow": "disallowed",
+}
 
 # MIME types for recognised image extensions.  Files with these extensions are
 # base64-encoded and sent as image_url content blocks instead of text.
@@ -115,6 +126,17 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     (
         "/index [path] [--file <path>] [--label <name>] [--full] [--remove]",
         "Index files for semantic search; [path] adds a root, --file indexes a single file",
+    ),
+    ("/mcp", "List configured MCP servers and their connection status"),
+    ("/mcp list", "List all MCP servers with status and tool count"),
+    ("/mcp info <server>", "Show tools exposed by an MCP server"),
+    (
+        "/mcp enable|disable [--persist] <server> [<tool>]",
+        "Enable or disable an MCP server or individual tool",
+    ),
+    (
+        "/mcp allow|disallow [--persist] <server> [<tool>]",
+        "Allow or disallow an MCP server or individual tool (hard gate)",
     ),
     ("/agents", "List configured agent types"),
     (
@@ -335,6 +357,7 @@ class REPL:
         config: ConfigManager | None = None,
         agent_registry: AgentRegistry | None = None,
         task_manager: TaskManager | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
@@ -344,6 +367,7 @@ class REPL:
         self._config = config
         self._agent_registry = agent_registry
         self._task_manager = task_manager
+        self._mcp_manager = mcp_manager
         # Orchestrator instance — created on first /plan and reused across calls.
         self._orchestrator: TaskOrchestrator | None = None
         # Maximum tool-call rounds per user turn — readable from config and
@@ -429,6 +453,7 @@ class REPL:
                     slash_commands=_SLASH_COMMAND_NAMES,
                     tool_registry=self._tool_registry,
                     workspace=self._workspace,
+                    mcp_manager=self._mcp_manager,
                     max_path_completions=max_completions,
                 ),
                 complete_while_typing=cwt,
@@ -532,6 +557,10 @@ class REPL:
         elif cmd == "index":
             self._handle_index_command(command[len(cmd) :].strip())
 
+        elif cmd == "mcp":
+            remainder = command[len(cmd) :].strip()
+            self._handle_mcp_subcommand(remainder)
+
         elif cmd == "agents":
             self._handle_agents_command()
 
@@ -614,20 +643,117 @@ class REPL:
                     self._tool_registry.disallow_session(name)
                 else:
                     self._tool_registry.disallow(name)
-            _past = {
-                "enable": "enabled",
-                "disable": "disabled",
-                "allow": "allowed",
-                "disallow": "disallowed",
-            }
             scope = "this session" if session_flag else "persistently"
-            self._display.show_status(f"Tool '{name}': {_past[sub]} {scope}.")
+            self._display.show_status(
+                f"Tool '{name}': {_PERMISSION_PAST_TENSE[sub]} {scope}."
+            )
             return
 
         self._display.show_error(
             f"Unknown /tools subcommand: '{sub}'. "
             "Try /tools, /tools list, /tools info <name>, "
             "or /tools enable|disable|allow|disallow [--session] <name>."
+        )
+
+    # ------------------------------------------------------------------
+    # /mcp subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_mcp_subcommand(self, remainder: str) -> None:
+        """Dispatch /mcp [subcommand] [args]."""
+        if self._mcp_manager is None:
+            self._display.show_status("No MCP servers configured.")
+            return
+
+        parts = remainder.split()
+        sub = parts[0].lower() if parts else ""
+
+        if not sub or sub == "list":
+            statuses = self._mcp_manager.status()
+            if not statuses:
+                self._display.show_status("No MCP servers configured.")
+                return
+            lines = ["MCP Servers"]
+            for s in statuses:
+                if s.connected:
+                    lines.append(f"  {s.name:<20}  connected    {s.tool_count} tool(s)")
+                else:
+                    lines.append(f"  {s.name:<20}  ERROR: {s.error}")
+            self._display.show_status("\n".join(lines))
+            return
+
+        if sub == "info":
+            if len(parts) < 2:
+                self._display.show_error("Usage: /mcp info <server>")
+                return
+            server_name = parts[1]
+            if server_name not in self._mcp_manager.server_names():
+                self._display.show_error(f"Unknown MCP server: '{server_name}'")
+                return
+            tools = self._mcp_manager.get_server_tools(server_name)
+            if not tools:
+                self._display.show_status(f"{server_name}: no tools discovered.")
+                return
+            lines = [f"{server_name}"]
+            for t in tools:
+                ns_name = f"{server_name}__{t}"
+                tool_obj = self._tool_registry.get(ns_name)
+                desc = tool_obj.description if tool_obj else ""
+                lines.append(f"  {ns_name:<45}  {desc}")
+            self._display.show_status("\n".join(lines))
+            return
+
+        if sub in ("enable", "disable", "allow", "disallow"):
+            rest = parts[1:]
+            persist = bool(rest and rest[0] == "--persist")
+            if persist:
+                rest = rest[1:]
+            if not rest:
+                self._display.show_error(
+                    f"Usage: /mcp {sub} [--persist] <server> [<tool>]"
+                )
+                return
+            server_name = rest[0]
+            if server_name not in self._mcp_manager.server_names():
+                self._display.show_error(f"Unknown MCP server: '{server_name}'")
+                return
+            tool_name = rest[1] if len(rest) > 1 else None
+
+            from ai_cli.core.mcp_manager import MCPError
+
+            try:
+                if tool_name is not None:
+                    known = self._mcp_manager.get_server_tools(server_name)
+                    if tool_name not in known:
+                        self._display.show_error(
+                            f"Unknown tool '{tool_name}' for server '{server_name}'"
+                        )
+                        return
+                    getattr(self._mcp_manager, f"{sub}_tool")(
+                        server_name, tool_name, persist=persist
+                    )
+                    scope = "persistently" if persist else "this session"
+                    self._display.show_status(
+                        f"MCP tool '{server_name}__{tool_name}': "
+                        f"{_PERMISSION_PAST_TENSE[sub]} {scope}."
+                    )
+                else:
+                    getattr(self._mcp_manager, f"{sub}_server")(
+                        server_name, persist=persist
+                    )
+                    scope = "persistently" if persist else "this session"
+                    self._display.show_status(
+                        f"MCP server '{server_name}': all tools "
+                        f"{_PERMISSION_PAST_TENSE[sub]} {scope}."
+                    )
+            except MCPError as exc:
+                self._display.show_error(f"MCP error: {exc}")
+            return
+
+        self._display.show_error(
+            f"Unknown /mcp subcommand: '{sub}'. "
+            "Try /mcp list, /mcp info <server>, "
+            "or /mcp enable|disable|allow|disallow [--persist] <server> [<tool>]."
         )
 
     # ------------------------------------------------------------------
