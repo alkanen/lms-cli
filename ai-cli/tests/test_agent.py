@@ -221,12 +221,17 @@ class TestAgentRun:
     def test_abort_before_first_round(self):
         abort = threading.Event()
         abort.set()
-        agent = _make_agent()
+        session = MagicMock()
+        session.get_messages.return_value = []
+        agent = _make_agent(session=session)
 
         result = agent.run("go", abort=abort)
 
         assert result.partial is True
         assert result.text == ""
+        # add_message is called once for the user prompt, never for "assistant".
+        assert session.add_message.call_count == 1
+        assert session.add_message.call_args_list[0][0] == ("user", "go")
 
     def test_abort_mid_streaming(self):
         abort = threading.Event()
@@ -297,6 +302,167 @@ class TestAgentRun:
         stub_ids = {m["tool_call_id"] for m in tool_msgs}
         assert "call-B" in stub_ids
 
+    def test_abort_after_completed_round_closes_session(self):
+        """Abort at the top of a new round (after the previous round's tool
+        response was saved) must inject a closing assistant message so the
+        session does not end with role=tool.
+
+        Uses a stateful session so get_messages() accurately reflects what
+        has been written rather than a static return value.
+        """
+        abort = threading.Event()
+
+        messages: list[dict] = []
+        session = MagicMock()
+        session.get_messages.side_effect = lambda: list(messages)
+        session.add_message.side_effect = lambda role, content: messages.append(
+            {"role": role, "content": content}
+        )
+        session.add_raw_message.side_effect = lambda msg: messages.append(dict(msg))
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.get.return_value = None
+
+        def _execute(name, args, **kwargs):
+            abort.set()  # fires after round 1's only tool call executes
+            return {"status": "success", "data": {}}
+
+        tool_registry.execute.side_effect = _execute
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c0",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            )
+            for _ in range(2)
+        ]
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        agent.run("do something", abort=abort)
+
+        session.add_message.assert_called_with("assistant", "[Aborted by user.]")
+
+    def test_abort_post_stream_closes_session(self):
+        """Abort detected after the stream ends (but before the current round's
+        messages are saved) must inject a closing assistant message when the
+        previous round ended with role=tool.
+
+        Uses a stateful session so get_messages() accurately reflects what
+        has been written, rather than a static mock that would pass regardless
+        of ordering.
+        """
+        abort = threading.Event()
+
+        # Stateful session: add_message/add_raw_message update the list that
+        # get_messages() reads from, mirroring real session behaviour.
+        messages: list[dict] = []
+        session = MagicMock()
+        session.get_messages.side_effect = lambda: list(messages)
+        session.add_message.side_effect = lambda role, content: messages.append(
+            {"role": role, "content": content}
+        )
+        session.add_raw_message.side_effect = lambda msg: messages.append(dict(msg))
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = None
+
+        def _round2_chunks():
+            abort.set()
+            yield {"type": "done", "stop_reason": "stop", "usage": {}}
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.side_effect = [
+            # Round 1: tool call — tool result is persisted, session ends role=tool.
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c0",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            # Round 2: abort fires during streaming.
+            _round2_chunks(),
+        ]
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        agent.run("do something", abort=abort)
+
+        # A closing assistant message must follow the abort so the session
+        # does not end with role=tool.
+        assert any(
+            c[0][0] == "assistant" and "Aborted" in c[0][1]
+            for c in session.add_message.call_args_list
+        ), "Expected a closing assistant message after abort"
+
+    def test_abort_mid_tool_execution_closes_session(self):
+        """After stubs are injected for un-executed tool calls, a closing
+        assistant message must follow so the session does not end with role=tool.
+
+        Uses a stateful session so get_messages() accurately reflects what
+        has been written rather than a static return value.
+        """
+        abort = threading.Event()
+
+        messages: list[dict] = []
+        session = MagicMock()
+        session.get_messages.side_effect = lambda: list(messages)
+        session.add_message.side_effect = lambda role, content: messages.append(
+            {"role": role, "content": content}
+        )
+        session.add_raw_message.side_effect = lambda msg: messages.append(dict(msg))
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.get.return_value = None
+
+        def _execute(name, args, **kwargs):
+            abort.set()
+            return {"status": "success", "data": {}}
+
+        tool_registry.execute.side_effect = _execute
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.return_value = iter(
+            [
+                {
+                    "type": "tool_call",
+                    "name": "read_file",
+                    "call_id": "call-A",
+                    "arguments": {},
+                },
+                {
+                    "type": "tool_call",
+                    "name": "read_file",
+                    "call_id": "call-B",
+                    "arguments": {},
+                },
+                {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+            ]
+        )
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        agent.run("do something", abort=abort)
+
+        session.add_message.assert_called_with("assistant", "[Aborted by user.]")
+
     def test_tool_round_limit(self):
         spec = AgentSpec(
             name="limited",
@@ -343,7 +509,11 @@ class TestAgentRun:
     def test_tool_round_limit_closes_session_with_assistant_message(self):
         """tool_limit must write a synthetic assistant message so the session
         does not end with role=tool, which would cause a role-sequence error
-        on the next user prompt."""
+        on the next user prompt.
+
+        Uses an empty session so the tool_limit closure is driven by the
+        run's own tool persistence rather than a pre-seeded tool message.
+        """
         spec = AgentSpec(
             name="limited",
             system_message="",
@@ -388,9 +558,7 @@ class TestAgentRun:
             "assistant", "[Stopped: tool call limit reached.]"
         )
 
-    def test_tool_round_limit_closing_message_session_error_is_logged(
-        self, caplog
-    ):
+    def test_tool_round_limit_closing_message_session_error_is_logged(self, caplog):
         """If writing the closing assistant message raises SessionError, the
         error is logged at ERROR level and tool_limit is still returned (no crash)."""
         import logging
@@ -403,9 +571,11 @@ class TestAgentRun:
             max_tool_rounds=1,
         )
         session = MagicMock()
+        # Empty session: the tool_limit closure is driven by _last_persisted_role
+        # tracking within the run, not by a pre-seeded tool message.
         session.get_messages.return_value = []
         # First call is the user message (must succeed); second is the
-        # synthetic closing assistant message — fail that one.
+        # synthetic closing assistant message at tool_limit — fail that one.
         session.add_message.side_effect = [None, SessionError("disk full")]
 
         tool_registry = MagicMock()
@@ -441,6 +611,60 @@ class TestAgentRun:
         assert error_logs, "Expected at least one ERROR log entry"
         assert any("disk full" in r.message for r in error_logs)
 
+    def test_run_closes_prior_open_tool_cycle_before_user_message(self):
+        """Starting a new run() when the session already ends with role=tool (from
+        a prior interrupted run) must inject a closing assistant message *before*
+        the new user prompt so the session never contains [..., tool, user].
+
+        Uses a stateful session so get_messages() reflects writes — the post-close
+        re-read must see role=assistant (not the original role=tool) to proceed.
+        """
+        messages: list[dict] = [{"role": "tool", "content": "..."}]
+        session = MagicMock()
+        session.get_messages.side_effect = lambda: list(messages)
+        session.add_message.side_effect = lambda role, content: messages.append(
+            {"role": role, "content": content}
+        )
+        session.add_raw_message.side_effect = lambda msg: messages.append(dict(msg))
+
+        llm = MagicMock()
+        llm.send.return_value = iter(_text_chunks("ok"))
+        llm.get_model_metadata.return_value = {}
+
+        agent = _make_agent(session=session, llm=llm)
+        result = agent.run("new prompt")
+
+        assert result.status == "ok"
+        # The closing assistant message must appear before the user message.
+        calls = session.add_message.call_args_list
+        roles = [c[0][0] for c in calls]
+        assert "assistant" in roles, "Expected a closing assistant message"
+        assert "user" in roles, "Expected the user message"
+        assert roles.index("assistant") < roles.index("user"), (
+            "Closing assistant message must precede the user message"
+        )
+
+    def test_run_returns_error_if_prior_tool_cycle_cannot_be_closed(self):
+        """If the pre-run close of a trailing tool message fails (SessionError on
+        add_message), run() must return status='error' without appending the new
+        user message so the session never contains [..., tool, user]."""
+        messages: list[dict] = [{"role": "tool", "content": "..."}]
+        session = MagicMock()
+        session.get_messages.side_effect = lambda: list(messages)
+        # add_message always fails — the closing assistant write cannot proceed.
+        session.add_message.side_effect = SessionError("disk full")
+        display = MagicMock()
+
+        agent = _make_agent(session=session, display=display)
+        result = agent.run("new prompt")
+
+        assert result.status == "error"
+        assert "prior tool cycle" in result.error_message.lower()
+        # The user message must not have been persisted.
+        assert all(
+            c[0][0] != "user" for c in session.add_message.call_args_list
+        ), "User message must not be appended when prior tool cycle close fails"
+
     def test_llm_error_returns_error_result(self):
         llm = MagicMock()
         llm.send.side_effect = LLMError("Connection refused")
@@ -452,6 +676,43 @@ class TestAgentRun:
         assert result.status == "error"
         assert "Connection refused" in result.error_message
         display.show_error.assert_called_once()
+
+    def test_llm_error_after_tool_persistence_closes_session(self):
+        """LLMError on the second round (after tool results were saved in round 1)
+        must inject a closing assistant message so the session does not end with
+        role=tool, which would cause a role-sequence error on the next prompt."""
+        session = MagicMock()
+        session.get_messages.return_value = []
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        # Round 1: returns a tool call (tool result is persisted after execution).
+        # Round 2: raises LLMError — session now ends with role=tool from round 1.
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c0",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            ),
+            LLMError("backend unavailable"),
+        ]
+
+        agent = _make_agent(session=session, llm=llm, tool_registry=tool_registry)
+        result = agent.run("do something")
+
+        assert result.status == "error"
+        session.add_message.assert_called_with("assistant", "[LLM error.]")
 
     def test_session_error_on_get_messages(self):
         session = MagicMock()
@@ -740,3 +1001,9 @@ class TestContextOverflow:
             == "tool"
         ]
         assert "call-abc" in stub_ids
+        # A closing assistant message must follow the stubs so the session does
+        # not end with role=tool, which would cause a role-sequence error on the
+        # next user prompt.
+        session.add_message.assert_called_with(
+            "assistant", "[Stopped: context limit reached.]"
+        )

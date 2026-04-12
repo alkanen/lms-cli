@@ -91,6 +91,10 @@ class Agent:
         self._tool_registry = tool_registry
         self._display = display
         self._pending_transients: dict[str, dict] = {}
+        # Tracks the role of the last message successfully persisted to the
+        # session so that _close_open_tool_cycle() can decide whether to inject
+        # a synthetic assistant message without an O(n) get_messages() read.
+        self._last_persisted_role: str = ""
 
     def reset(self) -> None:
         """Reset per-run state for agent reuse.
@@ -102,6 +106,40 @@ class Agent:
         """
         self._display.reset()
         self._pending_transients.clear()
+        self._last_persisted_role = ""
+
+    def _close_open_tool_cycle(self, reason: str) -> None:
+        """Inject a synthetic assistant message if the session ends with role=tool.
+
+        Tool-response messages must always be followed by an assistant message
+        before the next user turn.  Call this before any early return that does
+        not otherwise write a closing assistant message, so the session is left
+        in a state the LLM will accept on the next prompt.
+
+        Uses ``_last_persisted_role`` as a fast-path guard.  When the tracked
+        role is "assistant" the cycle is already closed and no read is needed.
+        When it is "tool" we injected the tool messages ourselves and know a
+        close is required without a read.  Only when the tracked role is
+        ambiguous (empty string or "user") do we fall back to ``get_messages()``
+        to handle tool cycles left open by prior runs.
+        """
+        if self._last_persisted_role == "assistant":
+            return
+        if self._last_persisted_role != "tool":
+            # Ambiguous: may be the start of a new run on a session-persistent
+            # agent whose previous run ended with a tool message.  Check the
+            # actual session to be safe.
+            try:
+                messages = self._session.get_messages()
+            except SessionError:
+                return
+            if not (messages and messages[-1].get("role") == "tool"):
+                return
+        try:
+            self._session.add_message("assistant", reason)
+            self._last_persisted_role = "assistant"
+        except SessionError as exc:
+            logger.error("Failed to write closing assistant message: %s", exc)
 
     def run(
         self,
@@ -116,11 +154,47 @@ class Agent:
         issues end_turn, the tool-round limit is hit, or the abort event
         is set.
         """
+        # Close any open tool cycle from a prior aborted/crashed run *before*
+        # appending the new user message, so the session never reaches
+        # [..., tool, user].  Force the shared helper to consult the actual
+        # session state by clearing the sentinel — _last_persisted_role may not
+        # reflect external inconsistencies (crashes, other writers).
+        self._last_persisted_role = ""  # sentinel: forces get_messages() fallback
+        self._close_open_tool_cycle("[Prior run ended without closing tool cycle.]")
+        # Always re-verify the actual session state after the close attempt so
+        # _last_persisted_role is fresh (not a stale cached value), and to detect
+        # a failed close (add_message raised SessionError inside the helper).
+        try:
+            _prior_msgs = self._session.get_messages()
+            self._last_persisted_role = (
+                _prior_msgs[-1].get("role", "") if _prior_msgs else ""
+            )
+        except SessionError as exc:
+            self._display.show_error(
+                f"Could not verify session state after closing prior tool cycle: {exc}"
+            )
+            return AgentResult(
+                text="",
+                status="error",
+                partial=False,
+                error_message=str(exc),
+            )
+        if self._last_persisted_role == "tool":
+            msg = "Could not close prior tool cycle; refusing to append user message."
+            self._display.show_error(msg)
+            return AgentResult(
+                text="",
+                status="error",
+                partial=False,
+                error_message=msg,
+            )
+
         try:
             if isinstance(prompt, list):
                 self._session.add_raw_message({"role": "user", "content": prompt})
             else:
                 self._session.add_message("user", prompt)
+            self._last_persisted_role = "user"
         except SessionError as exc:
             self._display.show_error(f"Could not save message: {exc}")
             return AgentResult(
@@ -135,6 +209,7 @@ class Agent:
 
         for _ in range(self.spec.max_tool_rounds):
             if abort is not None and abort.is_set():
+                self._close_open_tool_cycle("[Aborted by user.]")
                 self._display.show_status("Aborted.")
                 return AgentResult(
                     text="".join(all_text_parts), status="ok", partial=True
@@ -147,6 +222,7 @@ class Agent:
                 messages = self._session.get_messages()
             except SessionError as exc:
                 self._display.show_error(f"Could not read conversation history: {exc}")
+                self._close_open_tool_cycle("[Session read error.]")
                 return AgentResult(
                     text="".join(all_text_parts),
                     status="error",
@@ -224,6 +300,7 @@ class Agent:
                 else:
                     raise
             except LLMError as exc:
+                self._close_open_tool_cycle("[LLM error.]")
                 self._display.show_error(f"LLM error: {exc}")
                 return AgentResult(
                     text="".join(all_text_parts),
@@ -241,6 +318,7 @@ class Agent:
             all_text_parts.extend(text_parts)
 
             if abort is not None and abort.is_set():
+                self._close_open_tool_cycle("[Aborted by user.]")
                 self._display.show_status("Aborted.")
                 return AgentResult(
                     text="".join(all_text_parts), status="ok", partial=True
@@ -264,8 +342,10 @@ class Agent:
                 }
                 try:
                     self._session.add_raw_message(assistant_msg)
+                    self._last_persisted_role = "assistant"
                 except SessionError as exc:
                     self._display.show_error(f"Could not save assistant message: {exc}")
+                    self._close_open_tool_cycle("[Session write error.]")
                     return AgentResult(
                         text="".join(all_text_parts),
                         status="error",
@@ -275,8 +355,10 @@ class Agent:
             elif full_text:
                 try:
                     self._session.add_message("assistant", full_text)
+                    self._last_persisted_role = "assistant"
                 except SessionError as exc:
                     self._display.show_error(f"Could not save assistant message: {exc}")
+                    self._close_open_tool_cycle("[Session write error.]")
                     return AgentResult(
                         text="".join(all_text_parts),
                         status="error",
@@ -304,12 +386,14 @@ class Agent:
                                 ),
                             }
                         )
+                        self._last_persisted_role = "tool"
                     except SessionError as exc:
                         logger.error(
                             "Failed to inject context-limit stub for call_id=%r: %s",
                             pending["call_id"],
                             exc,
                         )
+                self._close_open_tool_cycle("[Stopped: context limit reached.]")
                 return AgentResult(
                     text="".join(all_text_parts),
                     status="context_limit",
@@ -338,12 +422,14 @@ class Agent:
                                     ),
                                 }
                             )
+                            self._last_persisted_role = "tool"
                         except SessionError as exc:
                             logger.error(
                                 "Failed to inject abort stub for call_id=%r: %s",
                                 pending["call_id"],
                                 exc,
                             )
+                    self._close_open_tool_cycle("[Aborted by user.]")
                     self._display.show_status("Aborted.")
                     return AgentResult(
                         text="".join(all_text_parts),
@@ -407,6 +493,7 @@ class Agent:
                             "content": json.dumps(result, default=str),
                         }
                     )
+                    self._last_persisted_role = "tool"
                 except SessionError as exc:
                     self._display.show_error(f"Could not save tool result: {exc}")
                     return AgentResult(
@@ -421,19 +508,9 @@ class Agent:
                 self.spec.max_tool_rounds,
             )
             # The final round always ends with saved tool-response messages.
-            # Without a following assistant message the session history is in
-            # an invalid state: the next user prompt would produce the sequence
-            # [..., tool, tool, user] which most LLM prompt templates reject.
-            # Inject a synthetic assistant turn to close out the open tool cycle.
-            try:
-                self._session.add_message(
-                    "assistant",
-                    "[Stopped: tool call limit reached.]",
-                )
-            except SessionError as exc:
-                logger.error(
-                    "Failed to write tool-limit closing message: %s", exc
-                )
+            # Inject a synthetic assistant turn to close the open tool cycle
+            # so the next user prompt does not produce an invalid role sequence.
+            self._close_open_tool_cycle("[Stopped: tool call limit reached.]")
             return AgentResult(
                 text="".join(all_text_parts),
                 status="tool_limit",
