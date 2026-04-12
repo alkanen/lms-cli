@@ -18,7 +18,7 @@ ai-cli/
 │   │   ├── permission_manager.py # ✅ In-memory permission state
 │   │   ├── tool_registry.py      # ✅ Three-tier tool discovery, loading, settings
 │   │   ├── llm_client.py         # ✅ Abstract LLMClient + OpenAI-compatible implementation
-│   │   ├── mcp_manager.py        # 🔲 MCP server connections, tool exposure
+│   │   ├── mcp_manager.py        # ✅ MCPManager, MCPProxyTool, MCPServerConfig, ServerStatus, MCPError
 │   │   ├── session_manager.py    # ✅ Session create/resume/compact/persist
 │   │   ├── agent.py              # 🔲 Agent, AgentSpec, AgentResult, SubAgentDisplay
 │   │   ├── agent_registry.py     # 🔲 AgentSpec loading from config, instance caching
@@ -67,6 +67,8 @@ workspace → config_manager
 workspace → ignore_filter
 workspace → embedding_index     (optional attribute; None when embeddings disabled)
 mcp_manager → tool_registry
+mcp_manager → workspace
+mcp_manager → permission_manager
 agent → llm_client
 agent → session_manager
 agent → tool_registry
@@ -367,6 +369,73 @@ lowering `permission_required` from True to False is only allowed when:
 At runtime `_is_enabled()` checks session overrides first, then falls back to `_enabled`. There is no separate third layer — the `DISABLED_BY_DEFAULT` attribute only affects the initial value of `_enabled` at load time.
 
 `enable()`/`disable()` clear any session override for the tool before updating persistent state.
+
+---
+
+### MCPManager ✅
+
+See `design_mcp.md` for the full design.  Interface summary:
+
+```python
+class MCPServerConfig:
+    name: str
+    transport: Literal["stdio", "sse"]
+    command: str | None       # stdio only
+    args: list[str]           # stdio only
+    url: str | None           # sse only
+    api_key_env: str | None   # sse only — env var name
+    api_key_header: str | None # sse only — HTTP header name
+    api_key_prefix: str        # sse only — prepended to key value
+
+class ServerStatus:
+    name: str
+    connected: bool
+    error: str | None
+    tool_count: int
+    tools: list[str]          # original (un-namespaced) tool names
+
+class MCPManager:
+    def __init__(
+        self,
+        global_config_path: Path,
+        project_config_path: Path | None,
+        tool_registry: ToolRegistry,
+        workspace: Workspace,
+        permission_manager: PermissionManager,
+    ): ...
+
+    def connect_all(self) -> None:
+        """Load mcp.yaml (global then project), connect all servers, register MCPProxyTool instances.
+
+        MCP tool invocation is performed by those proxy tools, which delegate directly to the
+        underlying transport; MCPManager does not expose a separate call_tool API.
+        """
+
+    def status(self) -> list[ServerStatus]: ...
+    def get_server_tools(self, server_name: str) -> list[str]: ...
+
+    def enable_server(self, server_name: str, *, persist: bool = False) -> None: ...
+    def disable_server(self, server_name: str, *, persist: bool = False) -> None: ...
+    def allow_server(self, server_name: str, *, persist: bool = False) -> None: ...
+    def disallow_server(self, server_name: str, *, persist: bool = False) -> None: ...
+    def enable_tool(self, server_name: str, tool_name: str, *, persist: bool = False) -> None: ...
+    def disable_tool(self, server_name: str, tool_name: str, *, persist: bool = False) -> None: ...
+    def allow_tool(self, server_name: str, tool_name: str, *, persist: bool = False) -> None: ...
+    def disallow_tool(self, server_name: str, tool_name: str, *, persist: bool = False) -> None: ...
+```
+
+**Tool naming**: MCP tools are registered as `<server>__<tool>` (double underscore).
+Full name must satisfy `^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$`; names that violate this are skipped with a warning.
+
+**Startup**: `connect_all()` is called from `__main__.py` after `ToolRegistry.load()`.
+Failed servers are warned and skipped; disabled servers still connect (for `/mcp info`
+and tab completion) but their tools are registered as disabled.
+
+**Runtime state**: enable/disable/allow/disallow are in-memory by default.
+Pass `persist=True` to write to the project `.ai-cli/mcp.yaml`.
+
+**Config files**: `~/.ai-cli/mcp.yaml` (global) and `<project>/.ai-cli/mcp.yaml`
+(project, wins on collision).  YAML format — see `design_mcp.md`.
 
 ---
 
@@ -1090,43 +1159,6 @@ Six tools sharing a `TaskManager` instance, all in `tools/tasks.py`:
 
 `tasks_update` excludes `"done"` from valid status values — transitioning
 to done must go through `tasks_mark_done` for validation.
-
----
-
-### MCPManager 🔲
-
-```python
-class MCPManager:
-    def __init__(
-        self,
-        tool_registry: ToolRegistry,
-        config_manager: ConfigManager,
-    ): ...
-
-    def connect_all(self) -> None:
-        """
-        Read mcp_servers.yaml from global + project .ai-cli/.
-        Connect to each server via stdio or SSE.
-        Register their tools into tool_registry.
-
-        Security: project-level mcp_servers.yaml is untrusted. Any stdio
-        command defined there must be explicitly approved by the user before
-        execution. Global (~/.ai-cli/) entries are considered trusted.
-        """
-
-    def disconnect_all(self) -> None: ...
-
-
-@dataclass
-class MCPServerConfig:
-    name: str
-    transport: Literal["stdio", "sse"]
-    command: list[str] | None  # for stdio
-    url: str | None            # for sse
-    enabled: bool = True
-```
-
-MCP tools are wrapped in a thin `MCPTool(Tool)` subclass that forwards `execute()` calls to the MCP server and uses the server-provided schema for `definition()`.
 
 ---
 

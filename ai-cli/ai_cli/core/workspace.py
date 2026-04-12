@@ -254,6 +254,24 @@ _INIT_TEMPLATES: dict[str, str] = {
 
                 return self._ok({"result": " ".join([message] * times)})
     """),
+    "mcp.yaml": textwrap.dedent("""\
+        # MCP server definitions for this project.
+        # See docs/design_mcp.md for the full schema.
+        servers:
+          # Example — stdio (local process):
+          # my-server:
+          #   transport: stdio
+          #   command: uvx
+          #   args: [mcp-server-filesystem, /home/user/projects]
+
+          # Example — SSE (remote server):
+          # my-api:
+          #   transport: sse
+          #   url: https://api.example.com/mcp
+          #   api_key_env: MY_API_KEY          # name of env-var holding the key
+          #   api_key_header: Authorization    # HTTP header to send the key in
+          #   api_key_prefix: "Bearer "        # prepended to the key value
+    """),
     "system_prompt.md": textwrap.dedent("""\
         <!-- Project-specific system prompt (optional).
              Overrides the global default system prompt when present. -->
@@ -382,6 +400,25 @@ _GLOBAL_INIT_TEMPLATES: dict[str, str] = {
              project-level system_prompt.md is present. -->
     """),
     ".ignore": _INIT_TEMPLATES[".ignore"],
+    "mcp.yaml": textwrap.dedent("""\
+        servers:
+          # context7 — up-to-date library documentation via SSE.
+          # Uncomment and fill in your API key env-var to enable.
+          #
+          # context7:
+          #   transport: sse
+          #   url: https://mcp.context7.com/mcp
+          #   api_key_env: CONTEXT7_API_KEY
+          #   api_key_header: CONTEXT7_API_KEY
+          #
+          # Example — stdio (local process):
+          # my-server:
+          #   transport: stdio
+          #   command: uvx
+          #   args:
+          #     - mcp-server-filesystem
+          #     - /home/user/projects
+    """),
 }
 
 

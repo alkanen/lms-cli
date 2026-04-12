@@ -43,6 +43,10 @@ This document outlines the technical requirements for the AI CLI tool project. I
   - `read_file` — `path` (required), `start_line`, `end_line` (optional, 1-based inclusive)
   - `write_file` — `path`, `content` (required), `start_line`, `end_line` (optional, must be provided together)
 
+- **Tool name constraints**:
+  - All tool names (built-in and MCP) must satisfy the enforced pattern `^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$`. In other words, a tool name must start with an ASCII letter, digit, or underscore; hyphens are allowed after the first character; the maximum length is 64 characters. Slashes, dots, and other characters are not permitted.
+  - MCP tool names are namespaced as `<server>__<tool>` (double underscore) to avoid collisions. The combined name must still satisfy the same pattern and 64-character limit; names that exceed it or otherwise fail validation are skipped at registration with a warning.
+
 - **LLM Tool Calls**:
   - The LLM should call tools using function calls or API endpoints.
   - The OpenAI API enforces the JSON Schema before the call reaches the tool, so structurally invalid calls (missing required args, wrong types) are rejected at the API boundary and never reach `execute()`. Tools therefore only need to validate semantic constraints (e.g. `start_line > total_lines`), which they return as canonical 4xx error dicts.

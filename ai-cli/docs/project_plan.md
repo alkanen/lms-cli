@@ -104,7 +104,7 @@ ai-cli/
 │   │   ├── tool_registry.py        # ✅ Three-tier tool discovery, loading, argument validation; apply_config(); register_instance(); is_allowed()
 │   │   ├── llm_client.py           # ✅ LLMClient ABC + OpenAIClient (REST/streaming); LMStudio WebSocket 🔲
 │   │   ├── session_manager.py      # ✅ Session create/resume/compact/persist; InMemorySession; SessionProtocol
-│   │   ├── mcp_manager.py          # 🔲 MCP server connections, tool exposure
+│   │   ├── mcp_manager.py          # ✅ MCP server connections, MCPProxyTool, stdio/SSE transports
 │   │   ├── agent.py               # ✅ Agent, AgentSpec, AgentResult, BackendConfig, build_agent_tool_registry()
 │   │   ├── agent_registry.py      # ✅ AgentSpec loading from config, lazy instance caching (get_or_create)
 │   │   ├── task_manager.py        # ✅ Task tree persistence, validation, queries, CRUD
@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1565 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1611 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -155,10 +155,12 @@ ai-cli/
 │   ├── test_vector_store.py       # ✅
 │   ├── test_embedding_provider.py # ✅
 │   ├── test_embedding_index.py    # ✅
-│   └── test_search_files.py       # ✅
+│   ├── test_search_files.py       # ✅
+│   └── test_mcp_manager.py        # ✅
 └── docs/                           # Documentation
     ├── project_plan.md             # This file
     ├── design_embeddings.md        # ✅ Embedding index + semantic search design
+    ├── design_mcp.md               # ✅ MCP server support design
     └── HOWTO_custom_tools.md       # ✅ Guide for writing custom tools
 ```
 
@@ -175,7 +177,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      .ai-cli/
      ├── config.yaml          # Model/backend config (YAML, template with placeholders on init)
      ├── system_prompt.md     # Project-specific system prompt override (optional)
-     ├── mcp_servers.yaml     # MCP server definitions for this project (optional)
+     ├── mcp.yaml             # MCP server definitions for this project (optional)
      ├── .ignore              # Files/paths the LLM and tools should not read or modify
      └── tools/               # Project-specific tool implementations (optional)
      ```
@@ -219,10 +221,10 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
      - Numeric bounds (`minimum`, `maximum`) are enforced via `_check_bounds()` with defensive handling of post-construction mutation.
    - All `invalid_arguments` errors are returned to the LLM so the model can self-correct — values are never silently coerced.
 
-4. **MCP Support** 🔲
-   - Implement a `MCPManager` class to discover, connect to, and communicate with MCP servers.
-   - Support stdio and SSE transports as defined by the Model Context Protocol.
-   - Expose MCP server tools through the same tool registry as built-in tools.
+4. **MCP Support** ✅
+   - `MCPManager` class discovers, connects to, and communicates with MCP servers.
+   - Supports stdio and SSE transports as defined by the Model Context Protocol.
+   - MCP server tools exposed through the same tool registry as built-in tools.
 
 ### Phase 2: Tooling and Execution
 1. **Tool Execution Improvements** ✅
@@ -373,8 +375,18 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Multi-granularity: both chunk-level and document-level vectors stored. Document vectors: `average` strategy (L2-normalised mean of chunk vectors) for code; `summary` strategy (LLM-generated thematic summary → embed that text) for prose. Input text is truncated to `summary_max_tokens * 4` chars before the LLM call. The summary prompt includes a word-count hint derived from `summary_response_tokens` (default `chunk_size // 4`); no per-call API `max_tokens` cap is set to preserve reasoning-model token budgets. Failed summary calls fall back to `average`. `auto` strategy routes per file extension via `_resolve_doc_strategy()`. Summary embedding during indexing is dispatched via `asyncio.to_thread` to avoid blocking the event loop.
    - Optional dependencies in `pyproject.toml` under `[embeddings]` and `[semantic]` extras.
 
-4. **MCP Server Support** 🔲
-   - `mcp_manager.py` — discover, connect to, and proxy MCP server tools.
+4. **MCP Server Support** ✅
+   - See [design_mcp.md](design_mcp.md) for the full design.
+   - `mcp_manager.py` ✅ — `MCPManager`, `MCPProxyTool`, `MCPServerConfig`, `ServerStatus`, `MCPError`.
+   - Connects to all configured MCP servers at startup (stdio: spawns subprocess; SSE: HTTP session).
+   - Failed servers warn and are skipped — CLI continues normally.
+   - MCP tools are registered in `ToolRegistry` as `<server>__<tool>` (double underscore) alongside built-in tools.  No special API treatment — they appear in the standard `tools` array passed to the LLM.
+   - Config: `~/.ai-cli/mcp.yaml` (global) and `<project>/.ai-cli/mcp.yaml` (project, wins on collision).  Both files are created by `--init` / `--init --global` respectively.  YAML format with commented-out examples.
+   - SSE auth: configurable header name (`api_key_header`), env var (`api_key_env`), and prefix (`api_key_prefix`).  Missing env var → skip server at startup.
+   - `/mcp` slash command ✅: `list`, `info <server>`, `enable|disable|allow|disallow <server> [tool]`.  All changes in-memory by default; `--persist` writes to project `mcp.yaml`.  This implements the intended new persistence behaviour that `/tools` will adopt in a future refactor.
+   - Tab completion ✅: subcommand → server name (+ `--persist`) → tool name within server.
+   - 95 tests in `test_mcp_manager.py` ✅.
+   - Global scaffold (`~/.ai-cli/mcp.yaml`) created by `--init --global` includes a commented-out Context7 entry as an example.
 
 5. **LM Studio WebSocket backend** 🔲
    - Optional; LM Studio currently works via its OpenAI-compatible HTTP endpoint.
@@ -382,7 +394,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Key Decisions
-- **MCP**: Anthropic's Model Context Protocol. External tool servers connected via stdio/SSE, exposed through the unified tool registry.
+- **MCP**: Anthropic's Model Context Protocol. External tool servers connected via stdio/SSE, exposed through the unified tool registry as regular tools (no special API parameter — the CLI proxies calls transparently).  Tool names namespaced `<server>__<tool>` (double underscore) to prevent collisions; total name length capped at 64 characters per the OpenAI function-calling spec.  Config in `mcp.yaml` (not `config.yaml`); managed via `/mcp` (not `/tools`).  Runtime mutations (enable/disable/allow/disallow) are in-memory by default; `--persist` writes to project `mcp.yaml` — this is the intended new behaviour for all runtime mutations going forward.
 - **LLM backend**: OpenAI-compatible REST API is primary. LM Studio WebSocket is optional, selected via config or `--backend lmstudio`. No silent fallback between backends.
 - **Configuration format**: YAML throughout. Layered: bundled defaults → `~/.ai-cli/config.yaml` → `<project>/.ai-cli/config.yaml` → CLI flags.
 - **Workspace**: Nearest `.ai-cli/` ancestor when walking up from start directory, skipping `~/.ai-cli/`. Initialised via `--init`.
@@ -433,8 +445,7 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 ---
 
 ## Next Steps (priority order)
-1. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
-2. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
+1. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
 3. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
 6. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
 7. **`/tools allow` REPL command + permission mutation refactor** — Invert the default persistence of `ToolRegistry.set_permission_required()`: bare invocation is in-memory only for the current session; `--persist` writes to the project config (`user_confirmed: true`); `--global` writes to `~/.ai-cli/config.yaml` (requires a confirmation step because it affects all projects). Update the underlying `ToolRegistry` API to match — temporary by default — so callers that need in-memory overrides (e.g. per-agent `ToolRegistry` factories) do not need to work around the API.

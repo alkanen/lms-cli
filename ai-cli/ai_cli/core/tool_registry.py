@@ -74,6 +74,7 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -91,6 +92,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _REQUIRED_ATTRS = ("NAME", "DESCRIPTION", "PERMISSION_REQUIRED")
+
+# Valid tool-name pattern: must start with an alphanumeric or underscore,
+# followed by up to 63 alphanumeric, underscore, or hyphen characters.
+# This is slightly stricter than the OpenAI spec (which allows a leading
+# hyphen) but avoids ambiguity with CLI flags like --persist.
+TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$")
 
 # Maximum length of a string value shown verbatim in debug logs.
 # Longer strings are replaced with a ``<str:Nch>`` placeholder to avoid
@@ -155,6 +162,11 @@ def _validate_tool_definition(defn: object, expected_name: str | None = None) ->
     name = fn.get("name")
     if not isinstance(name, str) or not name:
         return "definition()['function']['name'] must be a non-empty string"
+    if not TOOL_NAME_RE.match(name):
+        return (
+            f"definition()['function']['name'] {name!r} does not match the "
+            f"required pattern {TOOL_NAME_RE.pattern}"
+        )
     if expected_name is not None and name != expected_name:
         return (
             f"definition()['function']['name'] is {name!r} but must match "
