@@ -336,6 +336,55 @@ global `/tools` state.
 
 ---
 
+## VULN-011 — In-memory cache is not safe for concurrent `TaskManager` instances
+
+**Component:** `ai_cli/core/task_manager.py` — `TaskManager._cache`
+
+**Severity:** Low (requires two ai-cli processes sharing the same session directory)
+
+**Status:** Deferred — single-process use is the current design assumption
+
+### Description
+
+`TaskManager` caches the loaded task store in `_cache` after the first read.
+All subsequent reads are served from memory; `tasks.json` is only re-read
+when the cache is `None`.  This is safe when a single process owns the session
+directory, but breaks down when two ai-cli processes open the **same** session
+directory concurrently (e.g. two separate ai-cli invocations pointed at the
+same session directory):
+
+1. Both processes load `tasks.json` into their own `_cache`.
+2. Process A writes a new task — its cache and `tasks.json` are updated.
+3. Process B's cache is now stale. Any read returns outdated data; any
+   subsequent write from B will overwrite A's changes with B's stale
+   view of the store, silently losing A's update.
+
+This is a last-writer-wins data-loss scenario with no error signal.
+
+### Conditions required
+
+- Two ai-cli processes must open the same session directory simultaneously.
+- Both must perform writes after the first divergence.
+- Current normal usage is single-process (one REPL + in-process agents), so
+  this condition does not arise today.
+
+### Proposed mitigation
+
+Options in increasing complexity:
+
+1. **mtime staleness check** — record the file's `st_mtime` when loading; in
+   `_load()`, stat the file before serving the cache and invalidate if mtime
+   has changed.  Low overhead; handles the most common race but not a
+   sub-millisecond race on coarse-mtime filesystems.
+2. **Exclusive file lock** — acquire a cross-platform advisory lock
+   (e.g. `fcntl.flock` / `msvcrt.locking`) around every read-modify-write
+   cycle to serialise concurrent writers at the OS level.
+3. **Opt-in caching** — make caching configurable; default to per-call reload
+   (current pre-cache behaviour) and enable the cache only for the known
+   single-process scenario.
+
+---
+
 ## VULN-003 — Orphan session directory left behind on metadata write failure in `new()`
 
 **Component:** `ai_cli/core/session_manager.py` — `SessionManager.new()`
