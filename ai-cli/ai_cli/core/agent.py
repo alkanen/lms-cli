@@ -420,6 +420,20 @@ class Agent:
                 "Tool call limit (%d rounds) reached; stopping.",
                 self.spec.max_tool_rounds,
             )
+            # The final round always ends with saved tool-response messages.
+            # Without a following assistant message the session history is in
+            # an invalid state: the next user prompt would produce the sequence
+            # [..., tool, tool, user] which most LLM prompt templates reject.
+            # Inject a synthetic assistant turn to close out the open tool cycle.
+            try:
+                self._session.add_message(
+                    "assistant",
+                    "[Stopped: tool call limit reached.]",
+                )
+            except SessionError as exc:
+                logger.error(
+                    "Failed to write tool-limit closing message: %s", exc
+                )
             return AgentResult(
                 text="".join(all_text_parts),
                 status="tool_limit",

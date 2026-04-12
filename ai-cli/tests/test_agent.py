@@ -340,6 +340,107 @@ class TestAgentRun:
         assert result.partial is True
         assert llm.send.call_count == 2
 
+    def test_tool_round_limit_closes_session_with_assistant_message(self):
+        """tool_limit must write a synthetic assistant message so the session
+        does not end with role=tool, which would cause a role-sequence error
+        on the next user prompt."""
+        spec = AgentSpec(
+            name="limited",
+            system_message="",
+            tools=[],
+            model="",
+            max_tool_rounds=1,
+        )
+        session = MagicMock()
+        session.get_messages.return_value = []
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c0",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            )
+            for _ in range(2)
+        ]
+
+        agent = _make_agent(
+            spec=spec, session=session, llm=llm, tool_registry=tool_registry
+        )
+        result = agent.run("loop forever")
+
+        assert result.status == "tool_limit"
+        # A closing assistant message must be the last add_message call so
+        # the session ends with role=assistant, not role=tool.
+        session.add_message.assert_called_with(
+            "assistant", "[Stopped: tool call limit reached.]"
+        )
+
+    def test_tool_round_limit_closing_message_session_error_is_logged(
+        self, caplog
+    ):
+        """If writing the closing assistant message raises SessionError, the
+        error is logged at ERROR level and tool_limit is still returned (no crash)."""
+        import logging
+
+        spec = AgentSpec(
+            name="limited",
+            system_message="",
+            tools=[],
+            model="",
+            max_tool_rounds=1,
+        )
+        session = MagicMock()
+        session.get_messages.return_value = []
+        # First call is the user message (must succeed); second is the
+        # synthetic closing assistant message — fail that one.
+        session.add_message.side_effect = [None, SessionError("disk full")]
+
+        tool_registry = MagicMock()
+        tool_registry.definitions.return_value = []
+        tool_registry.execute.return_value = {"status": "success", "data": {}}
+        tool_registry.get.return_value = None
+
+        llm = MagicMock()
+        llm.get_model_metadata.return_value = {}
+        llm.send.side_effect = [
+            iter(
+                [
+                    {
+                        "type": "tool_call",
+                        "name": "read_file",
+                        "call_id": "c0",
+                        "arguments": {},
+                    },
+                    {"type": "done", "stop_reason": "tool_calls", "usage": {}},
+                ]
+            )
+            for _ in range(2)
+        ]
+
+        agent = _make_agent(
+            spec=spec, session=session, llm=llm, tool_registry=tool_registry
+        )
+        with caplog.at_level(logging.ERROR, logger="ai_cli.core.agent"):
+            result = agent.run("loop forever")
+
+        assert result.status == "tool_limit"
+        error_logs = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_logs, "Expected at least one ERROR log entry"
+        assert any("disk full" in r.message for r in error_logs)
+
     def test_llm_error_returns_error_result(self):
         llm = MagicMock()
         llm.send.side_effect = LLMError("Connection refused")
