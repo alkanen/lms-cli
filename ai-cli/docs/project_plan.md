@@ -129,7 +129,7 @@ ai-cli/
 │   └── utils/                      # Utility functions and helpers
 │       ├── ignore_filter.py        # ✅ .gitignore-style pattern matching
 │       └── logging_utils.py        # ✅ JSONL structured logging
-├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1534 tests)
+├── tests/                          # ✅ Unit tests mirroring ai_cli/ structure (1565 tests)
 │   ├── test_workspace.py
 │   ├── test_ignore_filter.py
 │   ├── test_config_manager.py
@@ -337,7 +337,8 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
    - Per-agent `ToolRegistry` instances with independent tool sets and permission overrides (`build_agent_tool_registry()` in `agent.py`).
    - Sequential execution by default (single-GPU constraint). Parallel opt-in via `call_agents_parallel` tool gated by `agent_settings.allow_parallel: true`.
    - Persistence modes: `ephemeral` (fresh context per call) and `session` (context accumulates across calls within the CLI session).
-   - Context overflow: token monitoring → stream loop breaks (assistant message persisted first) → dangling tool_call stubs injected → `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")` returned → coordinator decides how to proceed.
+   - Context overflow: token monitoring → stream loop breaks (assistant message persisted first) → dangling tool_call stubs injected → `_close_open_tool_cycle()` called → `AgentResult(status="context_limit", partial=True, error_message="Context limit reached (x/y tokens).")` returned → coordinator decides how to proceed.
+   - Role-sequence safety (`_close_open_tool_cycle()`): injects a synthetic `role=assistant` message on every early-exit path that can leave the session ending with `role=tool` (abort mid-stream / post-stream / mid-tool-execution, LLMError, SessionError, context limit after stubs, tool-round limit). A pre-run guard at the top of `run()` closes any open cycle left by a prior aborted/crashed run before the new user message is appended; returns `status="error"` immediately if the close fails so the session never reaches the invalid `[..., tool, user]` sequence. `_last_persisted_role` tracking (updated after every successful session write; cleared in `reset()`) provides an O(1) fast path so `get_messages()` is only called when the state is genuinely ambiguous.
    - `/agents` slash command: lists configured agent types with model, persistence, tools, and max_tool_rounds.
 
 2. **Task System** ✅
@@ -433,10 +434,8 @@ Legend: ✅ done · 🔲 planned · ⚠️ partial · → next
 
 ## Next Steps (priority order)
 1. **MCP support** — `mcp_manager.py` and integration with `ToolRegistry` (stdio + SSE transports).
-2. **Multi-agent system** — `agent.py`, `agent_registry.py`, `call_agent.py`, `SubAgentDisplay`. REPL refactor to extract `Agent.run()`. See [design_agents.md](design_agents.md).
-3. **Task system** — `task_manager.py`, `task_orchestrator.py`, `tasks.py`. `/plan` and `/tasks` slash commands. See [design_task_system.md](design_task_system.md).
-4. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
-5. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
+2. **LM Studio WebSocket backend** — optional; LM Studio already works via its OpenAI-compatible HTTP endpoint.
+3. **Interactive `@` file picker** — full popup/picker UX for `@path` references; image-file attachments as base64 content blocks.
 6. **Session resume UX polish** — on resume, display last assistant message in full; prompt to resend if last message was from the user.
 7. **`/tools allow` REPL command + permission mutation refactor** — Invert the default persistence of `ToolRegistry.set_permission_required()`: bare invocation is in-memory only for the current session; `--persist` writes to the project config (`user_confirmed: true`); `--global` writes to `~/.ai-cli/config.yaml` (requires a confirmation step because it affects all projects). Update the underlying `ToolRegistry` API to match — temporary by default — so callers that need in-memory overrides (e.g. per-agent `ToolRegistry` factories) do not need to work around the API.
 8. **`find_files` access control for external roots** — call `workspace.embedding_index.is_indexed_path()` to validate any optional `path` parameter, consistent with how `read_file` handles external paths.
