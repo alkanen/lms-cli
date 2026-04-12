@@ -78,12 +78,21 @@ class Agent:
     llm_client: LLMClient
     tool_registry: ToolRegistry
     display: Display           # SubAgentDisplay for sub-agents; terminal Display for coordinator
+    _last_persisted_role: str  # tracks last role written to session; "" = unknown
 
     def run(self, prompt: str | list[dict], *, abort: threading.Event | None = None) -> AgentResult:
         """
         Run the full send → tool-call → repeat loop for one prompt.
         Returns when the LLM issues end_turn or when a safety limit is hit.
         Never writes to the terminal directly — output goes through self.display.
+
+        Before appending the user message, run() closes any open tool cycle
+        left by a prior aborted or crashed run (see Role-Sequence Safety below).
+        """
+
+    def reset(self) -> None:
+        """Clear per-run state for reuse (called by AgentRegistry on session-persistent agents).
+        Clears the display buffer, pending transient schemas, and _last_persisted_role.
         """
 ```
 
@@ -722,6 +731,10 @@ class Agent:
         self._tool_registry = tool_registry
         self._display = display
         self._pending_transients: dict[str, dict] = {}
+        # Tracks the role of the last message successfully persisted to the
+        # session.  Used by _close_open_tool_cycle() as a fast-path guard to
+        # avoid an O(n) get_messages() read on every early-return path.
+        self._last_persisted_role: str = ""
 
     def run(
         self,
@@ -733,6 +746,11 @@ class Agent:
 
         Returns an ``AgentResult`` when the LLM issues end_turn, the
         tool-round limit is hit, or the abort event is set.
+
+        Before persisting the user message, calls _close_open_tool_cycle()
+        to close any tool cycle left open by a prior aborted/crashed run.
+        Returns status="error" immediately if the close fails (i.e., the
+        session still ends with role=tool after the attempt).
         """
 ```
 
@@ -1107,6 +1125,10 @@ if context_limit_hit:
             "content": json.dumps({"status": "error", "error": "context_limit",
                 "message": "Context limit reached; tool not executed.", "code": 503})
         })
+        self._last_persisted_role = "tool"
+    # Close the open tool cycle so the next user prompt is not preceded by
+    # role=tool (which would cause a role-sequence crash).
+    self._close_open_tool_cycle("[Stopped: context limit reached.]")
     return AgentResult(
         text="".join(all_text_parts),
         status="context_limit",
@@ -1147,3 +1169,132 @@ threshold is handled by the REPL's existing `_check_compaction()`.
   context window → `AgentResult(status="context_limit", partial=True)`.
 - Context overflow: mock at 89% → normal `"ok"` return.
 - Context overflow: `context_window == 0` (unknown) → never triggers.
+
+---
+
+### PR 6 — Role-Sequence Safety (`_close_open_tool_cycle`) ✅
+
+**Goal:** Prevent the `[..., tool, user]` invalid role-sequence crash that
+occurs when a run is interrupted (abort, LLM error, tool-round limit, context
+limit) after tool-response messages have been persisted but before a closing
+assistant message is written.
+
+#### Problem
+
+The LLM API requires that every tool-response message (`role=tool`) is
+followed by an assistant message before the next user turn.  Several code
+paths in `Agent.run()` exit early without writing that closing message:
+
+- **Abort** detected at the top of a new round (after the previous round's
+  tool results are already saved).
+- **LLMError** raised on a subsequent round (tool results from the prior
+  round are saved; the new round never completes).
+- **Tool-round limit** reached (all rounds complete with tool results saved).
+- **Context limit** reached (stub tool responses are saved but no closing
+  assistant message follows).
+- **SessionError** reading history or writing an assistant message.
+
+Additionally, if a session-persistent agent's previous run was interrupted,
+its session may already end with `role=tool` when the *next* `run()` starts.
+Appending the new user prompt in that state produces `[..., tool, user]`
+immediately.
+
+#### Solution
+
+**`_close_open_tool_cycle(reason: str)`** — private helper that injects a
+synthetic `role=assistant` message when needed:
+
+```python
+def _close_open_tool_cycle(self, reason: str) -> None:
+    if self._last_persisted_role == "assistant":
+        return  # fast path: cycle already closed
+    if self._last_persisted_role != "tool":
+        # Ambiguous (empty string or "user"): consult the actual session
+        # to handle tool cycles left open by a prior run.
+        try:
+            messages = self._session.get_messages()
+        except SessionError:
+            return
+        if not (messages and messages[-1].get("role") == "tool"):
+            return
+    try:
+        self._session.add_message("assistant", reason)
+        self._last_persisted_role = "assistant"
+    except SessionError as exc:
+        logger.error("Failed to write closing assistant message: %s", exc)
+```
+
+The helper is called at **every** early-return path that can occur after
+tool messages have been persisted:
+
+| Exit point | Reason string |
+|---|---|
+| Abort detected at top of loop | `"[Aborted by user.]"` |
+| Abort detected post-stream | `"[Aborted by user.]"` |
+| Abort stubs injected mid-tool | `"[Aborted by user.]"` |
+| LLMError on a subsequent round | `"[LLM error.]"` |
+| SessionError reading history | `"[Session read error.]"` |
+| SessionError saving assistant msg | `"[Session write error.]"` |
+| Context limit (after stubs) | `"[Stopped: context limit reached.]"` |
+| Tool-round limit | `"[Stopped: tool call limit reached.]"` |
+
+**`_last_persisted_role` tracking** — `Agent.__init__` initialises this to
+`""` and `run()` updates it after every successful `add_message` /
+`add_raw_message` call.  This allows `_close_open_tool_cycle()` to take an
+O(1) fast path (`_last_persisted_role == "tool"` → inject immediately;
+`_last_persisted_role == "assistant"` → skip) and only fall back to an O(n)
+`get_messages()` read when the state is ambiguous (e.g., at the very start
+of a new run before any writes).  `reset()` clears `_last_persisted_role`
+to `""` so session-persistent agents always re-check on next use.
+
+**Pre-run guard in `run()`** — before the new user message is persisted,
+`run()` closes any tool cycle that was left open by a prior aborted/crashed
+run:
+
+```python
+# Force the ambiguous path so _close_open_tool_cycle always reads the
+# actual session state (prior_role may be stale after an external crash).
+self._last_persisted_role = ""
+self._close_open_tool_cycle("[Prior run ended without closing tool cycle.]")
+# Re-read to refresh tracking and detect a failed close.
+_prior_msgs = self._session.get_messages()
+self._last_persisted_role = _prior_msgs[-1].get("role", "") if _prior_msgs else ""
+if self._last_persisted_role == "tool":
+    # Close failed; writing a user message now would create [..., tool, user].
+    return AgentResult(status="error", ...)
+```
+
+If `get_messages()` itself fails, `run()` returns `status="error"` rather
+than proceeding blindly.  If the last role is still `"tool"` after the close
+attempt (i.e., `add_message` raised `SessionError` inside the helper),
+`run()` again returns `status="error"` without appending the user prompt.
+
+#### Files changed
+
+- **`ai_cli/core/agent.py`** — `Agent.__init__` (adds `_last_persisted_role`),
+  `reset()` (clears it), new `_close_open_tool_cycle()`, `run()` (pre-run
+  guard; `_last_persisted_role` updates; helper calls at all early exits).
+
+#### Tests
+
+**`tests/test_agent.py`** — new and updated tests:
+
+- `test_abort_after_completed_round_closes_session` — stateful session;
+  abort fires after round 1's tool result is saved; asserts closing assistant
+  message is injected.
+- `test_abort_post_stream_closes_session` — stateful session; two-round
+  setup (round 1 completes with tool result, round 2 aborts during streaming).
+- `test_abort_mid_tool_execution_closes_session` — stateful session; stubs
+  injected for un-executed calls, then closing message follows.
+- `test_llm_error_after_tool_persistence_closes_session` — LLMError on
+  round 2 (after round 1's tool result is saved) → closing message injected.
+- `test_tool_round_limit_closes_session_with_assistant_message` — empty
+  session; tool_limit reached; closing message is last `add_message` call.
+- `test_context_limit_stubs_pending_tool_calls` — extended to assert closing
+  assistant message follows the stubs.
+- `test_run_closes_prior_open_tool_cycle_before_user_message` — stateful
+  session seeded with a trailing `role=tool` message; asserts assistant close
+  precedes the new user message.
+- `test_run_returns_error_if_prior_tool_cycle_cannot_be_closed` — `add_message`
+  always raises `SessionError`; asserts `status="error"` and no user message
+  is written.
