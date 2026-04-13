@@ -1330,3 +1330,38 @@ class TestRegisterViaInstance:
         reg._load_from_file(tool_file, tier="user")
 
         assert reg.get("non_standard_file") is None
+
+
+# ---------------------------------------------------------------------------
+# TOOL_NAME_RE pattern validation
+# ---------------------------------------------------------------------------
+
+
+class TestToolNamePattern:
+    """Verify TOOL_NAME_RE rejects leading hyphens and enforces length."""
+
+    def test_valid_names(self):
+        from ai_cli.core.tool_registry import TOOL_NAME_RE
+
+        for name in ("echo", "read_file", "my_tool", "a", "A1_b-c", "0_ok"):
+            assert TOOL_NAME_RE.match(name), f"{name!r} should be valid"
+
+    def test_leading_hyphen_rejected(self):
+        from ai_cli.core.tool_registry import TOOL_NAME_RE
+
+        assert TOOL_NAME_RE.match("-bad") is None
+
+    def test_too_long_rejected(self):
+        from ai_cli.core.tool_registry import TOOL_NAME_RE
+
+        assert TOOL_NAME_RE.match("a" * 65) is None
+
+    def test_max_length_accepted(self):
+        from ai_cli.core.tool_registry import TOOL_NAME_RE
+
+        assert TOOL_NAME_RE.match("a" * 64) is not None
+
+    def test_empty_rejected(self):
+        from ai_cli.core.tool_registry import TOOL_NAME_RE
+
+        assert TOOL_NAME_RE.match("") is None

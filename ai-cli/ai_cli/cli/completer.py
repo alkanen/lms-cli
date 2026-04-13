@@ -22,6 +22,7 @@ from prompt_toolkit.document import Document
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from ai_cli.core.mcp_manager import MCPManager
     from ai_cli.core.tool_registry import ToolRegistry
     from ai_cli.core.workspace import Workspace
 
@@ -36,6 +37,8 @@ _AT_PARTIAL_RE = re.compile(r"@(!?)((?:\\.|[^\s\\,;:!?()\[\]{}'\"<>])*)$")
 _INDEX_FLAGS = ["--file", "--full", "--label", "--remove"]
 _TOOLS_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
 _TASKS_SUBCOMMANDS = ["add", "close", "delete", "edit", "info", "list", "open", "tree"]
+_MCP_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
+_MCP_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +155,9 @@ class REPLCompleter(Completer):
     workspace:
         Workspace used to resolve and filter file-path completions for
         ``@path`` references.
+    mcp_manager:
+        Live MCPManager used to enumerate server and tool names for ``/mcp``
+        subcommands.  Queried lazily on each completion request.
     max_path_completions:
         Maximum number of ``@path`` completions returned per keystroke.
         Defaults to :data:`DEFAULT_MAX_PATH_COMPLETIONS`.
@@ -162,6 +168,7 @@ class REPLCompleter(Completer):
         slash_commands: list[str],
         tool_registry: ToolRegistry | None = None,
         workspace: Workspace | None = None,
+        mcp_manager: MCPManager | None = None,
         max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
         if max_path_completions < 1:
@@ -171,6 +178,7 @@ class REPLCompleter(Completer):
         self._slash_commands = sorted(slash_commands)
         self._tool_registry = tool_registry
         self._workspace = workspace
+        self._mcp_manager = mcp_manager
         self._max_path_completions = max_path_completions
 
     # ------------------------------------------------------------------
@@ -239,6 +247,8 @@ class REPLCompleter(Completer):
             yield from self._complete_rounds(parts, text)
         elif cmd == "index":
             yield from self._complete_index(parts, text)
+        elif cmd == "mcp":
+            yield from self._complete_mcp(parts, text)
 
     def _complete_tools(self, parts: list[str], text: str) -> Iterable[Completion]:
         trailing = text.endswith(" ")
@@ -313,6 +323,60 @@ class REPLCompleter(Completer):
             prefix = parts[1] if len(parts) > 1 else ""
             if "--session".startswith(prefix):
                 yield Completion("--session", start_position=-len(prefix))
+
+    def _complete_mcp(self, parts: list[str], text: str) -> Iterable[Completion]:
+        """Completions for ``/mcp [subcommand] [server] [tool]``."""
+        trailing = text.endswith(" ")
+
+        # Completing the subcommand word.
+        if len(parts) == 1 or (len(parts) == 2 and not trailing):
+            prefix = (parts[1] if len(parts) > 1 else "").lower()
+            raw_len = len(parts[1]) if len(parts) > 1 else 0
+            for sub in _MCP_SUBCOMMANDS:
+                if sub.startswith(prefix):
+                    yield Completion(sub, start_position=-raw_len)
+            return
+
+        subcmd = parts[1].lower()
+
+        # ``/mcp info <server>``  or  ``/mcp <action> [--persist] <server> [<tool>]``
+        if subcmd not in (*_MCP_FLAG_SUBCMDS, "info"):
+            return
+
+        after = parts[2:]  # tokens after "/mcp <subcmd>"
+
+        # Recognize --persist only in its documented flag position,
+        # immediately after the subcommand.
+        persist_present = bool(after and after[0] == "--persist")
+        after_clean = after[1:] if persist_present else after
+
+        if subcmd in _MCP_FLAG_SUBCMDS:
+            # Position 0 (after optional --persist): server name or --persist.
+            if not after_clean or (len(after_clean) == 1 and not trailing):
+                prefix = after_clean[0] if after_clean else ""
+                if not persist_present and "--persist".startswith(prefix):
+                    yield Completion("--persist", start_position=-len(prefix))
+                for name in self._mcp_server_names():
+                    if name.startswith(prefix):
+                        yield Completion(name, start_position=-len(prefix))
+                return
+
+            server_name = after_clean[0]
+
+            # Position 1: tool name within that server.
+            if len(after_clean) == 1 or (len(after_clean) == 2 and not trailing):
+                prefix = after_clean[1] if len(after_clean) > 1 else ""
+                for t in self._mcp_tool_names(server_name):
+                    if t.startswith(prefix):
+                        yield Completion(t, start_position=-len(prefix))
+            return
+
+        # subcmd == "info": complete server name only.
+        if not after or (len(after) == 1 and not trailing):
+            prefix = after[0] if after else ""
+            for name in self._mcp_server_names():
+                if name.startswith(prefix):
+                    yield Completion(name, start_position=-len(prefix))
 
     def _complete_index(self, parts: list[str], text: str) -> Iterable[Completion]:
         """Completions for ``/index [path] [--label <name>] [--file <path>] ...``.
@@ -454,3 +518,13 @@ class REPLCompleter(Completer):
         if self._tool_registry is None:
             return []
         return sorted(t["name"] for t in self._tool_registry.all_tools_info())
+
+    def _mcp_server_names(self) -> list[str]:
+        if self._mcp_manager is None:
+            return []
+        return sorted(self._mcp_manager.server_names())
+
+    def _mcp_tool_names(self, server_name: str) -> list[str]:
+        if self._mcp_manager is None:
+            return []
+        return sorted(self._mcp_manager.get_server_tools(server_name))
