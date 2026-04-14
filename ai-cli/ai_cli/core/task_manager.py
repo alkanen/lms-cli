@@ -30,6 +30,9 @@ from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
+_LOG_ID_PREVIEW_LIMIT = 10
+_LOG_GOAL_PREVIEW_LIMIT = 80
+
 # Valid status values and the allowed transitions from each.
 # "done" is only reachable via mark_done(), not update_task().
 _VALID_STATUSES = frozenset(
@@ -67,6 +70,15 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 def _generate_id() -> str:
     return "task_" + "".join(random.choices(_ID_CHARS, k=_ID_LENGTH))
+
+
+def _preview_for_log(value: str | None, limit: int = _LOG_GOAL_PREVIEW_LIMIT) -> str:
+    """Return a bounded preview string for log-safe INFO messages."""
+    if not isinstance(value, str):
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
 class TaskValidationError(ValueError):
@@ -382,8 +394,18 @@ class TaskManager:
         if not isinstance(goal, str) or not goal.strip():
             raise TaskValidationError("'goal' must be a non-empty string.")
         data = self._load()
+        previous_goal = data.get("goal")
         data["goal"] = goal
         self._save(data)
+        previous_goal_len = len(previous_goal) if isinstance(previous_goal, str) else 0
+        logger.info(
+            "Task goal updated: previous_len=%d new_len=%d previous_preview=%r new_preview=%r",
+            previous_goal_len,
+            len(goal),
+            _preview_for_log(previous_goal),
+            _preview_for_log(goal),
+        )
+        logger.debug("Task goal full values: previous=%r new=%r", previous_goal, goal)
 
     def get_goal(self) -> str | None:
         goal = self._load().get("goal")
@@ -492,6 +514,19 @@ class TaskManager:
             parent["updated_at"] = now
 
         self._save(data)
+        logger.info(
+            "Task created: id=%s name=%r parent_id=%r priority=%s",
+            task_id,
+            name,
+            parent_id,
+            priority,
+        )
+        if parent_id is not None:
+            logger.info(
+                "Parent task updated after child create: parent_id=%s child_id=%s",
+                parent_id,
+                task_id,
+            )
         return self._task_detail(data, task)
 
     def get_task(self, task_id: str) -> dict:
@@ -527,6 +562,7 @@ class TaskManager:
         """
         data = self._load()
         task = self._get_or_raise(data, task_id)
+        previous = {key: task.get(key) for key in fields}
 
         allowed = {
             "name",
@@ -629,6 +665,13 @@ class TaskManager:
         task["updated_at"] = self._now_iso()
 
         self._save(data)
+        changed = [key for key in fields if previous.get(key) != task.get(key)]
+        logger.info(
+            "Task updated: id=%s name=%r changed_fields=%s",
+            task_id,
+            task.get("name"),
+            changed if changed else "none",
+        )
         return self._task_detail(data, task)
 
     def add_note(self, task_id: str, note: str) -> dict:
@@ -651,6 +694,13 @@ class TaskManager:
         task["updated_at"] = timestamp
 
         self._save(data)
+        logger.info(
+            "Task note added: id=%s name=%r note_count=%d note_chars=%d",
+            task_id,
+            task.get("name"),
+            len(notes),
+            len(note),
+        )
         return self._task_detail(data, task)
 
     def mark_done(self, task_id: str) -> dict:
@@ -686,6 +736,12 @@ class TaskManager:
         task["status"] = "done"
         task["updated_at"] = self._now_iso()
         self._save(data)
+        logger.info(
+            "Task marked done: id=%s name=%r subtask_count=%d",
+            task_id,
+            task.get("name"),
+            len(subtask_ids),
+        )
         return self._task_detail(data, task)
 
     def close_task(self, task_id: str) -> dict:
@@ -744,6 +800,20 @@ class TaskManager:
                 t["updated_at"] = now
 
         self._save(data)
+        closed_count = len(ids_to_close)
+        closed_ids_preview = ids_to_close[:_LOG_ID_PREVIEW_LIMIT]
+        logger.info(
+            "Task force-closed: root_id=%s closed_count=%d closed_ids_preview=%s preview_truncated=%s",
+            task_id,
+            closed_count,
+            closed_ids_preview,
+            closed_count > _LOG_ID_PREVIEW_LIMIT,
+        )
+        logger.debug(
+            "Task force-closed IDs: root_id=%s closed_ids=%s",
+            task_id,
+            ids_to_close,
+        )
         return self._task_detail(data, self._validate_task_record(task))
 
     def open_task(self, task_id: str) -> dict:
@@ -767,6 +837,7 @@ class TaskManager:
         now = self._now_iso()
         task["status"] = "not_started"
         task["updated_at"] = now
+        reopened_ids = [task_id]
 
         # Walk up the parent chain, re-opening any "done" ancestor.
         current = task
@@ -799,9 +870,20 @@ class TaskManager:
                 break
             parent["status"] = "not_started"
             parent["updated_at"] = now
+            reopened_ids.append(parent_id)
             current = parent
 
         self._save(data)
+        logger.info(
+            "Task re-opened: root_id=%s reopened_count=%d",
+            task_id,
+            len(reopened_ids),
+        )
+        logger.debug(
+            "Task re-opened IDs: root_id=%s reopened_ids=%s",
+            task_id,
+            reopened_ids,
+        )
         return self._task_detail(data, self._validate_task_record(task))
 
     # ------------------------------------------------------------------
@@ -989,6 +1071,7 @@ class TaskManager:
         """
         data = self._load()
         task = self._get_or_raise(data, task_id)
+        deleted_name = task.get("name")
 
         # Collect all descendant IDs, guarding against cycles and corrupted subtask_ids.
         ids_to_delete: list[str] = []
@@ -1072,6 +1155,21 @@ class TaskManager:
             data["tasks"].pop(tid, None)
 
         self._save(data)
+        deleted_count = len(ids_to_delete)
+        deleted_ids_preview = ids_to_delete[:_LOG_ID_PREVIEW_LIMIT]
+        logger.info(
+            "Task deleted: root_id=%s root_name=%r deleted_count=%d deleted_ids_preview=%s preview_truncated=%s",
+            task_id,
+            deleted_name,
+            deleted_count,
+            deleted_ids_preview,
+            deleted_count > _LOG_ID_PREVIEW_LIMIT,
+        )
+        logger.debug(
+            "Deleted task IDs: root_id=%s deleted_ids=%s",
+            task_id,
+            ids_to_delete,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1079,9 +1177,16 @@ class TaskManager:
 
     def clear(self) -> None:
         """Delete tasks.json, removing all tasks and the goal."""
+        had_file = self._path.exists()
+        cached_count = len(self._cache.get("tasks", {})) if self._cache else 0
         try:
             self._path.unlink(missing_ok=True)
         except OSError as exc:
             logger.error("Failed to delete tasks.json: %s", exc)
             raise
         self._cache = None
+        logger.info(
+            "Task store cleared: file_existed=%s cached_task_count=%d",
+            had_file,
+            cached_count,
+        )

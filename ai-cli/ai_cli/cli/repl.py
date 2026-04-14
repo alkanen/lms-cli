@@ -789,6 +789,24 @@ class REPL:
         ``/plan``                    — resumes using the stored goal.
         ``/plan --autonomous``       — skip plan checkpoint; run unattended.
         ``/plan "goal" --autonomous``— set goal and run unattended.
+
+        Each step prints a one-line status summarising what the planner /
+        executor / reviewer just did (e.g. ``Step 0: planning — created 4
+        task(s)``).  If the loop exits early with a "planner could not make
+        progress" message, the planner agent likely lacks the tools it needs
+        to decompose tasks — check its ``tools:`` list in ``config.yaml``
+        (``tasks_create``, ``tasks_update``, etc.).
+
+        For a full record of every planning round (prompt, result status,
+        snapshot diff) raise the orchestrator's log level by adding the
+        following to your ``config.yaml``::
+
+            logging:
+              level: INFO
+              modules:
+                ai_cli.core.task_orchestrator: DEBUG
+
+        Records are written as JSONL to ``<session_dir>/session.log``.
         """
         from ai_cli.core.task_manager import TaskStorageError, TaskValidationError
         from ai_cli.core.task_orchestrator import TaskOrchestrator

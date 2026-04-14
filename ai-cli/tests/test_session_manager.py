@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -877,6 +877,286 @@ class TestSessionManagerLoad:
         created = sm.new()
         loaded = sm.load(created.session_id)
         assert loaded.session_id == created.session_id
+
+    def test_load_repairs_trailing_tool_message_in_both_history_files(self, tmp_path):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+
+        current_path = created.session_dir / "history_current.jsonl"
+        full_path = created.session_dir / "history_full.jsonl"
+        current_path.write_text(
+            '{"role": "user", "content": "hi"}\n'
+            '{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}\n'
+            '{"role": "tool", "tool_call_id": "call_1", "content": "result"}\n'
+        )
+        full_path.write_text(
+            '{"role": "user", "content": "hi", "timestamp": "2026-04-15T12:00:00+00:00"}\n'
+            '{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}], "timestamp": "2026-04-15T12:00:01+00:00"}\n'
+            '{"role": "tool", "tool_call_id": "call_1", "content": "result", "timestamp": "2026-04-15T12:00:02+00:00"}\n'
+        )
+        meta = created._read_meta()
+        meta["message_count"] = 3
+        meta["last_message_role"] = "tool"
+        meta["last_message_preview"] = "result"
+        created._write_meta(meta)
+
+        loaded = sm.load(created.session_id)
+
+        messages = loaded.get_messages()
+        assert messages[-1] == {"role": "assistant", "content": "aborted by user"}
+
+        current_lines = current_path.read_text().splitlines()
+        assert json.loads(current_lines[-1]) == {
+            "role": "assistant",
+            "content": "aborted by user",
+        }
+
+        full_lines = full_path.read_text().splitlines()
+        repaired_full = json.loads(full_lines[-1])
+        assert repaired_full["role"] == "assistant"
+        assert repaired_full["content"] == "aborted by user"
+        assert datetime.fromisoformat(repaired_full["timestamp"]) == (
+            datetime.fromisoformat("2026-04-15T12:00:02+00:00")
+            + timedelta(microseconds=1)
+        )
+
+        repaired_meta = loaded.get_meta()
+        assert repaired_meta["message_count"] == 4
+        assert repaired_meta["last_message_role"] == "assistant"
+        assert repaired_meta["last_message_preview"] == "aborted by user"
+
+    def test_load_repairs_trailing_assistant_tool_call_message(self, tmp_path):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+
+        current_path = created.session_dir / "history_current.jsonl"
+        full_path = created.session_dir / "history_full.jsonl"
+        current_path.write_text(
+            '{"role": "user", "content": "hi"}\n'
+            '{"role": "assistant", "content": null, "tool_calls": [{"id": "815617873", "type": "function", "function": {"name": "call_agent", "arguments": "{\\"agent_type\\": \\"reviewer\\", \\"prompt\\": \\"check status\\"}"}}]}\n'
+        )
+        full_path.write_text(
+            '{"role": "user", "content": "hi", "timestamp": "2026-04-15T18:05:32.254230+00:00"}\n'
+            '{"role": "assistant", "content": null, "tool_calls": [{"id": "815617873", "type": "function", "function": {"name": "call_agent", "arguments": "{\\"agent_type\\": \\"reviewer\\", \\"prompt\\": \\"check status\\"}"}}], "timestamp": "2026-04-15T18:05:33.254230+00:00"}\n'
+        )
+        meta = created._read_meta()
+        meta["message_count"] = 2
+        meta["last_message_role"] = "assistant"
+        meta["last_message_preview"] = ""
+        created._write_meta(meta)
+
+        loaded = sm.load(created.session_id)
+
+        messages = loaded.get_messages()
+        assert messages[-2] == {
+            "role": "tool",
+            "tool_call_id": "815617873",
+            "content": json.dumps(
+                {
+                    "status": "error",
+                    "error": "aborted",
+                    "message": "aborted by user",
+                    "code": 499,
+                }
+            ),
+        }
+        assert messages[-1] == {"role": "assistant", "content": "aborted by user"}
+
+        current_lines = current_path.read_text().splitlines()
+        assert json.loads(current_lines[-2]) == {
+            "role": "tool",
+            "tool_call_id": "815617873",
+            "content": json.dumps(
+                {
+                    "status": "error",
+                    "error": "aborted",
+                    "message": "aborted by user",
+                    "code": 499,
+                }
+            ),
+        }
+        assert json.loads(current_lines[-1]) == {
+            "role": "assistant",
+            "content": "aborted by user",
+        }
+
+        full_lines = full_path.read_text().splitlines()
+        repaired_tool = json.loads(full_lines[-2])
+        assert repaired_tool["role"] == "tool"
+        assert repaired_tool["tool_call_id"] == "815617873"
+        assert json.loads(repaired_tool["content"]) == {
+            "status": "error",
+            "error": "aborted",
+            "message": "aborted by user",
+            "code": 499,
+        }
+        assert datetime.fromisoformat(repaired_tool["timestamp"]) == (
+            datetime.fromisoformat("2026-04-15T18:05:33.254230+00:00")
+            + timedelta(microseconds=1)
+        )
+        repaired_full = json.loads(full_lines[-1])
+        assert repaired_full["role"] == "assistant"
+        assert repaired_full["content"] == "aborted by user"
+        assert datetime.fromisoformat(repaired_full["timestamp"]) == (
+            datetime.fromisoformat("2026-04-15T18:05:33.254230+00:00")
+            + timedelta(microseconds=2)
+        )
+
+        repaired_meta = loaded.get_meta()
+        assert repaired_meta["message_count"] == 4
+        assert repaired_meta["last_message_role"] == "assistant"
+        assert repaired_meta["last_message_preview"] == "aborted by user"
+
+    def test_load_repairs_multiple_trailing_assistant_tool_calls(self, tmp_path):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+
+        current_path = created.session_dir / "history_current.jsonl"
+        full_path = created.session_dir / "history_full.jsonl"
+        current_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}]}\n'
+        )
+        full_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}], '
+            '"timestamp": "2026-04-15T18:05:33.254230+00:00"}\n'
+        )
+        meta = created._read_meta()
+        meta["message_count"] = 1
+        meta["last_message_role"] = "assistant"
+        created._write_meta(meta)
+
+        loaded = sm.load(created.session_id)
+
+        messages = loaded.get_messages()
+        assert messages[-3]["role"] == "tool"
+        assert messages[-3]["tool_call_id"] == "call_1"
+        assert messages[-2]["role"] == "tool"
+        assert messages[-2]["tool_call_id"] == "call_2"
+        assert messages[-1] == {"role": "assistant", "content": "aborted by user"}
+
+        full_lines = full_path.read_text().splitlines()
+        ts_1 = datetime.fromisoformat(json.loads(full_lines[-3])["timestamp"])
+        ts_2 = datetime.fromisoformat(json.loads(full_lines[-2])["timestamp"])
+        ts_3 = datetime.fromisoformat(json.loads(full_lines[-1])["timestamp"])
+        assert ts_2 == ts_1 + timedelta(microseconds=1)
+        assert ts_3 == ts_2 + timedelta(microseconds=1)
+
+    def test_load_repairs_trailing_tool_with_missing_remaining_tool_calls(
+        self, tmp_path
+    ):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+
+        current_path = created.session_dir / "history_current.jsonl"
+        full_path = created.session_dir / "history_full.jsonl"
+        current_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}]}\n'
+            '{"role": "tool", "tool_call_id": "call_1", "content": "result"}\n'
+        )
+        full_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}], '
+            '"timestamp": "2026-04-15T18:05:33.254230+00:00"}\n'
+            '{"role": "tool", "tool_call_id": "call_1", "content": "result", '
+            '"timestamp": "2026-04-15T18:05:34.254230+00:00"}\n'
+        )
+        meta = created._read_meta()
+        meta["message_count"] = 2
+        meta["last_message_role"] = "tool"
+        meta["last_message_preview"] = "result"
+        created._write_meta(meta)
+
+        loaded = sm.load(created.session_id)
+
+        messages = loaded.get_messages()
+        assert messages[-2]["role"] == "tool"
+        assert messages[-2]["tool_call_id"] == "call_2"
+        assert json.loads(messages[-2]["content"]) == {
+            "status": "error",
+            "error": "aborted",
+            "message": "aborted by user",
+            "code": 499,
+        }
+        assert messages[-1] == {"role": "assistant", "content": "aborted by user"}
+
+        full_lines = full_path.read_text().splitlines()
+        repaired_tool = json.loads(full_lines[-2])
+        repaired_assistant = json.loads(full_lines[-1])
+        assert repaired_tool["role"] == "tool"
+        assert repaired_tool["tool_call_id"] == "call_2"
+        assert repaired_assistant["role"] == "assistant"
+        assert repaired_assistant["content"] == "aborted by user"
+
+        ts_prev = datetime.fromisoformat("2026-04-15T18:05:34.254230+00:00")
+        ts_tool = datetime.fromisoformat(repaired_tool["timestamp"])
+        ts_assistant = datetime.fromisoformat(repaired_assistant["timestamp"])
+        assert ts_tool == ts_prev + timedelta(microseconds=1)
+        assert ts_assistant == ts_tool + timedelta(microseconds=1)
+
+    def test_load_repairs_missing_full_timestamps_with_monotonic_synthetics(
+        self, tmp_path
+    ):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+
+        current_path = created.session_dir / "history_current.jsonl"
+        full_path = created.session_dir / "history_full.jsonl"
+        current_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}]}\n'
+        )
+        # Deliberately omit any parseable timestamp fields in full history.
+        full_path.write_text(
+            '{"role": "assistant", "content": null, "tool_calls": ['
+            '{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}, '
+            '{"id": "call_2", "type": "function", "function": {"name": "find_files", "arguments": "{}"}}]}\n'
+        )
+
+        loaded = sm.load(created.session_id)
+
+        messages = loaded.get_messages()
+        assert messages[-3]["tool_call_id"] == "call_1"
+        assert messages[-2]["tool_call_id"] == "call_2"
+        assert messages[-1] == {"role": "assistant", "content": "aborted by user"}
+
+        full_lines = full_path.read_text().splitlines()
+        ts_1 = datetime.fromisoformat(json.loads(full_lines[-3])["timestamp"])
+        ts_2 = datetime.fromisoformat(json.loads(full_lines[-2])["timestamp"])
+        ts_3 = datetime.fromisoformat(json.loads(full_lines[-1])["timestamp"])
+        assert ts_2 == ts_1 + timedelta(microseconds=1)
+        assert ts_3 == ts_2 + timedelta(microseconds=1)
+
+    def test_load_leaves_well_formed_session_unchanged(self, tmp_path):
+        ws = _make_workspace(tmp_path / "proj")
+        sm = SessionManager(ws, _make_llm(), tmp_path / "sessions")
+        created = sm.new()
+        created.add_message("user", "hi")
+        created.add_message("assistant", "done")
+
+        current_before = (created.session_dir / "history_current.jsonl").read_text()
+        full_before = (created.session_dir / "history_full.jsonl").read_text()
+        meta_before = created.get_meta()
+
+        loaded = sm.load(created.session_id)
+
+        assert loaded.get_meta() == meta_before
+        assert (
+            created.session_dir / "history_current.jsonl"
+        ).read_text() == current_before
+        assert (created.session_dir / "history_full.jsonl").read_text() == full_before
 
     # Helper: a valid-format ID that does not exist as a directory.
     _VALID_NONEXISTENT = "proj__2024-01-01T00h00m00.001s"

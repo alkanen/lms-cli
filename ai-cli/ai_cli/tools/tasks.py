@@ -24,6 +24,7 @@ act as separators.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.core.task_manager import (
@@ -39,6 +40,8 @@ from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
     from ai_cli.core.workspace import Workspace
+
+logger = logging.getLogger(__name__)
 
 # Sorted lists for ToolSchema enums — derived from TaskManager's canonical sets
 # so schema and validation never drift apart.
@@ -80,14 +83,19 @@ class _TaskTool(Tool):
     def _handle(self, fn: Any, *args: Any, **kwargs: Any) -> dict:
         """Call *fn* with *args*/*kwargs* and map TaskManager exceptions to errors."""
         try:
-            return self._ok(fn(*args, **kwargs))
+            result = fn(*args, **kwargs)
+            logger.debug("Task tool '%s' succeeded", self.name)
+            return self._ok(result)
         except TaskNotFoundError as exc:
+            logger.info("Task tool '%s' not_found: %s", self.name, exc)
             return self._err(
                 "not_found", exc.args[0] if exc.args else str(exc), code=404
             )
         except TaskValidationError as exc:
+            logger.info("Task tool '%s' validation_error: %s", self.name, exc)
             return self._err("validation_error", str(exc), code=400)
         except TaskStorageError as exc:
+            logger.info("Task tool '%s' storage_error: %s", self.name, exc)
             return self._err("storage_error", str(exc), code=500)
 
     def _parse_task_path(
@@ -151,11 +159,21 @@ class TasksListTool(_TaskTool):
         if err:
             return err
 
+        logger.debug("Task tool '%s' invoked: parent_path=%r", self.name, parent_path)
+
         def _go() -> dict:
             parent_id = (
                 self._tm.resolve_path_to_id(parent_path) if parent_path else None
             )
-            return {"tasks": self._tm.list_tasks(parent_id=parent_id)}
+            tasks = self._tm.list_tasks(parent_id=parent_id)
+            logger.debug(
+                "Task tool '%s': listed %d task(s) for parent_path=%r parent_id=%r",
+                self.name,
+                len(tasks),
+                parent_path,
+                parent_id,
+            )
+            return {"tasks": tasks}
 
         return self._handle(_go)
 
@@ -192,7 +210,19 @@ class TasksGetTool(_TaskTool):
         path, err = self._parse_task_path(kwargs)
         if err:
             return err
-        return self._handle(lambda: {"task": self._tm.find_by_path(path)})
+        logger.debug("Task tool '%s' invoked: task_path=%r", self.name, path)
+
+        def _go() -> dict:
+            task = self._tm.find_by_path(path)
+            logger.debug(
+                "Task tool '%s': retrieved task id=%s path=%r",
+                self.name,
+                task.get("id"),
+                path,
+            )
+            return {"task": task}
+
+        return self._handle(_go)
 
 
 # ---------------------------------------------------------------------------
@@ -279,19 +309,33 @@ class TasksCreateTool(_TaskTool):
                 "validation_error", "'priority' must be a string.", code=400
             )
 
+        logger.debug(
+            "Task tool '%s' invoked: name=%r parent_path=%r priority=%r",
+            self.name,
+            name,
+            parent_path,
+            priority,
+        )
+
         def _go() -> dict:
             parent_id = (
                 self._tm.resolve_path_to_id(parent_path) if parent_path else None
             )
-            return {
-                "task": self._tm.create_task(
-                    name=name,
-                    definition_of_done=dod,
-                    description=description,
-                    parent_id=parent_id,
-                    priority=priority,
-                )
-            }
+            task = self._tm.create_task(
+                name=name,
+                definition_of_done=dod,
+                description=description,
+                parent_id=parent_id,
+                priority=priority,
+            )
+            logger.debug(
+                "Task tool '%s': created task id=%s name=%r parent_id=%r",
+                self.name,
+                task.get("id"),
+                task.get("name"),
+                parent_id,
+            )
+            return {"task": task}
 
         return self._handle(_go)
 
@@ -388,9 +432,23 @@ class TasksUpdateTool(_TaskTool):
                 code=400,
             )
 
+        logger.debug(
+            "Task tool '%s' invoked: task_path=%r fields=%s",
+            self.name,
+            path,
+            sorted(update_fields.keys()),
+        )
+
         def _go() -> dict:
             task_id = self._tm.resolve_path_to_id(path)
-            return {"task": self._tm.update_task(task_id, **update_fields)}
+            task = self._tm.update_task(task_id, **update_fields)
+            logger.debug(
+                "Task tool '%s': updated task id=%s path=%r",
+                self.name,
+                task_id,
+                path,
+            )
+            return {"task": task}
 
         return self._handle(_go)
 
@@ -439,9 +497,23 @@ class TasksAddNoteTool(_TaskTool):
                 "validation_error", "'note' must be a non-empty string.", code=400
             )
 
+        logger.debug(
+            "Task tool '%s' invoked: task_path=%r note_chars=%d",
+            self.name,
+            path,
+            len(note),
+        )
+
         def _go() -> dict:
             task_id = self._tm.resolve_path_to_id(path)
-            return {"task": self._tm.add_note(task_id, note)}
+            task = self._tm.add_note(task_id, note)
+            logger.debug(
+                "Task tool '%s': added note to task id=%s path=%r",
+                self.name,
+                task_id,
+                path,
+            )
+            return {"task": task}
 
         return self._handle(_go)
 
@@ -483,8 +555,17 @@ class TasksMarkDoneTool(_TaskTool):
         if err:
             return err
 
+        logger.debug("Task tool '%s' invoked: task_path=%r", self.name, path)
+
         def _go() -> dict:
             task_id = self._tm.resolve_path_to_id(path)
-            return {"task": self._tm.mark_done(task_id)}
+            task = self._tm.mark_done(task_id)
+            logger.debug(
+                "Task tool '%s': marked task done id=%s path=%r",
+                self.name,
+                task_id,
+                path,
+            )
+            return {"task": task}
 
         return self._handle(_go)

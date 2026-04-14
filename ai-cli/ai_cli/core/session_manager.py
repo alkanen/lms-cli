@@ -21,7 +21,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -239,10 +239,26 @@ class Session:
 
     def _append_message(self, message: dict) -> None:
         """Write *message* to both history files and update metadata."""
+        self._append_message_with_timestamp(message)
+
+    def _append_message_with_timestamp(
+        self,
+        message: dict,
+        *,
+        timestamp: str | None = None,
+    ) -> None:
+        """Write *message* to both history files and update metadata.
+
+        When *timestamp* is provided, it is written to ``history_full.jsonl``
+        instead of generating a fresh current-time timestamp.  This is used by
+        resume-time history repair so the archival log remains strictly ordered.
+        """
         role: str = message["role"]
         content = message.get("content") or ""
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = timestamp if isinstance(timestamp, str) and timestamp else None
+        if now is None:
+            now = datetime.now(timezone.utc).isoformat()
         try:
             current_entry = json.dumps(message)
             full_entry = json.dumps({**message, "timestamp": now})
@@ -276,6 +292,164 @@ class Session:
             # the two history files and metadata stay in sync.
             self._rollback_history(current_size, full_size)
             raise
+
+    def _last_full_history_timestamp(self) -> str | None:
+        """Return the last parseable timestamp seen in ``history_full.jsonl``.
+
+        Returns ``None`` when the file is missing, unreadable, empty, or the
+        file contains no parseable ``timestamp`` value at all.
+        """
+        if not self._full_path.exists():
+            return None
+        last_timestamp: str | None = None
+        try:
+            with self._full_path.open("r", encoding="utf-8") as fh:
+                for lineno, raw in enumerate(fh, 1):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(
+                            "Skipping malformed JSONL line %d in %s while reading last timestamp: %s",
+                            lineno,
+                            self._full_path,
+                            exc,
+                        )
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    ts = entry.get("timestamp")
+                    if not isinstance(ts, str) or not ts.strip():
+                        continue
+                    try:
+                        parsed = datetime.fromisoformat(ts)
+                    except ValueError:
+                        logger.warning(
+                            "Skipping unparsable timestamp on line %d in %s: %r",
+                            lineno,
+                            self._full_path,
+                            ts,
+                        )
+                        continue
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    last_timestamp = parsed.isoformat()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise SessionError(
+                f"Could not read history file {self._full_path}: {exc}"
+            ) from exc
+        return last_timestamp
+
+    @staticmethod
+    def _next_timestamp(timestamp: str | None) -> str | None:
+        """Return *timestamp* plus one microsecond, or ``None`` when absent."""
+        if timestamp is None:
+            return None
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (parsed + timedelta(microseconds=1)).isoformat()
+
+    def repair_dangling_tool_cycle(self) -> bool:
+        """Repair a history that ends mid tool cycle.
+
+        Returns ``True`` when a repair message was appended, ``False`` when the
+        session history was already well-formed.
+        """
+        messages = self._load_history_messages()
+        if not messages:
+            return False
+
+        last = messages[-1]
+        last_role = last.get("role")
+        has_tool_calls = isinstance(last.get("tool_calls"), list) and bool(
+            last.get("tool_calls")
+        )
+        needs_repair = last_role == "tool" or (
+            last_role == "assistant" and has_tool_calls
+        )
+        if not needs_repair:
+            return False
+
+        pending_call_ids: list[str] = []
+        completed_call_ids: set[str] = set()
+        if last_role == "assistant" and has_tool_calls:
+            # Fast-path: terminal assistant tool-call message.
+            for tool_call in last["tool_calls"]:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = tool_call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    pending_call_ids.append(call_id)
+        elif last_role == "tool":
+            # Walk backward to the most recent assistant tool-call turn and
+            # infer which tool_call_ids are still missing tool responses.
+            assistant_idx: int | None = None
+            for idx in range(len(messages) - 1, -1, -1):
+                msg = messages[idx]
+                if msg.get("role") != "assistant":
+                    continue
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    assistant_idx = idx
+                    for tool_call in tool_calls:
+                        if not isinstance(tool_call, dict):
+                            continue
+                        call_id = tool_call.get("id")
+                        if isinstance(call_id, str) and call_id:
+                            pending_call_ids.append(call_id)
+                    break
+
+            if assistant_idx is not None:
+                for msg in messages[assistant_idx + 1 :]:
+                    if msg.get("role") != "tool":
+                        continue
+                    call_id = msg.get("tool_call_id")
+                    if isinstance(call_id, str) and call_id:
+                        completed_call_ids.add(call_id)
+
+        timestamp = self._last_full_history_timestamp()
+        if timestamp is None:
+            # Seed once so all synthetic messages in this repair round use
+            # deterministic +1us increments instead of separate now() calls.
+            timestamp = datetime.now(timezone.utc).isoformat()
+        repaired_messages = 0
+
+        for call_id in pending_call_ids:
+            if call_id in completed_call_ids:
+                continue
+            timestamp = self._next_timestamp(timestamp)
+            self._append_message_with_timestamp(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        {
+                            "status": "error",
+                            "error": "aborted",
+                            "message": "aborted by user",
+                            "code": 499,
+                        }
+                    ),
+                },
+                timestamp=timestamp,
+            )
+            repaired_messages += 1
+
+        timestamp = self._next_timestamp(timestamp)
+        self._append_message_with_timestamp(
+            {"role": "assistant", "content": "aborted by user"},
+            timestamp=timestamp,
+        )
+        repaired_messages += 1
+        logger.info(
+            "Session %s repaired on load: appended %d synthetic message(s) after dangling tool cycle",
+            self._id,
+            repaired_messages,
+        )
+        return True
 
     def get_messages(self) -> list[dict]:
         """Return messages from ``history_current.jsonl`` as a list of dicts.
@@ -770,6 +944,7 @@ class SessionManager:
             raise SessionError(f"Session metadata missing for {session_id!r}")
         session = Session(session_id, session_dir, self._llm)
         session._read_meta()  # raises SessionError if corrupt or not a mapping
+        session.repair_dangling_tool_cycle()
         return session
 
     def most_recent(self, workspace_path: Path) -> Session | None:

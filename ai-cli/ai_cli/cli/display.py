@@ -13,6 +13,8 @@ import json
 import logging
 import pydoc
 import sys
+import threading
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from datetime import datetime
@@ -36,6 +38,21 @@ if TYPE_CHECKING:
     from ai_cli.tools.base import Tool
 
 logger = logging.getLogger(__name__)
+
+_PARENT_DISPLAY_LOCKS: weakref.WeakKeyDictionary[Display, threading.RLock] = (
+    weakref.WeakKeyDictionary()
+)
+_PARENT_DISPLAY_LOCKS_GUARD = threading.Lock()
+
+
+def _parent_display_lock(display: Display) -> threading.RLock:
+    """Return a shared re-entrant lock for a parent display instance."""
+    with _PARENT_DISPLAY_LOCKS_GUARD:
+        lock = _PARENT_DISPLAY_LOCKS.get(display)
+        if lock is None:
+            lock = threading.RLock()
+            _PARENT_DISPLAY_LOCKS[display] = lock
+        return lock
 
 
 class Display(ABC):
@@ -96,8 +113,12 @@ class Display(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def begin_assistant_turn(self) -> None:
-        """Called once before the first text delta from the LLM arrives."""
+    def begin_assistant_turn(self, title: str = "Assistant") -> None:
+        """Called once before the first text delta from the LLM arrives.
+
+        *title* is a display label for the turn header (for example,
+        ``"Assistant"`` or ``"Agent (planner)"``).
+        """
 
     @abstractmethod
     def stream_text(self, delta: str) -> None:
@@ -346,7 +367,7 @@ class PlainDisplay(Display):
     # Streaming assistant output
     # ------------------------------------------------------------------
 
-    def begin_assistant_turn(self) -> None:
+    def begin_assistant_turn(self, title: str = "Assistant") -> None:
         self._reasoning_started = False  # reset per-turn reasoning prefix state
 
     def stream_text(self, delta: str) -> None:
@@ -795,12 +816,12 @@ class RichDisplay(Display):
     # Streaming assistant output
     # ------------------------------------------------------------------
 
-    def begin_assistant_turn(self) -> None:
+    def begin_assistant_turn(self, title: str = "Assistant") -> None:
         self._text_acc = ""
         self._reasoning_acc = ""
         self._turn_start_time = datetime.now()
         self._thinking_spinner = Spinner("dots", " Thinking…")
-        self._console.print(Rule("Assistant", style="bold cyan", align="left"))
+        self._console.print(Rule(title, style="bold cyan", align="left"))
         if self._live is not None:
             self._live.stop()
         # _LiveRenderable re-evaluates _build_live_renderable() on every tick
@@ -1321,10 +1342,26 @@ class SubAgentDisplay(Display):
     not require interactive approval at runtime.
     """
 
-    def __init__(self, *, verbose: bool = False, markdown_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        verbose: bool = False,
+        markdown_enabled: bool = True,
+        parent_display: Display | None = None,
+        agent_name: str = "sub-agent",
+    ) -> None:
         super().__init__(verbose=verbose, markdown_enabled=markdown_enabled)
         self._buffer: list[str] = []
         self._last_usage: dict = {}
+        self._parent_display = parent_display
+        self._agent_name = agent_name
+        self._parent_lock = (
+            _parent_display_lock(parent_display) if parent_display is not None else None
+        )
+        self._forward_turn_active = False
+
+    def _should_forward(self) -> bool:
+        return self._parent_display is not None and self._parent_display.verbose
 
     # -- Public API --------------------------------------------------------
 
@@ -1340,17 +1377,62 @@ class SubAgentDisplay(Display):
 
     # -- Streaming assistant output ----------------------------------------
 
-    def begin_assistant_turn(self) -> None:
-        pass
+    def begin_assistant_turn(self, title: str = "Assistant") -> None:
+        if self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                self._parent_lock.acquire()
+            self._forward_turn_active = True
+            if title == "Assistant":
+                header = f"Agent ({self._agent_name})"
+            else:
+                header = f"{title} ({self._agent_name})"
+            try:
+                self._parent_display.begin_assistant_turn(title=header)
+            except Exception:
+                if self._parent_lock is not None:
+                    self._parent_lock.release()
+                self._forward_turn_active = False
+                raise
 
     def stream_text(self, delta: str) -> None:
         self._buffer.append(delta)
+        if self._forward_turn_active and self._parent_display is not None:
+            self._parent_display.stream_text(delta)
+        elif self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                with self._parent_lock:
+                    self._parent_display.stream_text(delta)
+            else:
+                self._parent_display.stream_text(delta)
 
     def stream_reasoning(self, delta: str) -> None:
+        if self._forward_turn_active and self._parent_display is not None:
+            self._parent_display.stream_reasoning(delta)
+            return
+        if self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                with self._parent_lock:
+                    self._parent_display.stream_reasoning(delta)
+            else:
+                self._parent_display.stream_reasoning(delta)
+            return
         logger.debug("Sub-agent reasoning: %s", delta)
 
     def end_assistant_turn(self) -> None:
-        pass
+        if self._forward_turn_active and self._parent_display is not None:
+            try:
+                self._parent_display.end_assistant_turn()
+            finally:
+                self._forward_turn_active = False
+                if self._parent_lock is not None:
+                    self._parent_lock.release()
+            return
+        if self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                with self._parent_lock:
+                    self._parent_display.end_assistant_turn()
+            else:
+                self._parent_display.end_assistant_turn()
 
     def update_usage(self, usage: dict, context_window: int) -> None:
         self._last_usage = usage
@@ -1358,6 +1440,14 @@ class SubAgentDisplay(Display):
     # -- Tool activity -----------------------------------------------------
 
     def show_tool_call(self, name: str, args: dict) -> None:
+        if self._forward_turn_active and self._parent_display is not None:
+            self._parent_display.show_tool_call(name, args)
+        elif self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                with self._parent_lock:
+                    self._parent_display.show_tool_call(name, args)
+            else:
+                self._parent_display.show_tool_call(name, args)
         if self._verbose:
             logger.debug("Sub-agent tool call: %s (keys: %s)", name, list(args))
         else:
@@ -1366,6 +1456,14 @@ class SubAgentDisplay(Display):
     def show_tool_result(
         self, name: str, result: dict, display_str: str | None = None
     ) -> None:
+        if self._forward_turn_active and self._parent_display is not None:
+            self._parent_display.show_tool_result(name, result, display_str)
+        elif self._should_forward() and self._parent_display is not None:
+            if self._parent_lock is not None:
+                with self._parent_lock:
+                    self._parent_display.show_tool_result(name, result, display_str)
+            else:
+                self._parent_display.show_tool_result(name, result, display_str)
         logger.debug("Sub-agent tool result: %s → %s", name, result.get("status"))
 
     # -- Status and errors -------------------------------------------------
