@@ -139,6 +139,72 @@ class TestFileLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Storage location & cross-instance persistence
+# ---------------------------------------------------------------------------
+
+
+class TestStorageLocation:
+    """Locks in the contract that ``tasks.json`` is project-scoped.
+
+    These tests do not care *which* directory the manager is given — they
+    care that two managers pointed at the same directory share state, and
+    two managers pointed at different directories do not.  Together with
+    the ``__main__`` wiring, this guarantees that tasks survive across
+    sessions in the same project and stay isolated between projects.
+    """
+
+    def test_two_managers_share_state_when_pointed_at_same_dir(self, tmp_path):
+        # First manager creates a task and persists it.
+        tm1 = TaskManager(tmp_path)
+        created = tm1.create_task(name="Shared", definition_of_done="DoD here")
+
+        # Second manager constructed against the same directory must see it.
+        tm2 = TaskManager(tmp_path)
+        ids = [t["id"] for t in tm2.list_tasks()]
+        assert created["id"] in ids
+
+    def test_managers_in_different_dirs_are_isolated(self, tmp_path):
+        # Two distinct project directories.
+        project_a = tmp_path / "project_a"
+        project_b = tmp_path / "project_b"
+        project_a.mkdir()
+        project_b.mkdir()
+
+        tm_a = TaskManager(project_a)
+        tm_b = TaskManager(project_b)
+
+        a_task = tm_a.create_task(name="OnlyA", definition_of_done="DoD A here")
+        b_task = tm_b.create_task(name="OnlyB", definition_of_done="DoD B here")
+
+        a_ids = [t["id"] for t in tm_a.list_tasks()]
+        b_ids = [t["id"] for t in tm_b.list_tasks()]
+
+        assert a_task["id"] in a_ids
+        assert b_task["id"] not in a_ids
+        assert b_task["id"] in b_ids
+        assert a_task["id"] not in b_ids
+
+    def test_missing_file_in_fresh_dir_returns_empty_without_creating_file(
+        self, tmp_path
+    ):
+        # Brand-new directory with no prior task activity.
+        tm = TaskManager(tmp_path)
+
+        assert tm.list_tasks() == []
+        # Reading must not create tasks.json.
+        assert not (tmp_path / "tasks.json").exists()
+
+    def test_first_write_creates_file_in_storage_dir(self, tmp_path):
+        # The structural assertion: the file is written exactly under the
+        # directory the manager was given, not in any subdirectory.
+        tm = TaskManager(tmp_path)
+        tm.create_task(name="T", definition_of_done="DoD here")
+        assert (tmp_path / "tasks.json").exists()
+        # No nested session-style directory was created.
+        assert not (tmp_path / "sessions").exists()
+
+
+# ---------------------------------------------------------------------------
 # Goal
 # ---------------------------------------------------------------------------
 

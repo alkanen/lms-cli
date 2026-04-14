@@ -410,8 +410,8 @@ technical constraints that affect implementation.
 
 See `design_task_system.md` for the full schema and tool definitions.
 
-- **File location**: `<session_dir>/tasks.json`.  One file per CLI session,
-  co-located with session history files.
+- **File location**: `<workspace_root>/.ai-cli/tasks.json`.  One file per
+  project, shared by every session opened in that project.
 
 - **Format**: JSON object with an optional top-level `goal` field and a
   top-level `tasks` map keyed by task IDs of the form `task_<...>`.  Each
