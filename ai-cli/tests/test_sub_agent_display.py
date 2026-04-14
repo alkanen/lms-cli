@@ -1,6 +1,8 @@
 """Tests for ai_cli.cli.display.SubAgentDisplay."""
 
 import logging
+import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -118,6 +120,126 @@ class TestNoOpMethods:
     )
     def test_noop_callable(self, display, method, args):
         getattr(display, method)(*args)
+
+
+class TestParentForwarding:
+    def test_forwards_streaming_to_parent_when_parent_is_verbose(self):
+        parent = MagicMock()
+        parent.verbose = True
+        parent.markdown_enabled = True
+        d = SubAgentDisplay(
+            verbose=False,
+            parent_display=parent,
+            agent_name="planner",
+        )
+
+        d.begin_assistant_turn()
+        d.stream_reasoning("thinking")
+        d.stream_text("done")
+        d.end_assistant_turn()
+
+        parent.begin_assistant_turn.assert_called_once_with(title="Agent (planner)")
+        parent.stream_reasoning.assert_called_once_with("thinking")
+        parent.stream_text.assert_called_once_with("done")
+        parent.end_assistant_turn.assert_called_once_with()
+
+    def test_forwards_custom_title_to_parent_when_verbose(self):
+        parent = MagicMock()
+        parent.verbose = True
+        parent.markdown_enabled = True
+        d = SubAgentDisplay(
+            verbose=False,
+            parent_display=parent,
+            agent_name="planner",
+        )
+
+        d.begin_assistant_turn(title="Reviewer")
+
+        parent.begin_assistant_turn.assert_called_once_with(title="Reviewer (planner)")
+
+    def test_does_not_forward_when_parent_is_not_verbose(self):
+        parent = MagicMock()
+        parent.verbose = False
+        parent.markdown_enabled = True
+        d = SubAgentDisplay(
+            verbose=False,
+            parent_display=parent,
+            agent_name="explorer",
+        )
+
+        d.begin_assistant_turn()
+        d.stream_text("hidden")
+        d.stream_reasoning("hidden-thinking")
+        d.end_assistant_turn()
+
+        parent.begin_assistant_turn.assert_not_called()
+        parent.stream_text.assert_not_called()
+        parent.stream_reasoning.assert_not_called()
+        parent.end_assistant_turn.assert_not_called()
+        assert d.captured_text == "hidden"
+
+    def test_serializes_forwarded_streaming_for_shared_parent(self):
+        parent = MagicMock()
+        parent.verbose = True
+        parent.markdown_enabled = True
+
+        first_begin_entered = threading.Event()
+        release_first_begin = threading.Event()
+        second_begin_attempted = threading.Event()
+        second_begin_entered_parent = threading.Event()
+        second_begin_returned = threading.Event()
+        begin_count = {"n": 0}
+
+        def _begin_side_effect(*, title):
+            begin_count["n"] += 1
+            if begin_count["n"] == 1:
+                first_begin_entered.set()
+                assert release_first_begin.wait(timeout=1.0)
+            elif begin_count["n"] == 2:
+                second_begin_entered_parent.set()
+
+        parent.begin_assistant_turn.side_effect = _begin_side_effect
+
+        d1 = SubAgentDisplay(
+            verbose=False,
+            parent_display=parent,
+            agent_name="planner",
+        )
+        d2 = SubAgentDisplay(
+            verbose=False,
+            parent_display=parent,
+            agent_name="reviewer",
+        )
+
+        def _run_first() -> None:
+            d1.begin_assistant_turn()
+            d1.stream_text("a")
+            d1.end_assistant_turn()
+
+        def _run_second() -> None:
+            assert first_begin_entered.wait(timeout=1.0)
+            second_begin_attempted.set()
+            d2.begin_assistant_turn()
+            second_begin_returned.set()
+            d2.end_assistant_turn()
+
+        t1 = threading.Thread(target=_run_first)
+        t2 = threading.Thread(target=_run_second)
+        t1.start()
+        t2.start()
+
+        # While the first forwarded turn is active, the second must block.
+        assert first_begin_entered.wait(timeout=1.0)
+        assert second_begin_attempted.wait(timeout=1.0)
+        assert not second_begin_entered_parent.wait(timeout=0.2)
+
+        release_first_begin.set()
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert second_begin_entered_parent.is_set()
+        assert second_begin_returned.is_set()
 
 
 class TestConstructorDefaults:

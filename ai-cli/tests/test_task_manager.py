@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -234,6 +235,22 @@ class TestGoal:
         tm = _make_tm(tmp_path)
         with pytest.raises(TaskValidationError, match="goal"):
             tm.set_goal("   ")
+
+    def test_set_goal_info_log_uses_truncated_preview(self, tmp_path, caplog):
+        tm = _make_tm(tmp_path)
+        long_goal = "x" * 300
+
+        with caplog.at_level(logging.INFO, logger="ai_cli.core.task_manager"):
+            tm.set_goal(long_goal)
+
+        info_logs = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.name == "ai_cli.core.task_manager" and rec.levelno == logging.INFO
+        ]
+        assert any("Task goal updated:" in line for line in info_logs)
+        # Full goal text should not appear in INFO logs.
+        assert all(long_goal not in line for line in info_logs)
 
 
 # ---------------------------------------------------------------------------

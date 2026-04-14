@@ -20,6 +20,7 @@ from ai_cli.core.agent import AgentSpec, BackendConfig
 from ai_cli.core.config_manager import ConfigManager
 
 if TYPE_CHECKING:
+    from ai_cli.cli.display import Display
     from ai_cli.core.agent import Agent
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.tool_registry import ToolRegistry
@@ -34,6 +35,7 @@ _OPTIONAL_FIELDS: dict[str, Any] = {
     "tool_permission_overrides": {},
     "max_tool_rounds": 10,
     "context_limit_threshold": 0.90,
+    "context_window": None,
 }
 
 _REQUIRED_FIELDS = ("system_message", "tools", "model")
@@ -48,12 +50,14 @@ _KNOWN_KEYS = {
     "tool_permission_overrides",
     "max_tool_rounds",
     "context_limit_threshold",
+    "context_window",
 }
 
 
 def _parse_backend(raw: Any) -> BackendConfig | None:
     """Parse a ``backend:`` mapping into a ``BackendConfig``, or ``None``."""
     if raw is None:
+        logger.debug("No agent-specific backend configured; using coordinator backend")
         return None
     if not isinstance(raw, dict):
         raise ValueError(f"'backend' must be a mapping, got {type(raw).__name__}")
@@ -63,6 +67,11 @@ def _parse_backend(raw: Any) -> BackendConfig | None:
     api_key_env = raw.get("api_key_env")
     if api_key_env is not None and not isinstance(api_key_env, str):
         raise ValueError("'backend.api_key_env' must be a string")
+    logger.debug(
+        "Parsed agent backend config for base_url=%r api_key_env=%r",
+        base_url,
+        api_key_env,
+    )
     return BackendConfig(base_url=base_url, api_key_env=api_key_env)
 
 
@@ -74,6 +83,12 @@ def _parse_agent_spec(name: str, raw: dict, defaults: dict) -> AgentSpec:
 
     Raises ``ValueError`` on missing required fields or invalid types.
     """
+    logger.debug(
+        "Agent '%s': parsing spec with raw keys=%s default keys=%s",
+        name,
+        sorted(raw.keys()),
+        sorted(defaults.keys()),
+    )
     # Merge: agent-level overrides defaults.
     merged = {**defaults, **raw}
 
@@ -155,7 +170,35 @@ def _parse_agent_spec(name: str, raw: dict, defaults: dict) -> AgentSpec:
             f"Agent '{name}': 'context_limit_threshold' must be > 0 and <= 1"
         )
 
+    raw_context_window = merged.get(
+        "context_window", _OPTIONAL_FIELDS["context_window"]
+    )
+    context_window: int | None = None
+    if raw_context_window is not None:
+        if isinstance(raw_context_window, bool) or not isinstance(
+            raw_context_window, int
+        ):
+            raise ValueError(
+                f"Agent '{name}': 'context_window' must be a positive integer"
+            )
+        if raw_context_window <= 0:
+            raise ValueError(
+                f"Agent '{name}': 'context_window' must be a positive integer, "
+                f"got {raw_context_window}"
+            )
+        context_window = raw_context_window
+
     backend = _parse_backend(merged.get("backend"))
+
+    logger.info(
+        "Agent '%s': parsed spec (tools=%d, persistence=%s, backend=%s, context_window=%r, max_tool_rounds=%d)",
+        name,
+        len(tools),
+        persistence,
+        "custom" if backend is not None else "coordinator",
+        context_window,
+        max_tool_rounds,
+    )
 
     return AgentSpec(
         name=name,
@@ -168,6 +211,7 @@ def _parse_agent_spec(name: str, raw: dict, defaults: dict) -> AgentSpec:
         tool_permission_overrides=dict(tool_permission_overrides),
         max_tool_rounds=max_tool_rounds,
         context_limit_threshold=float(context_limit_threshold),
+        context_window=context_window,
     )
 
 
@@ -179,6 +223,7 @@ def load_agent_specs(config: ConfigManager) -> dict[str, AgentSpec]:
     """
     agents_raw = config.get("agents")
     if agents_raw is None:
+        logger.info("No 'agents' config found; agent registry will be empty")
         return {}
     if not isinstance(agents_raw, dict):
         logger.warning("'agents' config must be a mapping — ignoring")
@@ -187,10 +232,16 @@ def load_agent_specs(config: ConfigManager) -> dict[str, AgentSpec]:
     defaults = config.get("agent_defaults")
     if defaults is None:
         defaults = {}
+        logger.debug("No 'agent_defaults' config found; using built-in defaults")
     if not isinstance(defaults, dict):
         logger.warning("'agent_defaults' config must be a mapping — ignoring")
         defaults = {}
 
+    logger.info(
+        "Loading agent specs for %d configured agents with %d default keys",
+        len(agents_raw),
+        len(defaults),
+    )
     specs: dict[str, AgentSpec] = {}
     for name, entry in agents_raw.items():
         if not isinstance(name, str):
@@ -203,6 +254,11 @@ def load_agent_specs(config: ConfigManager) -> dict[str, AgentSpec]:
             specs[name] = _parse_agent_spec(name, entry, defaults)
         except ValueError as exc:
             logger.warning("%s — skipping", exc)
+    logger.info(
+        "Loaded %d valid agent specs (from %d configured entries)",
+        len(specs),
+        len(agents_raw),
+    )
     return specs
 
 
@@ -214,12 +270,23 @@ class AgentRegistry:
     lazy agent instantiation via :meth:`get_or_create`.
     """
 
-    def __init__(self, specs: dict[str, AgentSpec]) -> None:
+    def __init__(
+        self,
+        specs: dict[str, AgentSpec],
+        *,
+        parent_display: Display | None = None,
+    ) -> None:
         self._specs = dict(specs)
+        self._parent_display = parent_display
         # Cache for session-persistent agent instances.
         self._instances: dict[str, Agent] = {}
         # Protects _instances cache mutations for thread-safe parallel dispatch.
         self._lock = threading.Lock()
+        logger.info(
+            "AgentRegistry initialised with %d specs: %s",
+            len(self._specs),
+            sorted(self._specs),
+        )
 
     @property
     def specs(self) -> dict[str, AgentSpec]:
@@ -244,7 +311,11 @@ class AgentRegistry:
         names.
         """
         with self._lock:
-            self._instances.pop(name, None)
+            removed = self._instances.pop(name, None)
+        if removed is None:
+            logger.debug("AgentRegistry reset ignored for uncached agent %r", name)
+        else:
+            logger.info("AgentRegistry reset cached session agent %r", name)
 
     def get_or_create(
         self,
@@ -267,18 +338,27 @@ class AgentRegistry:
         """
         spec = self._specs.get(name)
         if spec is None:
+            logger.warning("AgentRegistry lookup failed for unknown agent %r", name)
             raise KeyError(f"No agent spec named {name!r}")
+
+        logger.info(
+            "AgentRegistry get_or_create for agent %r (persistence=%s)",
+            name,
+            spec.persistence,
+        )
 
         if spec.persistence == "session":
             # Fast path: already cached — acquire lock only briefly.
             with self._lock:
                 if name in self._instances:
                     agent = self._instances[name]
+                    logger.info("AgentRegistry cache hit for session agent %r", name)
                     agent.reset()
                     return agent
 
             # Build outside the lock so expensive construction doesn't
             # serialise concurrent parallel dispatches.
+            logger.info("AgentRegistry cache miss for session agent %r; building", name)
             candidate = self._build_agent(
                 spec, workspace, config, coordinator_llm, global_tool_registry
             )
@@ -288,12 +368,18 @@ class AgentRegistry:
             with self._lock:
                 if name in self._instances:
                     cached = self._instances[name]
+                    logger.info(
+                        "AgentRegistry concurrent cache fill won race for session agent %r; reusing cached instance",
+                        name,
+                    )
                     cached.reset()
                     return cached
                 self._instances[name] = candidate
+                logger.info("AgentRegistry cached new session agent %r", name)
                 return candidate
 
         # ephemeral — build a fresh agent every time
+        logger.info("AgentRegistry building fresh ephemeral agent %r", name)
         return self._build_agent(
             spec, workspace, config, coordinator_llm, global_tool_registry
         )
@@ -312,11 +398,24 @@ class AgentRegistry:
         from ai_cli.core.llm_client import OpenAIClient
         from ai_cli.core.session_manager import InMemorySession
 
+        logger.info(
+            "AgentRegistry building agent %r (model=%s, backend=%s, tools=%d)",
+            spec.name,
+            spec.model,
+            "custom" if spec.backend is not None else "coordinator",
+            len(spec.tools),
+        )
         if spec.backend is not None:
             meta = coordinator_llm.get_model_metadata()
             llm_cfg: dict = {
                 "model": spec.model,
-                "context_window": meta.get("context_window", 8192),
+                # Prefer the per-agent context_window spec; fall back to the
+                # coordinator's value so existing configs still work.
+                "context_window": (
+                    spec.context_window
+                    if spec.context_window is not None
+                    else meta.get("context_window", 8192)
+                ),
                 "max_response_tokens": spec.max_response_tokens,
                 "base_url": spec.backend.base_url,
             }
@@ -331,13 +430,35 @@ class AgentRegistry:
                     )
                     api_key = "no-key"
                 llm_cfg["api_key"] = api_key
+            logger.debug(
+                "AgentRegistry creating dedicated OpenAIClient for agent %r with context_window=%r",
+                spec.name,
+                llm_cfg.get("context_window"),
+            )
             llm_client: LLMClient = OpenAIClient(llm_cfg)
         else:
+            logger.debug(
+                "AgentRegistry reusing coordinator LLM for agent %r",
+                spec.name,
+            )
             llm_client = coordinator_llm
 
-        display = SubAgentDisplay()
+        if self._parent_display is not None:
+            display = SubAgentDisplay(
+                verbose=self._parent_display.verbose,
+                markdown_enabled=self._parent_display.markdown_enabled,
+                parent_display=self._parent_display,
+                agent_name=spec.name,
+            )
+        else:
+            display = SubAgentDisplay()
         session = InMemorySession(llm_client, system_message=spec.system_message)
         registry = build_agent_tool_registry(
             spec, workspace, config, display, global_tool_registry
+        )
+        logger.info(
+            "AgentRegistry finished building agent %r with scoped tools=%d",
+            spec.name,
+            len(registry.definitions()),
         )
         return Agent(spec, session, llm_client, registry, display)

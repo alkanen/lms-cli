@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from ai_cli.core.agent import AgentResult, AgentSpec
 from ai_cli.core.agent_registry import AgentRegistry
+from ai_cli.tools.base import Tool, ToolSchema
 from ai_cli.tools.call_agent import CallAgentsParallelTool, CallAgentTool
 
 # ---------------------------------------------------------------------------
@@ -428,6 +429,68 @@ class TestBuildAgentToolRegistry:
         # No warning should mention call_agent — it is silently skipped.
         for call in mock_logger.warning.call_args_list:
             assert "call_agent" not in str(call)
+
+    def test_instance_only_tools_are_cloned_per_registry(self):
+        """Instance-only tools must not be shared across scoped registries.
+
+        Permission overrides are applied by mutating ``permission_required``.
+        If a shared object is reused, overrides leak across agents/coordinator.
+        """
+        from ai_cli.cli.display import SubAgentDisplay
+        from ai_cli.core.agent import AgentSpec, build_agent_tool_registry
+
+        class InstanceOnlyTool(Tool):
+            NAME = "instance_only"
+            DESCRIPTION = "Instance-only test tool"
+            PERMISSION_REQUIRED = False
+            REGISTER_VIA_INSTANCE = True
+
+            def __init__(self, task_manager, workspace, permission_manager) -> None:
+                super().__init__(
+                    workspace,
+                    permission_manager,
+                    self.PERMISSION_REQUIRED,
+                    self.NAME,
+                    self.DESCRIPTION,
+                )
+                self._tm = task_manager
+
+            def definition(self) -> ToolSchema:
+                return ToolSchema(name=self.name, description=self.description)
+
+            def execute(self, **kwargs: object) -> dict:
+                return self._ok({"ok": True})
+
+        spec = AgentSpec(
+            name="loopy",
+            system_message="I use one instance-only tool.",
+            tools=["instance_only"],
+            model="llama3:8b",
+            tool_permission_overrides={"instance_only": True},
+        )
+
+        workspace = MagicMock()
+        config = MagicMock()
+        config.get.return_value = None
+        display = SubAgentDisplay()
+
+        task_manager = MagicMock()
+        global_instance = InstanceOnlyTool(task_manager, MagicMock(), MagicMock())
+        global_instance.permission_required = False
+
+        global_tool_registry = MagicMock()
+        global_tool_registry.get.return_value = global_instance
+
+        registry = build_agent_tool_registry(
+            spec, workspace, config, display, global_tool_registry
+        )
+
+        scoped_instance = registry.get("instance_only")
+        assert scoped_instance is not None
+        assert scoped_instance is not global_instance
+        assert getattr(scoped_instance, "_tm", None) is task_manager
+        assert global_instance.permission_required is False
+        assert scoped_instance.permission_required is True
 
 
 # ---------------------------------------------------------------------------
