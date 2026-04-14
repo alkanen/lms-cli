@@ -239,12 +239,14 @@ Both modes read and write the same `tasks.json`.  A session might look like:
 ### File Location
 
 ```
-<session_dir>/tasks.json
+<workspace_root>/.ai-cli/tasks.json
 ```
 
-The task file is tied to the session and persists across CLI restarts via
-session resume.  It is created on first use (first `tasks_create` call or
-first `/plan` invocation).
+The task file is tied to the **project**, not the session.  Every session
+opened in the same project sees and mutates the same task list, so plans and
+in-flight work survive across restarts and `--resume` cycles regardless of
+which session is active.  It is created on first use (first `tasks_create`
+call or first `/plan` invocation).
 
 ### File Schema
 
@@ -1318,8 +1320,9 @@ integration — just the class that owns `tasks.json`.
 
 `TaskManager` implements:
 
-- `__init__(session_dir: Path)` — resolves `tasks.json` path; does not create
-  the file until first write.
+- `__init__(storage_dir: Path)` — resolves `tasks.json` path; does not create
+  the file until first write.  In production `storage_dir` is the project's
+  `.ai-cli/` directory so the task list is project-scoped.
 - `set_goal(goal: str)` — writes or updates the top-level `goal` field.
 - `get_goal() -> str | None`
 - `create_task(name, definition_of_done, description="", parent_id=None, priority="medium") -> dict` — generates a `task_<random6>` ID, validates DoD ≥ 5 chars, appends to `subtask_ids` of parent if given, persists, returns `task_detail`.
@@ -1384,10 +1387,12 @@ produce canonical error responses.
 
 Changes:
 
-- `__main__.py` — instantiate `TaskManager(session_dir)` after session is
-  resolved; instantiate all six task tool objects; register them via
-  `tool_registry.register_instance()` on both the coordinator registry and any
-  per-agent registries that list task tool names in their spec.
+- `__main__.py` — instantiate `TaskManager(workspace.ai_cli_dir)` after the
+  workspace is resolved; instantiate all six task tool objects; register them
+  via `tool_registry.register_instance()` on both the coordinator registry and
+  any per-agent registries that list task tool names in their spec.  Tasks are
+  project-scoped (stored under `.ai-cli/tasks.json`) so they survive across
+  every session opened in the same project.
 
 - `repl.py` — add slash command handlers:
   - `/tasks` → `display.show_task_tree(tm.list_tasks())`

@@ -487,8 +487,10 @@ def _cmd_repl(
         agent_registry, tool_registry, workspace, permission_manager, config, llm_client
     )
 
-    # Wire up task tools — always registered, session-scoped.
-    task_manager = TaskManager(session.session_dir)
+    # Wire up task tools — always registered.  Tasks are project-scoped: they
+    # live under the project's .ai-cli/ directory so they survive across
+    # sessions and are shared between every session opened in the same project.
+    task_manager = TaskManager(workspace.ai_cli_dir)
     _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
 
     # Wire up MCP servers (connect, discover tools, register proxies).
