@@ -1094,7 +1094,8 @@ class TaskManager:
 Enforces: valid parent references, `subtask_ids` integrity, `done` requires
 all subtasks done, `done` only reachable via `mark_done()`.
 
-Storage: `<session_dir>/tasks.json`, created on first use.
+Storage: `<workspace_root>/.ai-cli/tasks.json`, created on first use and
+shared across every session opened in the project.
 
 ---
 
@@ -1259,8 +1260,10 @@ def main():
     # If agents are configured, register CallAgentTool on the coordinator's
     # tool registry. If agents: is absent/empty, this is a no-op.
 
-    # 6. Initialise task manager for this session (🔲 planned)
-    task_manager = TaskManager(session.session_dir)
+    # 6. Initialise task manager for this project.  Tasks live under the
+    #    project's .ai-cli/ directory so they are shared across every session
+    #    opened in the same project.
+    task_manager = TaskManager(workspace.ai_cli_dir)
 
     # 7. Start REPL
     repl = REPL(session, tool_registry, llm_client, display, workspace,

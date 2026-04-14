@@ -1,9 +1,14 @@
 """
 task_manager.py — Persistent task tree for the task system.
 
-Tasks are stored in ``<session_dir>/tasks.json`` as a flat map of
-``task_id → Task``.  The manager owns all file I/O, ID generation, validation,
-and status-transition enforcement.
+Tasks are stored in ``<storage_dir>/tasks.json`` as a flat map of
+``task_id → Task``.  In production the storage directory is the project's
+``.ai-cli/`` directory, so the task list is project-scoped and shared across
+all sessions opened in the same project.  The manager itself takes any
+directory and is therefore reusable in tests.
+
+The manager owns all file I/O, ID generation, validation, and
+status-transition enforcement.
 
 The file is created on the first write; reads against a missing file return
 empty results rather than raising.
@@ -94,7 +99,11 @@ class TaskStorageError(OSError):
 
 
 class TaskManager:
-    """Read/write the task tree in ``<session_dir>/tasks.json``.
+    """Read/write the task tree in ``<storage_dir>/tasks.json``.
+
+    In production *storage_dir* is the project's ``.ai-cli/`` directory, so
+    the task list is project-scoped and survives across sessions opened in
+    the same project.
 
     All public methods that mutate state write atomically via a temp-file
     rename so the file is never left in a partial state.
@@ -103,12 +112,12 @@ class TaskManager:
     single ``TaskManager`` instance in a single process, every ``_save``
     updates both the file and the cache atomically from that caller's
     perspective.  This does not provide cross-process or cross-instance cache
-    coherence if multiple writers point at the same ``session_dir`` — see
+    coherence if multiple writers point at the same ``storage_dir`` — see
     VULN-011 in ``docs/vulnerabilities.md``.
     """
 
-    def __init__(self, session_dir: Path) -> None:
-        self._path = session_dir / "tasks.json"
+    def __init__(self, storage_dir: Path) -> None:
+        self._path = storage_dir / "tasks.json"
         self._last_ts: str = ""
         self._cache: dict[str, Any] | None = None
 

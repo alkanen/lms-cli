@@ -921,3 +921,150 @@ class TestLoadSystemPrompt:
         root, global_dir = self._make_dirs(tmp_path)
         (root / _DOT_AI_CLI / "system_prompt.md").write_text(f"\n\n{_REAL_PROMPT}\n\n")
         assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Project-scoped task storage wiring
+# ---------------------------------------------------------------------------
+
+
+class TestTaskManagerWiring:
+    """Verifies _cmd_repl wires TaskManager to the project's .ai-cli/ dir.
+
+    These tests cover steps 2 and 5 of the fix plan in alkanen/lms-cli#89:
+    they assert that a fresh session in a project sees tasks created by an
+    earlier session, and that the task file lives under .ai-cli/ — not under
+    any session subdirectory.
+    """
+
+    def _setup_project(self, tmp_path):
+        """Init a minimal real project scaffold under tmp_path/project."""
+        root = tmp_path / "project"
+        root.mkdir()
+        run_main(["--init", "--workspace", str(root)])
+        return root
+
+    def _patch_cmd_repl_dependencies(
+        self, monkeypatch, tmp_path_factory, *, captured_dirs
+    ):
+        """Patch out everything _cmd_repl uses except TaskManager wiring.
+
+        The TaskManager binding in ai_cli.__main__ is replaced with a spy
+        that records the storage_dir it was constructed with, then delegates
+        to the real class so behaviour is preserved.
+        """
+        from ai_cli.core.task_manager import TaskManager as RealTaskManager
+
+        class SpyTaskManager(RealTaskManager):
+            def __init__(self, storage_dir):
+                captured_dirs.append(storage_dir)
+                super().__init__(storage_dir)
+
+        monkeypatch.setattr("ai_cli.__main__.TaskManager", SpyTaskManager)
+
+        # LLM client: trivial stub.
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda config: MagicMock()
+        )
+
+        # SessionManager + session: produce a session whose session_dir is in
+        # a *different* directory than the project's .ai-cli/, so the assertion
+        # "TaskManager is wired to the project dir, not the session dir" has
+        # bite.
+        sessions_root = tmp_path_factory.mktemp("sessions_root")
+        fake_session = MagicMock()
+        fake_session.session_id = "spy-session"
+        fake_session.session_dir = sessions_root / "spy-session"
+        fake_session.session_dir.mkdir()
+        fake_session.set_system_message = MagicMock()
+
+        fake_sm = MagicMock()
+        fake_sm.new.return_value = fake_session
+        fake_sm.load.return_value = fake_session
+        fake_sm.most_recent.return_value = None
+        fake_sm.list.return_value = []
+
+        monkeypatch.setattr("ai_cli.__main__.SessionManager", lambda *a, **k: fake_sm)
+        monkeypatch.setattr(
+            "ai_cli.__main__._pick_session", lambda *a, **k: (fake_session, False)
+        )
+
+        # No-op out of bootstrap pieces that touch disk / subprocess / network.
+        monkeypatch.setattr("ai_cli.__main__.setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr("ai_cli.__main__.load_agent_specs", lambda config: {})
+        monkeypatch.setattr("ai_cli.__main__._wire_agents", lambda *a, **k: None)
+        monkeypatch.setattr("ai_cli.__main__._wire_mcp", lambda *a, **k: None)
+
+        # ToolRegistry is constructed for real but its load() is a no-op.
+        monkeypatch.setattr(
+            "ai_cli.core.tool_registry.ToolRegistry.load", lambda self: None
+        )
+
+        # REPL: do not start the interactive loop.
+        fake_repl = MagicMock()
+        monkeypatch.setattr("ai_cli.__main__.REPL", lambda *a, **k: fake_repl)
+
+        return fake_session, fake_sm
+
+    def test_task_manager_constructed_with_project_ai_cli_dir(
+        self, tmp_path, tmp_path_factory, monkeypatch
+    ):
+        """The TaskManager spy must record the project's .ai-cli/ dir.
+
+        Specifically, it must NOT be constructed with the session_dir, which
+        would re-introduce session-scoped task storage.
+        """
+        root = self._setup_project(tmp_path)
+
+        captured_dirs: list = []
+        fake_session, _ = self._patch_cmd_repl_dependencies(
+            monkeypatch, tmp_path_factory, captured_dirs=captured_dirs
+        )
+
+        _real_cmd_repl(root, tmp_path_factory.mktemp("global"))
+
+        assert len(captured_dirs) == 1
+        assert captured_dirs[0] == root / _DOT_AI_CLI
+        assert captured_dirs[0] != fake_session.session_dir
+
+    def test_tasks_persist_across_sessions_in_same_project(
+        self, tmp_path, tmp_path_factory, monkeypatch
+    ):
+        """End-to-end: a task created in one wired-up session is visible
+        to a later wired-up session in the same project."""
+        root = self._setup_project(tmp_path)
+
+        # First "session": run _cmd_repl, then use the captured TaskManager
+        # to create a task as if a tool had been invoked during the session.
+        captured_dirs_1: list = []
+        self._patch_cmd_repl_dependencies(
+            monkeypatch, tmp_path_factory, captured_dirs=captured_dirs_1
+        )
+        _real_cmd_repl(root, tmp_path_factory.mktemp("global1"))
+        assert len(captured_dirs_1) == 1
+
+        # Construct a TaskManager exactly as the wiring did and create a task
+        # in the project's storage location.
+        from ai_cli.core.task_manager import TaskManager as RealTM
+
+        tm_first = RealTM(captured_dirs_1[0])
+        created = tm_first.create_task(
+            name="Persist", definition_of_done="Survives sessions"
+        )
+
+        # Second "session": fresh patches, fresh _cmd_repl run, fresh manager
+        # constructed from the captured directory.  It must see the task.
+        captured_dirs_2: list = []
+        self._patch_cmd_repl_dependencies(
+            monkeypatch, tmp_path_factory, captured_dirs=captured_dirs_2
+        )
+        _real_cmd_repl(root, tmp_path_factory.mktemp("global2"))
+        assert len(captured_dirs_2) == 1
+        assert captured_dirs_2[0] == captured_dirs_1[0]
+
+        tm_second = RealTM(captured_dirs_2[0])
+        ids_seen = [t["id"] for t in tm_second.list_tasks()]
+        assert created["id"] in ids_seen
+
+        # Structural assertion: the file lives directly under .ai-cli/.
+        assert (root / _DOT_AI_CLI / "tasks.json").exists()
