@@ -36,6 +36,7 @@ def _completer(
     cmds: list[str] | None = None,
     tool_names: list[str] | None = None,
     workspace=None,
+    task_manager=None,
 ) -> REPLCompleter:
     registry = None
     if tool_names is not None:
@@ -45,6 +46,7 @@ def _completer(
         slash_commands=cmds if cmds is not None else CMDS,
         tool_registry=registry,
         workspace=workspace,
+        task_manager=task_manager,
     )
 
 
@@ -60,6 +62,27 @@ def _make_workspace(root: Path, is_ignored: bool = False) -> MagicMock:
     ws.root = root
     ws.is_ignored.return_value = is_ignored
     return ws
+
+
+def _make_task_detail(
+    name: str,
+    task_id: str,
+    parent_id: str | None = None,
+    subtask_names: list[str] | None = None,
+) -> dict:
+    subtasks = [
+        {"id": f"{task_id}_{i}", "name": child_name, "status": "not_started"}
+        for i, child_name in enumerate(subtask_names or [], start=1)
+    ]
+    return {
+        "id": task_id,
+        "name": name,
+        "parent_id": parent_id,
+        "status": "not_started",
+        "priority": "medium",
+        "description": "",
+        "subtasks": subtasks,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +266,59 @@ class TestTasksSubcommands:
         result = _completions(_completer(), "/tasks z")
         assert result == []
 
-    def test_tasks_subcommand_no_further_completions(self):
+    def test_tasks_list_without_task_manager_has_no_path_completions(self):
         result = _completions(_completer(), "/tasks list ")
         assert result == []
+
+    def test_tasks_info_offers_top_level_task_paths(self):
+        task_manager = MagicMock()
+        task_manager.get_all_task_details_map.return_value = {
+            "task_root": _make_task_detail(
+                "Root", "task_root", subtask_names=["Child"]
+            ),
+            "task_other": _make_task_detail("Other", "task_other"),
+        }
+        result = _completions(_completer(task_manager=task_manager), "/tasks info ")
+        assert result == ["Other", "Root"]
+
+    def test_tasks_list_offers_optional_path_completion(self):
+        task_manager = MagicMock()
+        task_manager.get_all_task_details_map.return_value = {
+            "task_root": _make_task_detail("Root", "task_root")
+        }
+        result = _completions(_completer(task_manager=task_manager), "/tasks list ")
+        assert result == ["Root"]
+
+    def test_tasks_info_nested_completion_after_dot(self):
+        task_manager = MagicMock()
+        task_manager.get_all_task_details_map.return_value = {
+            "task_root": _make_task_detail(
+                "Root", "task_root", subtask_names=["Child"]
+            ),
+            "task_child": _make_task_detail(
+                "Child", "task_child", parent_id="task_root"
+            ),
+            "task_other": _make_task_detail("Other", "task_other"),
+        }
+        result = _completions(
+            _completer(task_manager=task_manager), "/tasks info Root."
+        )
+        assert result == ["Root.Child"]
+
+    def test_tasks_completion_display_shows_subtask_count(self):
+        task_manager = MagicMock()
+        task_manager.get_all_task_details_map.return_value = {
+            "task_root": _make_task_detail(
+                "Root", "task_root", subtask_names=["ChildA", "ChildB"]
+            )
+        }
+        completer = _completer(task_manager=task_manager)
+        doc = Document("/tasks info R", cursor_position=len("/tasks info R"))
+        event = MagicMock()
+        completions = list(completer.get_completions(doc, event))
+        assert len(completions) == 1
+        assert completions[0].text == "Root"
+        assert completions[0].display_text == "Root (2 subtasks)"
 
 
 # ---------------------------------------------------------------------------

@@ -222,6 +222,23 @@ class TestTasksListTool:
         tm.list_tasks.assert_called_once_with(parent_id=None)
         assert result == _ok({"tasks": []})
 
+    def test_parent_path_strips_trailing_dot(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksListTool)
+        tm.resolve_path_to_id.return_value = "p1"
+        tm.list_tasks.return_value = []
+        result = tool.execute(parent_path="some_task.")
+        tm.resolve_path_to_id.assert_called_once_with("some_task")
+        tm.list_tasks.assert_called_once_with(parent_id="p1")
+        assert result == _ok({"tasks": []})
+
+    def test_parent_path_dot_only_returns_validation_error(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksListTool)
+        result = tool.execute(parent_path=".")
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+        tm.resolve_path_to_id.assert_not_called()
+        tm.list_tasks.assert_not_called()
+
     def test_storage_error_returns_error_response(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksListTool)
         tm.list_tasks.side_effect = TaskStorageError("disk failure")
@@ -276,6 +293,14 @@ class TestTasksGetTool:
         detail = {"id": "task_abc", "name": "T"}
         tm.find_by_path.return_value = detail
         result = tool.execute(task_path="T")
+        tm.find_by_path.assert_called_once_with("T")
+        assert result == _ok({"task": detail})
+
+    def test_task_path_strips_trailing_dot(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksGetTool)
+        detail = {"id": "task_abc", "name": "T"}
+        tm.find_by_path.return_value = detail
+        result = tool.execute(task_path="T.")
         tm.find_by_path.assert_called_once_with("T")
         assert result == _ok({"task": detail})
 

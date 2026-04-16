@@ -34,6 +34,7 @@ from ai_cli.core.task_manager import (
     TaskNotFoundError,
     TaskStorageError,
     TaskValidationError,
+    normalize_task_path,
 )
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
@@ -103,11 +104,12 @@ class _TaskTool(Tool):
     ) -> tuple[str, dict | None]:
         """Return ``(stripped_path, None)`` or ``("", error_dict)``."""
         raw = kwargs.get(key, "")
-        if not isinstance(raw, str) or not raw.strip():
+        try:
+            return normalize_task_path(raw), None
+        except TaskValidationError:
             return "", self._err(
                 "validation_error", f"'{key}' must be a non-empty string.", code=400
             )
-        return raw.strip(), None
 
     def _parse_parent_path(
         self, kwargs: dict[str, Any]
@@ -120,7 +122,16 @@ class _TaskTool(Tool):
             return None, self._err(
                 "validation_error", "'parent_path' must be a string.", code=400
             )
-        return raw.strip() or None, None
+        if not raw.strip():
+            return None, None
+        try:
+            return normalize_task_path(raw), None
+        except TaskValidationError:
+            return None, self._err(
+                "validation_error",
+                "'parent_path' must be a non-empty string.",
+                code=400,
+            )
 
 
 # ---------------------------------------------------------------------------

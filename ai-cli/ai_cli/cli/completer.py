@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ai_cli.core.mcp_manager import MCPManager
+    from ai_cli.core.task_manager import TaskManager
     from ai_cli.core.tool_registry import ToolRegistry
     from ai_cli.core.workspace import Workspace
 
@@ -39,6 +40,8 @@ _TOOLS_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
 _TASKS_SUBCOMMANDS = ["add", "close", "delete", "edit", "info", "list", "open", "tree"]
 _MCP_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
 _MCP_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
+_TASKS_REQUIRED_PATH_SUBCMDS = frozenset({"close", "edit", "info", "open"})
+_TASKS_OPTIONAL_PATH_SUBCMDS = frozenset({"add", "delete", "list"})
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +171,7 @@ class REPLCompleter(Completer):
         slash_commands: list[str],
         tool_registry: ToolRegistry | None = None,
         workspace: Workspace | None = None,
+        task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
         max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
@@ -178,6 +182,7 @@ class REPLCompleter(Completer):
         self._slash_commands = sorted(slash_commands)
         self._tool_registry = tool_registry
         self._workspace = workspace
+        self._task_manager = task_manager
         self._mcp_manager = mcp_manager
         self._max_path_completions = max_path_completions
 
@@ -306,6 +311,91 @@ class REPLCompleter(Completer):
             for sub in _TASKS_SUBCOMMANDS:
                 if sub.startswith(prefix):
                     yield Completion(sub, start_position=-raw_len)
+            return
+
+        subcmd = parts[1].lower()
+        path_partial = self._tasks_path_partial(subcmd, parts[2:], trailing)
+        if path_partial is None:
+            return
+
+        yield from self._complete_task_path(path_partial)
+
+    def _tasks_path_partial(
+        self, subcmd: str, args: list[str], trailing: bool
+    ) -> str | None:
+        if subcmd in _TASKS_REQUIRED_PATH_SUBCMDS | _TASKS_OPTIONAL_PATH_SUBCMDS:
+            if not args:
+                return ""
+            if len(args) == 1 and not trailing:
+                return args[0]
+            return None
+
+        if subcmd != "tree":
+            return None
+
+        if args and args[-1] == "--depth":
+            return None
+        if not trailing and len(args) >= 2 and args[-2] == "--depth":
+            return None
+
+        positional_count = 0
+        i = 0
+        while i < len(args):
+            token = args[i]
+            if token == "--depth":
+                i += 2
+                continue
+            positional_count += 1
+            i += 1
+
+        if trailing:
+            return "" if positional_count == 0 else None
+
+        partial = args[-1]
+        if partial == "--depth" or partial.startswith("-"):
+            return None
+        return partial if positional_count <= 1 else None
+
+    def _complete_task_path(self, partial: str) -> Iterable[Completion]:
+        detail_map = self._task_detail_map()
+        if not detail_map:
+            return
+        detail_index = self._build_task_detail_index(detail_map)
+
+        parent_path = ""
+        prefix = partial
+        if partial.endswith("."):
+            parent_path = partial[:-1]
+            prefix = ""
+        elif "." in partial:
+            parent_path, prefix = partial.rsplit(".", 1)
+
+        parent_id: str | None = None
+        if parent_path:
+            parent = self._resolve_task_path(parent_path, detail_map, detail_index)
+            if parent is None:
+                return
+            parent_id = parent["id"]
+
+        for task in sorted(
+            detail_index.get(parent_id, {}).values(),
+            key=lambda t: str(t.get("name", "")),
+        ):
+            name = str(task.get("name", ""))
+            if not name.startswith(prefix):
+                continue
+            candidate = f"{parent_path}.{name}" if parent_path else name
+            subtask_count = len(task.get("subtasks", []))
+            label = (
+                f"{candidate} ({subtask_count} subtask)"
+                if subtask_count == 1
+                else f"{candidate} ({subtask_count} subtasks)"
+            )
+            yield Completion(
+                candidate,
+                start_position=-len(partial),
+                display=label,
+            )
 
     def _complete_session(self, parts: list[str], text: str) -> Iterable[Completion]:
         trailing = text.endswith(" ")
@@ -518,6 +608,46 @@ class REPLCompleter(Completer):
         if self._tool_registry is None:
             return []
         return sorted(t["name"] for t in self._tool_registry.all_tools_info())
+
+    def _task_detail_map(self) -> dict[str, dict]:
+        if self._task_manager is None:
+            return {}
+        try:
+            return self._task_manager.get_all_task_details_map()
+        except Exception:
+            logger.warning("Task completion lookup failed", exc_info=True)
+            return {}
+
+    @staticmethod
+    def _build_task_detail_index(
+        detail_map: dict[str, dict],
+    ) -> dict[str | None, dict[str, dict]]:
+        index: dict[str | None, dict[str, dict]] = {}
+        for task in detail_map.values():
+            parent_id = task.get("parent_id")
+            name = task.get("name")
+            if not isinstance(name, str):
+                continue
+            index.setdefault(parent_id, {})[name] = task
+        return index
+
+    @staticmethod
+    def _resolve_task_path(
+        path: str,
+        detail_map: dict[str, dict],
+        detail_index: dict[str | None, dict[str, dict]] | None = None,
+    ) -> dict | None:
+        if detail_index is None:
+            detail_index = REPLCompleter._build_task_detail_index(detail_map)
+
+        current_parent_id: str | None = None
+        found: dict | None = None
+        for segment in path.split("."):
+            found = detail_index.get(current_parent_id, {}).get(segment)
+            if found is None:
+                return None
+            current_parent_id = str(found["id"])
+        return found
 
     def _mcp_server_names(self) -> list[str]:
         if self._mcp_manager is None:
