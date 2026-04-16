@@ -318,8 +318,13 @@ class TreeSitterChunker(ChunkStrategy):
         # tree-sitter Python API varies by version: newer bindings use
         # Parser() + set_language(), older ones accept the language in __init__.
         try:
-            self._parser = Parser()
-            self._parser.set_language(self._language)
+            parser = Parser()
+            set_language = getattr(parser, "set_language", None)
+            if callable(set_language):
+                set_language(self._language)
+                self._parser = parser
+            else:
+                self._parser = Parser(self._language)
         except (TypeError, AttributeError):
             self._parser = Parser(self._language)
         self._min_chunk_chars: int = int(config.get("min_chunk_chars", 80))

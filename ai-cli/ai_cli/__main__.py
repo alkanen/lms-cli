@@ -481,17 +481,19 @@ def _cmd_repl(
     setup_logging(config, session.session_dir)
     tool_registry.load()
 
+    # Wire up task tools before agents so the startup validation in
+    # _wire_agents can see the tasks_* tools when checking agent specs.
+    # Tasks are project-scoped: they live under the project's .ai-cli/
+    # directory so they survive across sessions and are shared between
+    # every session opened in the same project.
+    task_manager = TaskManager(workspace.ai_cli_dir)
+    _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
+
     # Wire up call_agent tool if any agent specs are configured.
-    agent_registry = AgentRegistry(load_agent_specs(config))
+    agent_registry = AgentRegistry(load_agent_specs(config), parent_display=ui)
     _wire_agents(
         agent_registry, tool_registry, workspace, permission_manager, config, llm_client
     )
-
-    # Wire up task tools — always registered.  Tasks are project-scoped: they
-    # live under the project's .ai-cli/ directory so they survive across
-    # sessions and are shared between every session opened in the same project.
-    task_manager = TaskManager(workspace.ai_cli_dir)
-    _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
 
     # Wire up MCP servers (connect, discover tools, register proxies).
     mcp_manager = _wire_mcp(
