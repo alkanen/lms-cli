@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 _MAX_RESULTS = 500
 
 
+def _normalize_workspace_glob(pattern: str) -> str:
+    """Normalize workspace-relative glob syntax for stable matching semantics.
+
+    A leading "./" is optional in workspace-relative paths and should not alter
+    matching behavior.
+    """
+    normalized = pattern
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    # Preserve historical behavior for "./" by keeping a non-empty pattern.
+    return normalized or "."
+
+
 def _glob_to_regex(pattern: str) -> str:
     """Convert a glob pattern string to a regex string (not anchored).
 
@@ -167,8 +180,10 @@ class FindFilesTool(Tool):
                 400,
             )
 
+        canonical_pattern = _normalize_workspace_glob(pattern)
+
         try:
-            compiled = _compile_glob(pattern)
+            compiled = _compile_glob(canonical_pattern)
         except re.error as exc:
             return self._err("invalid_input", f"Invalid glob pattern: {exc}", 400)
 
@@ -180,8 +195,8 @@ class FindFilesTool(Tool):
         # Recursion is requested only when the pattern contains '**'.
         # Without '**', the maximum traversal depth equals the number of '/'
         # separators in the pattern (e.g. "src/*.py" needs depth 1).
-        recursive = "**" in pattern
-        max_depth = None if recursive else pattern.count("/")
+        recursive = "**" in canonical_pattern
+        max_depth = None if recursive else canonical_pattern.count("/")
 
         # Narrow the walk root by consuming any leading literal (non-glob)
         # directory segments from the pattern.  This applies to both fixed-depth
@@ -189,8 +204,8 @@ class FindFilesTool(Tool):
         # walking from workspace_root/src/lib (or workspace_root/src) instead of
         # workspace_root, skipping sibling trees like "tests/" or "docs/" entirely.
         walk_root = workspace_root
-        if "/" in pattern:
-            segments = pattern.split("/")
+        if "/" in canonical_pattern:
+            segments = canonical_pattern.split("/")
             # Collect leading segments that contain no glob characters.
             literal_dirs: list[str] = []
             for seg in segments[:-1]:
