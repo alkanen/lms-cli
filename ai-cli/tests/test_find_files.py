@@ -274,6 +274,39 @@ class TestRecursiveSearch:
         assert result["status"] == "success"
         assert result["data"]["matches"] == ["pkg/docs/readme.md"]
 
+    def test_leading_dot_slash_equivalent_for_subdir_glob(self, tmp_path):
+        _write(tmp_path / "my_directory" / "a.txt")
+        _write(tmp_path / "my_directory" / "b.txt")
+        tool = make_tool(tmp_path)
+        plain = tool.execute(pattern="my_directory/*.txt")
+        dotted = tool.execute(pattern="./my_directory/*.txt")
+        expected = ["my_directory/a.txt", "my_directory/b.txt"]
+        assert plain["status"] == "success"
+        assert dotted["status"] == "success"
+        assert plain["data"]["matches"] == expected
+        assert dotted["data"]["matches"] == expected
+        assert plain["data"]["matches"] == dotted["data"]["matches"]
+        assert plain["data"]["count"] == dotted["data"]["count"]
+        assert plain["data"].get("truncated") == dotted["data"].get("truncated")
+        assert plain["data"].get("partial") == dotted["data"].get("partial")
+
+    def test_leading_dot_slash_equivalent_for_recursive_glob(self, tmp_path):
+        _write(tmp_path / "a.txt")
+        _write(tmp_path / "sub" / "b.txt")
+        _write(tmp_path / "sub" / "deep" / "c.txt")
+        tool = make_tool(tmp_path)
+        plain = tool.execute(pattern="**/*.txt")
+        dotted = tool.execute(pattern="./**/*.txt")
+        expected = ["a.txt", "sub/b.txt", "sub/deep/c.txt"]
+        assert plain["status"] == "success"
+        assert dotted["status"] == "success"
+        assert plain["data"]["matches"] == expected
+        assert dotted["data"]["matches"] == expected
+        assert plain["data"]["matches"] == dotted["data"]["matches"]
+        assert plain["data"]["count"] == dotted["data"]["count"]
+        assert plain["data"].get("truncated") == dotted["data"].get("truncated")
+        assert plain["data"].get("partial") == dotted["data"].get("partial")
+
 
 # ---------------------------------------------------------------------------
 # Ignore rules
@@ -430,6 +463,11 @@ class TestErrorCases:
     def test_dotdot_in_middle_of_pattern_returns_error(self, tmp_path):
         tool = make_tool(tmp_path)
         result = tool.execute(pattern="src/../../*.py")
+        assert result["status"] == "error"
+
+    def test_dot_slash_dotdot_pattern_still_returns_error(self, tmp_path):
+        tool = make_tool(tmp_path)
+        result = tool.execute(pattern="./../*.py")
         assert result["status"] == "error"
 
     def test_absolute_pattern_returns_error(self, tmp_path):
