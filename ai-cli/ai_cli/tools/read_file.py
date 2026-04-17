@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ai_cli.core.skill_registry import SkillRegistry
 from ai_cli.core.workspace import WorkspaceError
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
@@ -47,6 +48,11 @@ class ReadFileTool(Tool):
         # Session-scoped allow-lists; cleared by reset_session_state().
         self._session_allowed_files: set[Path] = set()
         self._session_allowed_dirs: set[Path] = set()
+        self._skill_registry: SkillRegistry | None = None
+
+    def set_skill_registry(self, skill_registry: SkillRegistry | None) -> None:
+        """Attach the current SkillRegistry used for ``base_dir`` validation."""
+        self._skill_registry = skill_registry
 
     # ------------------------------------------------------------------
     # Session state
@@ -84,6 +90,12 @@ class ReadFileTool(Tool):
         """Check the tool's own allow-list before delegating to PermissionManager."""
         if not self.permission_required:
             return True, ""
+        # Skill-gated reads via base_dir skip interactive permission prompting.
+        # Access control is enforced by skill availability and execute()'s
+        # base_dir validation + containment checks.
+        base_dir = kwargs.get("base_dir")
+        if isinstance(base_dir, str) and base_dir.strip():
+            return True, ""
         path_str = kwargs.get("path", "")
         if path_str:
             resolved = self._resolve_any(path_str)
@@ -113,6 +125,9 @@ class ReadFileTool(Tool):
             dir:/data/docs/
             dir:/data/
         """
+        base_dir = kwargs.get("base_dir")
+        if isinstance(base_dir, str) and base_dir.strip():
+            return []
         path_str = kwargs.get("path", "")
         if not path_str:
             return []
@@ -209,6 +224,15 @@ class ReadFileTool(Tool):
                     ),
                     argument_type="integer",
                 ),
+                ToolArgument(
+                    name="base_dir",
+                    description=(
+                        "Optional skill base directory. When provided, the target path "
+                        "must resolve within this directory. base_dir must match a "
+                        "currently loaded skill base_dir."
+                    ),
+                    argument_type="string",
+                ),
             ],
         )
 
@@ -222,6 +246,7 @@ class ReadFileTool(Tool):
         path: str,
         start_line: int | None = None,
         end_line: int | None = None,
+        base_dir: str | None = None,
     ) -> dict:
         logger.debug(
             "read_file: '%s' (lines %s–%s)",
@@ -229,6 +254,25 @@ class ReadFileTool(Tool):
             start_line if start_line is not None else "start",
             end_line if end_line is not None else "end",
         )
+
+        if base_dir is not None:
+            resolved_base, err = self._resolve_skill_base_dir(base_dir)
+            if err is not None:
+                return err
+            assert resolved_base is not None
+            resolved_target, err = self._resolve_target_within_base(path, resolved_base)
+            if err is not None:
+                return err
+            assert resolved_target is not None
+            try:
+                full_text = resolved_target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                return self._err(
+                    "read_error",
+                    f"Cannot read '{path}': {exc}",
+                    400,
+                )
+            return self._apply_line_range(full_text, path, start_line, end_line)
 
         # For absolute paths that fall under an external indexed root, bypass
         # the workspace bounds check and read the file directly.
@@ -256,6 +300,69 @@ class ReadFileTool(Tool):
             return self._err("read_error", str(exc), 400)
 
         return self._apply_line_range(full_text, path, start_line, end_line)
+
+    def _resolve_skill_base_dir(
+        self,
+        base_dir: str,
+    ) -> tuple[Path | None, dict | None]:
+        if not isinstance(base_dir, str) or not base_dir.strip():
+            return None, self._err(
+                "invalid_arguments",
+                "'base_dir' must be a non-empty string.",
+                400,
+            )
+
+        if self._skill_registry is None:
+            return None, self._err(
+                "invalid_arguments",
+                "'base_dir' is only supported when skills are loaded.",
+                400,
+            )
+
+        base_path = Path(base_dir)
+        resolved_base = (
+            base_path.resolve()
+            if base_path.is_absolute()
+            else (self._workspace.root / base_path).resolve()
+        )
+
+        allowed_dirs = {
+            spec.base_dir.resolve() for spec in self._skill_registry.skills.values()
+        }
+        if resolved_base not in allowed_dirs:
+            return None, self._err(
+                "invalid_arguments",
+                "'base_dir' must match a currently loaded skill base_dir.",
+                400,
+            )
+
+        return resolved_base, None
+
+    def _resolve_target_within_base(
+        self,
+        path: str,
+        base_dir: Path,
+    ) -> tuple[Path | None, dict | None]:
+        target_path = Path(path)
+        resolved_target = (
+            target_path.resolve()
+            if target_path.is_absolute()
+            else (base_dir / target_path).resolve()
+        )
+
+        try:
+            resolved_target.relative_to(base_dir)
+        except ValueError:
+            return None, self._err(
+                "read_error",
+                f"Path '{path}' resolves outside base_dir.",
+                400,
+            )
+
+        if not resolved_target.is_file():
+            return None, self._err("read_error", f"File not found: '{path}'", 400)
+
+        return resolved_target, None
 
     def _apply_line_range(
         self,

@@ -645,7 +645,13 @@ def _wire_skills(
     workspace: Workspace,
     permission_manager: PermissionManager,
 ) -> None:
-    """Register the model-facing ``skills`` tool when skills are configured."""
+    """Register skills tool and bind skills context into read_file."""
+    read_file_tool = tool_registry.get("read_file")
+    if read_file_tool is not None:
+        set_skill_registry = getattr(read_file_tool, "set_skill_registry", None)
+        if callable(set_skill_registry):
+            set_skill_registry(skills)
+
     if not skills.has_skills:
         return
 

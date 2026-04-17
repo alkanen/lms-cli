@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
 from ai_cli.tools.read_file import ReadFileTool
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,19 @@ def make_real_tool(
     )
 
 
+def _skill_registry_with_dirs(*dirs: Path) -> SkillRegistry:
+    specs: dict[str, SkillSpec] = {}
+    for i, d in enumerate(dirs):
+        specs[f"skill_{i}"] = SkillSpec(
+            name=f"skill_{i}",
+            description="desc",
+            instructions="instructions",
+            base_dir=d.resolve(),
+            scope="project",
+        )
+    return SkillRegistry(specs)
+
+
 # ---------------------------------------------------------------------------
 # Class attributes
 # ---------------------------------------------------------------------------
@@ -97,6 +111,7 @@ class TestDefinition:
         assert params["required"] == ["path"]
         assert "start_line" in params["properties"]
         assert "end_line" in params["properties"]
+        assert "base_dir" in params["properties"]
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +235,99 @@ class TestExecute:
         result = tool.execute(path="secret.txt")
         assert result["status"] == "error"
         assert result["error"] == "read_error"
+
+    def test_base_dir_relative_path_contained(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.txt").write_text("ok\n")
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        result = tool.execute(path="data.txt", base_dir=str(skill_dir))
+        assert result["status"] == "success"
+        assert result["data"]["content"] == "ok\n"
+
+    def test_base_dir_absolute_path_contained(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        target = skill_dir / "data.txt"
+        target.write_text("ok\n")
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        result = tool.execute(path=str(target), base_dir=str(skill_dir))
+        assert result["status"] == "success"
+        assert result["data"]["content"] == "ok\n"
+
+    def test_base_dir_traversal_escape_rejected(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("nope\n")
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        result = tool.execute(path="../outside.txt", base_dir=str(skill_dir))
+        assert result["status"] == "error"
+        assert result["error"] == "read_error"
+
+    @pytest.mark.skipif(
+        not hasattr(Path, "symlink_to"),
+        reason="symlinks not supported on this platform",
+    )
+    def test_base_dir_symlink_escape_rejected(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("nope\n")
+        (skill_dir / "link.txt").symlink_to(outside)
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        result = tool.execute(path="link.txt", base_dir=str(skill_dir))
+        assert result["status"] == "error"
+        assert result["error"] == "read_error"
+
+    def test_invalid_base_dir_rejected(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.txt").write_text("ok\n")
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        bad_dir = tmp_path / "other"
+        bad_dir.mkdir()
+        result = tool.execute(path="data.txt", base_dir=str(bad_dir))
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_stale_base_dir_invalid_after_registry_update(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_a = tmp_path / "skill_a"
+        skill_b = tmp_path / "skill_b"
+        skill_a.mkdir()
+        skill_b.mkdir()
+        (skill_a / "data.txt").write_text("a\n")
+
+        tool = make_real_tool(tmp_path)
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_a))
+        ok = tool.execute(path="data.txt", base_dir=str(skill_a))
+        assert ok["status"] == "success"
+
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_b))
+        stale = tool.execute(path="data.txt", base_dir=str(skill_a))
+        assert stale["status"] == "error"
+        assert stale["error"] == "invalid_arguments"
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +457,38 @@ class TestSessionAllowList:
         tool = make_tool(tmp_path, permission_required=False)
         allowed, _ = tool.request_permission("read anything", path="./f.txt")
         assert allowed is True
+
+    def test_base_dir_bypasses_permission_prompt(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.txt").write_text("ok\n")
+
+        tool = make_real_tool(tmp_path, permission_required=True)
+        tool._permission_manager.request.return_value = (False, "denied")
+        tool.set_skill_registry(_skill_registry_with_dirs(skill_dir))
+
+        allowed, choice = tool.request_permission(
+            "read skill file",
+            path="data.txt",
+            base_dir=str(skill_dir),
+        )
+        assert allowed is True
+        assert choice == ""
+        tool._permission_manager.request.assert_not_called()
+
+    def test_base_dir_has_no_extra_permission_options(self, tmp_path):
+        (tmp_path / ".ai-cli").mkdir()
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.txt").write_text("ok\n")
+
+        tool = make_real_tool(tmp_path, permission_required=True)
+        options = tool.extra_permission_options(
+            path="data.txt",
+            base_dir=str(skill_dir),
+        )
+        assert options == []
 
 
 # ---------------------------------------------------------------------------
