@@ -639,6 +639,15 @@ class PlainDisplay(Display):
             print("Notes:")
             for n in notes:
                 print(f"  {n}")
+        note_history = task.get("note_history", [])
+        if isinstance(note_history, list):
+            obsolete_count = sum(
+                1
+                for entry in note_history
+                if isinstance(entry, dict) and entry.get("status") == "obsolete"
+            )
+            if obsolete_count:
+                print(f"Obsolete notes hidden: {obsolete_count}")
 
     def confirm_plan(
         self, nodes: list[dict], goal: str | None, *, depth: int = 3
@@ -1166,6 +1175,17 @@ class RichDisplay(Display):
             self._console.print(Text("Notes:", style="bold"))
             for n in notes:
                 self._console.print(f"  {n}")
+        note_history = task.get("note_history", [])
+        if isinstance(note_history, list):
+            obsolete_count = sum(
+                1
+                for entry in note_history
+                if isinstance(entry, dict) and entry.get("status") == "obsolete"
+            )
+            if obsolete_count:
+                self._console.print(
+                    Text(f"Obsolete notes hidden: {obsolete_count}", style="dim")
+                )
 
     def show_tool_info(self, tool_info: dict) -> None:
         name = tool_info.get("name", "")

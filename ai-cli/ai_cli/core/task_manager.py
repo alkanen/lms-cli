@@ -24,6 +24,7 @@ import random
 import re
 import string
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -66,6 +67,7 @@ _MIN_DOD_CHARS = 5
 _ID_CHARS = string.ascii_lowercase + string.digits
 _ID_LENGTH = 6
 _NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_NOTE_STATUSES = frozenset({"active", "obsolete"})
 
 
 def _generate_id() -> str:
@@ -284,6 +286,105 @@ class TaskManager:
             raise
         self._cache = data
 
+    def _generate_note_id(self) -> str:
+        return f"note_{uuid.uuid4().hex[:10]}"
+
+    def _ensure_note_lifecycle_fields(
+        self, task_id: str, task: dict[str, Any]
+    ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+        """Return validated ``(notes, active_note_ids, note_history)``.
+
+        Legacy tasks may only have ``notes``. In that case we synthesize
+        lifecycle fields lazily so old files remain readable/writable.
+        """
+        notes = task.setdefault("notes", [])
+        if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'notes' field: "
+                f"expected list[str], got {type(notes).__name__}."
+            )
+
+        raw_ids = task.get("active_note_ids")
+        raw_history = task.get("note_history")
+
+        if raw_ids is None and raw_history is None:
+            active_note_ids = [self._generate_note_id() for _ in notes]
+            note_history = [
+                {
+                    "id": note_id,
+                    "text": note_text,
+                    "status": "active",
+                    "created_at": None,
+                    "obsoleted_at": None,
+                    "obsolete_reason": "",
+                }
+                for note_id, note_text in zip(active_note_ids, notes, strict=False)
+            ]
+            task["active_note_ids"] = active_note_ids
+            task["note_history"] = note_history
+            return notes, active_note_ids, note_history
+
+        if not isinstance(raw_ids, list) or not all(isinstance(nid, str) for nid in raw_ids):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'active_note_ids' field."
+            )
+        if not isinstance(raw_history, list):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'note_history' field."
+            )
+
+        note_history: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+        for i, entry in enumerate(raw_history):
+            if not isinstance(entry, dict):
+                raise TaskStorageError(
+                    f"Task {task_id!r} has invalid note_history entry at index {i}."
+                )
+            note_id = entry.get("id")
+            text = entry.get("text")
+            status = entry.get("status", "active")
+            if not isinstance(note_id, str) or not note_id:
+                raise TaskStorageError(
+                    f"Task {task_id!r} has note_history entry with invalid 'id'."
+                )
+            if not isinstance(text, str):
+                raise TaskStorageError(
+                    f"Task {task_id!r} has note_history entry with invalid 'text'."
+                )
+            if status not in _NOTE_STATUSES:
+                raise TaskStorageError(
+                    f"Task {task_id!r} has note_history entry with invalid 'status'."
+                )
+            normalized = {
+                "id": note_id,
+                "text": text,
+                "status": status,
+                "created_at": entry.get("created_at"),
+                "obsoleted_at": entry.get("obsoleted_at"),
+                "obsolete_reason": entry.get("obsolete_reason", ""),
+            }
+            note_history.append(normalized)
+            by_id[note_id] = normalized
+
+        active_note_ids: list[str] = []
+        active_notes: list[str] = []
+        for note_id in raw_ids:
+            entry = by_id.get(note_id)
+            if not entry:
+                continue
+            if entry.get("status") != "active":
+                continue
+            text = entry.get("text")
+            if isinstance(text, str):
+                active_note_ids.append(note_id)
+                active_notes.append(text)
+
+        # Keep legacy ``notes`` aligned with lifecycle metadata.
+        task["active_note_ids"] = active_note_ids
+        task["note_history"] = note_history
+        task["notes"] = active_notes
+        return active_notes, active_note_ids, note_history
+
     def _get_or_raise(self, data: dict[str, Any], task_id: str) -> dict[str, Any]:
         task = data["tasks"].get(task_id)
         if task is None:
@@ -368,9 +469,9 @@ class TaskManager:
                 f"Task {task_id!r} has a corrupted 'blockers' field."
             )
 
-        notes = task.get("notes", [])
-        if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
-            raise TaskStorageError(f"Task {task_id!r} has a corrupted 'notes' field.")
+        notes, _active_note_ids, note_history = self._ensure_note_lifecycle_fields(
+            task_id, task
+        )
 
         parent_id = task.get("parent_id")
         if parent_id is not None and not isinstance(parent_id, str):
@@ -393,6 +494,7 @@ class TaskManager:
             "next_action": task.get("next_action", ""),
             "blockers": list(blockers),
             "notes": list(notes),
+            "note_history": [dict(entry) for entry in note_history],
             "subtasks": subtasks,
         }
 
@@ -507,6 +609,8 @@ class TaskManager:
             "next_action": "",
             "blockers": [],
             "notes": [],
+            "active_note_ids": [],
+            "note_history": [],
             "subtask_ids": [],
             "created_at": now,
             "updated_at": now,
@@ -692,15 +796,25 @@ class TaskManager:
         data = self._load()
         task = self._get_or_raise(data, task_id)
 
-        notes = task.setdefault("notes", [])
-        if not isinstance(notes, list):
-            raise TaskStorageError(
-                f"Task {task_id!r} has a corrupted 'notes' field: "
-                f"expected list, got {type(notes).__name__}."
-            )
+        notes, active_note_ids, note_history = self._ensure_note_lifecycle_fields(
+            task_id, task
+        )
 
         timestamp = self._now_iso()
-        notes.append(f"[{timestamp}] {note}")
+        rendered_note = f"[{timestamp}] {note}"
+        note_id = self._generate_note_id()
+        notes.append(rendered_note)
+        active_note_ids.append(note_id)
+        note_history.append(
+            {
+                "id": note_id,
+                "text": rendered_note,
+                "status": "active",
+                "created_at": timestamp,
+                "obsoleted_at": None,
+                "obsolete_reason": "",
+            }
+        )
         task["updated_at"] = timestamp
 
         self._save(data)
@@ -710,6 +824,62 @@ class TaskManager:
             task.get("name"),
             len(notes),
             len(note),
+        )
+        return self._task_detail(data, task)
+
+    def obsolete_note(self, task_id: str, note_index: int, reason: str = "") -> dict:
+        """Mark an active note obsolete and remove it from active context."""
+        if not isinstance(note_index, int):
+            raise TaskValidationError("'note_index' must be an integer.")
+        if note_index < 0:
+            raise TaskValidationError("'note_index' must be >= 0.")
+        if not isinstance(reason, str):
+            raise TaskValidationError("'reason' must be a string.")
+
+        data = self._load()
+        task = self._get_or_raise(data, task_id)
+        notes, active_note_ids, note_history = self._ensure_note_lifecycle_fields(
+            task_id, task
+        )
+
+        if note_index >= len(notes):
+            raise TaskValidationError(
+                f"'note_index' out of range: {note_index}. Active notes: {len(notes)}."
+            )
+
+        obsolete_note_id = active_note_ids.pop(note_index)
+        obsolete_text = notes.pop(note_index)
+        timestamp = self._now_iso()
+
+        marked = False
+        for entry in reversed(note_history):
+            if entry.get("id") != obsolete_note_id:
+                continue
+            entry["status"] = "obsolete"
+            entry["obsoleted_at"] = timestamp
+            entry["obsolete_reason"] = reason
+            marked = True
+            break
+        if not marked:
+            note_history.append(
+                {
+                    "id": obsolete_note_id,
+                    "text": obsolete_text,
+                    "status": "obsolete",
+                    "created_at": None,
+                    "obsoleted_at": timestamp,
+                    "obsolete_reason": reason,
+                }
+            )
+
+        task["updated_at"] = timestamp
+        self._save(data)
+        logger.info(
+            "Task note obsoleted: id=%s name=%r note_index=%d remaining_active=%d",
+            task_id,
+            task.get("name"),
+            note_index,
+            len(notes),
         )
         return self._task_detail(data, task)
 

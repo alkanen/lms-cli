@@ -19,6 +19,7 @@ from ai_cli.tools.tasks import (
     TasksGetTool,
     TasksListTool,
     TasksMarkDoneTool,
+    TasksObsoleteNoteTool,
     TasksUpdateTool,
 )
 
@@ -69,6 +70,7 @@ class TestClassAttributes:
             TasksCreateTool,
             TasksUpdateTool,
             TasksAddNoteTool,
+            TasksObsoleteNoteTool,
             TasksMarkDoneTool,
         ],
     )
@@ -83,6 +85,7 @@ class TestClassAttributes:
             TasksCreateTool,
             TasksUpdateTool,
             TasksAddNoteTool,
+            TasksObsoleteNoteTool,
             TasksMarkDoneTool,
         ],
     )
@@ -97,6 +100,7 @@ class TestClassAttributes:
             (TasksCreateTool, "tasks_create"),
             (TasksUpdateTool, "tasks_update"),
             (TasksAddNoteTool, "tasks_add_note"),
+            (TasksObsoleteNoteTool, "tasks_obsolete_note"),
             (TasksMarkDoneTool, "tasks_mark_done"),
         ],
     )
@@ -159,6 +163,13 @@ class TestDefinitions:
         tool, _ = _make_tool(TasksMarkDoneTool, tmp_path)
         schema = tool.definition().schema()
         assert "task_path" in schema["function"]["parameters"]["required"]
+
+    def test_tasks_obsolete_note_schema(self, tmp_path):
+        tool, _ = _make_tool(TasksObsoleteNoteTool, tmp_path)
+        schema = tool.definition().schema()
+        required = schema["function"]["parameters"]["required"]
+        assert "task_path" in required
+        assert "note_index" in required
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +571,53 @@ class TestTasksAddNoteTool:
         result = tool.execute(task_path="T", note="note")
         tm.resolve_path_to_id.assert_called_once_with("T")
         tm.add_note.assert_called_once_with("task_x", "note")
+        assert result == _ok({"task": detail})
+
+
+# ---------------------------------------------------------------------------
+# TasksObsoleteNoteTool
+# ---------------------------------------------------------------------------
+
+
+class TestTasksObsoleteNoteTool:
+    def test_obsolete_note(self, tmp_path):
+        workspace = MagicMock()
+        pm = MagicMock()
+        tm = _make_tm(tmp_path)
+        add_tool = TasksAddNoteTool(tm, workspace, pm)
+        tool = TasksObsoleteNoteTool(tm, workspace, pm)
+        tm.create_task("T", "DoD here")
+        add_tool.execute(task_path="T", note="Stale")
+        add_tool.execute(task_path="T", note="Current")
+
+        result = tool.execute(task_path="T", note_index=0, reason="resolved")
+
+        assert result["status"] == "success"
+        notes = result["data"]["task"]["notes"]
+        assert len(notes) == 1
+        assert "Current" in notes[0]
+
+    def test_obsolete_note_unknown_task_returns_not_found(self, tmp_path):
+        tool, _ = _make_tool(TasksObsoleteNoteTool, tmp_path)
+        result = tool.execute(task_path="ghost", note_index=0)
+        assert result["status"] == "error"
+        assert result["error"] == "not_found"
+
+    def test_obsolete_note_requires_integer_index(self, tmp_path):
+        tool, tm = _make_tool(TasksObsoleteNoteTool, tmp_path)
+        tm.create_task("T", "DoD here")
+        result = tool.execute(task_path="T", note_index="0")
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+
+    def test_delegates_to_task_manager(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksObsoleteNoteTool)
+        tm.resolve_path_to_id.return_value = "task_x"
+        detail = {"id": "task_x", "notes": []}
+        tm.obsolete_note.return_value = detail
+        result = tool.execute(task_path="T", note_index=1, reason="stale")
+        tm.resolve_path_to_id.assert_called_once_with("T")
+        tm.obsolete_note.assert_called_once_with("task_x", 1, reason="stale")
         assert result == _ok({"task": detail})
 
 

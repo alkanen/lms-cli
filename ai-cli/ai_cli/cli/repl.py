@@ -150,6 +150,10 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/tasks add [<path>]", "Wizard: create a task (or subtask under <path>)"),
     ("/tasks edit <path>", "Wizard: edit a task"),
     ("/tasks delete [<path>]", "Delete task (or all tasks+goal if no path)"),
+    (
+        "/tasks note obsolete <path> <index> [--reason \"<text>\"]",
+        "Mark an active note obsolete by index",
+    ),
 ]
 
 
@@ -907,7 +911,11 @@ class REPL:
 
         assert self._task_manager is not None  # guaranteed by _handle_tasks_subcommand
 
-        parts = remainder.split()
+        try:
+            parts = shlex.split(remainder)
+        except ValueError as exc:
+            self._display.show_error(f"Could not parse /tasks arguments: {exc}")
+            return
         sub = parts[0].lower() if parts else ""
 
         # bare /tasks — simple list of unfinished root tasks
@@ -935,12 +943,14 @@ class REPL:
             "delete",
             "close",
             "open",
+            "note",
         }
         if sub not in _KNOWN_SUBS:
             self._display.show_error(
                 f"Unknown /tasks subcommand: '{sub}'. "
                 "Try /tasks, /tasks list, /tasks tree, /tasks info <path>, "
-                "/tasks add, /tasks edit <path>, /tasks delete [<path>]."
+                "/tasks add, /tasks edit <path>, /tasks delete [<path>], "
+                "/tasks note obsolete <path> <index> [--reason \"<text>\"]."
             )
             return
 
@@ -1154,6 +1164,58 @@ class REPL:
                 task = self._task_manager.find_by_path(path)
                 updated = self._task_manager.open_task(task["id"])
                 self._display.show_status(f"Task '{updated['name']}' re-opened.")
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+            return
+
+        if sub == "note":
+            if not args or args[0].lower() != "obsolete":
+                self._display.show_error(
+                    "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                )
+                return
+
+            note_args = args[1:]
+            if len(note_args) < 2:
+                self._display.show_error(
+                    "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                )
+                return
+
+            path_arg = note_args[0]
+            index_arg = note_args[1]
+
+            reason = ""
+            extras = note_args[2:]
+            if extras:
+                if len(extras) == 2 and extras[0] == "--reason":
+                    reason = extras[1]
+                else:
+                    self._display.show_error(
+                        "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                    )
+                    return
+
+            try:
+                path = self._normalize_task_path_arg(path_arg)
+            except TaskValidationError as exc:
+                self._display.show_error(str(exc))
+                return
+
+            try:
+                note_index = int(index_arg)
+            except ValueError:
+                self._display.show_error("'index' must be an integer.")
+                return
+
+            try:
+                task = self._task_manager.find_by_path(path)
+                updated = self._task_manager.obsolete_note(
+                    task["id"], note_index, reason=reason
+                )
+                self._display.show_status(
+                    f"Marked note {note_index} obsolete for task '{updated['name']}'."
+                )
             except (TaskNotFoundError, TaskValidationError) as exc:
                 self._display.show_error(str(exc))
             return

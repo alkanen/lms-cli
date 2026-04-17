@@ -2488,6 +2488,82 @@ class TestTasksCommand:
         assert "requires exactly one argument" in display.show_error.call_args[0][0]
 
     # ------------------------------------------------------------------
+    # /tasks note obsolete
+    # ------------------------------------------------------------------
+
+    def test_note_obsolete_calls_task_manager(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.obsolete_note.return_value = detail
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command("tasks note obsolete MyTask 0")
+
+        tm.find_by_path.assert_called_once_with("MyTask")
+        tm.obsolete_note.assert_called_once_with(detail["id"], 0, reason="")
+        display.show_status.assert_called_once()
+
+    def test_note_obsolete_accepts_reason_with_spaces(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.obsolete_note.return_value = detail
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command(
+            'tasks note obsolete MyTask 1 --reason "fixed in follow-up"'
+        )
+
+        tm.obsolete_note.assert_called_once_with(
+            detail["id"], 1, reason="fixed in follow-up"
+        )
+
+    def test_note_obsolete_usage_error_on_missing_args(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command("tasks note obsolete MyTask")
+
+        display.show_error.assert_called_once()
+        assert "Usage:" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    def test_note_obsolete_requires_integer_index(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command("tasks note obsolete MyTask xyz")
+
+        display.show_error.assert_called_once()
+        assert "integer" in display.show_error.call_args[0][0]
+        tm.find_by_path.assert_not_called()
+
+    def test_note_obsolete_rejects_invalid_flag_shape(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command("tasks note obsolete MyTask 0 --because stale")
+
+        display.show_error.assert_called_once()
+        assert "Usage:" in display.show_error.call_args[0][0]
+
+    def test_note_obsolete_unbalanced_quotes_show_parse_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+
+        repl._handle_slash_command('tasks note obsolete MyTask 0 --reason "broken')
+
+        display.show_error.assert_called_once()
+        assert "Could not parse /tasks arguments" in display.show_error.call_args[0][0]
+
+    # ------------------------------------------------------------------
     # Unknown subcommand
     # ------------------------------------------------------------------
 

@@ -242,6 +242,7 @@ class TestTasksSubcommands:
             "edit",
             "info",
             "list",
+            "note",
             "open",
             "tree",
         }
@@ -265,6 +266,28 @@ class TestTasksSubcommands:
     def test_tasks_no_match(self):
         result = _completions(_completer(), "/tasks z")
         assert result == []
+
+    def test_tasks_note_offers_obsolete_verb(self):
+        result = _completions(_completer(), "/tasks note ")
+        assert result == ["obsolete"]
+
+    def test_tasks_note_partial_obsolete(self):
+        result = _completions(_completer(), "/tasks note o")
+        assert result == ["obsolete"]
+
+    def test_tasks_note_obsolete_path_completion(self):
+        task_manager = MagicMock()
+        task_manager.get_all_task_details_map.return_value = {
+            "task_root": _make_task_detail("Root", "task_root")
+        }
+        result = _completions(
+            _completer(task_manager=task_manager), "/tasks note obsolete R"
+        )
+        assert result == ["Root"]
+
+    def test_tasks_note_obsolete_suggests_reason_flag_after_index(self):
+        result = _completions(_completer(), "/tasks note obsolete Root 0 ")
+        assert result == ["--reason"]
 
     def test_tasks_list_without_task_manager_has_no_path_completions(self):
         result = _completions(_completer(), "/tasks list ")
