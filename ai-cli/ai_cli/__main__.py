@@ -30,6 +30,7 @@ from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
 from ai_cli.core.mcp_manager import MCPManager
 from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
+from ai_cli.core.skill_registry import SkillRegistry
 from ai_cli.core.task_manager import TaskManager
 from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
@@ -488,6 +489,11 @@ def _cmd_repl(
     # every session opened in the same project.
     task_manager = TaskManager(workspace.ai_cli_dir)
     _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
+
+    # Load skills registry early so validation warnings are visible at startup.
+    # PR1 scope only: discovery + validation + warning surface.
+    for warning in SkillRegistry.load(root, global_dir=global_dir).warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
 
     # Wire up call_agent tool if any agent specs are configured.
     agent_registry = AgentRegistry(load_agent_specs(config), parent_display=ui)

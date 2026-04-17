@@ -324,7 +324,9 @@ class TaskManager:
             task["note_history"] = note_history
             return notes, active_note_ids, note_history
 
-        if not isinstance(raw_ids, list) or not all(isinstance(nid, str) for nid in raw_ids):
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(nid, str) for nid in raw_ids
+        ):
             raise TaskStorageError(
                 f"Task {task_id!r} has a corrupted 'active_note_ids' field."
             )
@@ -333,7 +335,7 @@ class TaskManager:
                 f"Task {task_id!r} has a corrupted 'note_history' field."
             )
 
-        note_history: list[dict[str, Any]] = []
+        normalized_history: list[dict[str, Any]] = []
         by_id: dict[str, dict[str, Any]] = {}
         for i, entry in enumerate(raw_history):
             if not isinstance(entry, dict):
@@ -363,10 +365,10 @@ class TaskManager:
                 "obsoleted_at": entry.get("obsoleted_at"),
                 "obsolete_reason": entry.get("obsolete_reason", ""),
             }
-            note_history.append(normalized)
+            normalized_history.append(normalized)
             by_id[note_id] = normalized
 
-        active_note_ids: list[str] = []
+        normalized_active_note_ids: list[str] = []
         active_notes: list[str] = []
         for note_id in raw_ids:
             entry = by_id.get(note_id)
@@ -376,14 +378,14 @@ class TaskManager:
                 continue
             text = entry.get("text")
             if isinstance(text, str):
-                active_note_ids.append(note_id)
+                normalized_active_note_ids.append(note_id)
                 active_notes.append(text)
 
         # Keep legacy ``notes`` aligned with lifecycle metadata.
-        task["active_note_ids"] = active_note_ids
-        task["note_history"] = note_history
+        task["active_note_ids"] = normalized_active_note_ids
+        task["note_history"] = normalized_history
         task["notes"] = active_notes
-        return active_notes, active_note_ids, note_history
+        return active_notes, normalized_active_note_ids, normalized_history
 
     def _get_or_raise(self, data: dict[str, Any], task_id: str) -> dict[str, Any]:
         task = data["tasks"].get(task_id)
