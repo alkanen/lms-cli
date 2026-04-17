@@ -12,12 +12,14 @@ from ai_cli.__main__ import (
     _pick_session,
     _show_resume_context,
     _wire_agents,
+    _wire_skills,
     load_system_prompt,
 )
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
 from ai_cli.core.agent import AgentSpec
 from ai_cli.core.agent_registry import AgentRegistry
 from ai_cli.core.session_manager import SessionError
+from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
 
 
@@ -762,6 +764,49 @@ class TestWireAgents:
         assert any(
             "allow_parallel" in str(c) for c in mock_logger.warning.call_args_list
         )
+
+
+# ---------------------------------------------------------------------------
+# _wire_skills — registration gating
+# ---------------------------------------------------------------------------
+
+
+class TestWireSkills:
+    def _skills(self, tmp_path, names: list[str]) -> SkillRegistry:
+        specs: dict[str, SkillSpec] = {}
+        for name in names:
+            skill_dir = tmp_path / "skills" / name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            specs[name] = SkillSpec(
+                name=name,
+                description=f"{name} desc",
+                instructions=f"{name} instructions",
+                base_dir=skill_dir,
+                scope="project",
+            )
+        return SkillRegistry(specs)
+
+    def test_skills_tool_not_registered_when_no_skills(self, tmp_path):
+        tool_registry = MagicMock()
+        _wire_skills(
+            self._skills(tmp_path, []),
+            tool_registry,
+            MagicMock(),
+            MagicMock(),
+        )
+        tool_registry.register_instance.assert_not_called()
+
+    def test_skills_tool_registered_when_skills_exist(self, tmp_path):
+        tool_registry = MagicMock()
+        _wire_skills(
+            self._skills(tmp_path, ["alpha"]),
+            tool_registry,
+            MagicMock(),
+            MagicMock(),
+        )
+        tool_registry.register_instance.assert_called_once()
+        registered = tool_registry.register_instance.call_args.args[0]
+        assert registered.NAME == "skills"
 
 
 class TestWireAgentsValidation:
