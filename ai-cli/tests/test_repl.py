@@ -2181,6 +2181,25 @@ class TestTasksCommand:
         assert "Usage" in display.show_error.call_args[0][0]
         tm.get_all_task_details_map.assert_not_called()
 
+    def test_list_strips_trailing_dot_before_detail_map_lookup(self):
+        display = MagicMock()
+        parent = _make_task_detail("Root")
+        child = _make_task_detail("Child", parent_id=parent["id"])
+        tm = _make_task_manager(detail_map={parent["id"]: parent, child["id"]: child})
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks list Root.")
+        display.show_tasks_list.assert_called_once()
+        nodes = display.show_tasks_list.call_args[0][0]
+        assert [n["name"] for n in nodes] == ["Child"]
+
+    def test_list_dot_only_path_shows_validation_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks list .")
+        display.show_error.assert_called_once()
+        tm.get_all_task_details_map.assert_not_called()
+
     # ------------------------------------------------------------------
     # /tasks tree
     # ------------------------------------------------------------------
@@ -2283,6 +2302,24 @@ class TestTasksCommand:
         repl._handle_slash_command("tasks info MyTask")
         display.show_task_info.assert_called_once_with(detail)
 
+    def test_info_strips_trailing_dot_before_lookup(self):
+        display = MagicMock()
+        detail = _make_task_detail()
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks info MyTask.")
+        tm.find_by_path.assert_called_once_with("MyTask")
+        display.show_task_info.assert_called_once_with(detail)
+
+    def test_info_dot_only_path_shows_validation_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks info .")
+        display.show_error.assert_called_once()
+        tm.find_by_path.assert_not_called()
+
     # ------------------------------------------------------------------
     # /tasks edit
     # ------------------------------------------------------------------
@@ -2332,6 +2369,14 @@ class TestTasksCommand:
         with patch("prompt_toolkit.prompt", return_value="y"):
             repl._handle_slash_command("tasks delete")
         tm.clear.assert_called_once()
+
+    def test_delete_dot_only_path_shows_validation_error(self):
+        display = MagicMock()
+        tm = _make_task_manager()
+        repl = _make_repl(display=display, task_manager=tm)
+        repl._handle_slash_command("tasks delete .")
+        display.show_error.assert_called_once()
+        tm.clear.assert_not_called()
 
     def test_delete_storage_error_shows_storage_error_prefix(self):
         """TaskStorageError from clear() propagates to the top-level handler."""

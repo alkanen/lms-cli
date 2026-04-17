@@ -81,6 +81,16 @@ def _preview_for_log(value: str | None, limit: int = _LOG_GOAL_PREVIEW_LIMIT) ->
     return value[:limit] + "..."
 
 
+def normalize_task_path(path: str) -> str:
+    """Return a canonical task path for interactive and tool inputs."""
+    if not isinstance(path, str):
+        raise TaskValidationError("'path' must be a non-empty string.")
+    normalized = path.strip().rstrip(".")
+    if not normalized:
+        raise TaskValidationError("'path' must be a non-empty string.")
+    return normalized
+
+
 class TaskValidationError(ValueError):
     """Raised when a task operation violates a business rule."""
 
@@ -985,9 +995,7 @@ class TaskManager:
         task records (missing required fields, non-string ``parent_id``,
         dangling ``parent_id`` references).
         """
-        if not isinstance(path, str) or not path.strip():
-            raise TaskValidationError("'path' must be a non-empty string.")
-        segments = path.strip().split(".")
+        segments = normalize_task_path(path).split(".")
         for seg in segments:
             if not _NAME_RE.match(seg):
                 raise TaskValidationError(

@@ -453,6 +453,7 @@ class REPL:
                     slash_commands=_SLASH_COMMAND_NAMES,
                     tool_registry=self._tool_registry,
                     workspace=self._workspace,
+                    task_manager=self._task_manager,
                     mcp_manager=self._mcp_manager,
                     max_path_completions=max_completions,
                 ),
@@ -950,8 +951,8 @@ class REPL:
             if len(args) > 1:
                 self._display.show_error("Usage: /tasks list [<path>]")
                 return
-            path = args[0] if args else None
             try:
+                path = self._normalize_optional_task_path(args[0]) if args else None
                 detail_map = self._task_manager.get_all_task_details_map()
                 if path:
                     parent = self._find_in_detail_map(path, detail_map)
@@ -999,8 +1000,12 @@ class REPL:
             if len(clean_args) > 1:
                 self._display.show_error("Usage: /tasks tree [<path>] [--depth <n>]")
                 return
-            path = clean_args[0] if clean_args else None
             try:
+                path = (
+                    self._normalize_optional_task_path(clean_args[0])
+                    if clean_args
+                    else None
+                )
                 detail_map = self._task_manager.get_all_task_details_map()
                 if path:
                     parent = self._find_in_detail_map(path, detail_map)
@@ -1024,8 +1029,8 @@ class REPL:
             if len(args) != 1:
                 self._display.show_error("Usage: /tasks info <path>")
                 return
-            path = args[0]
             try:
+                path = self._normalize_task_path_arg(args[0])
                 task = self._task_manager.find_by_path(path)
             except (TaskNotFoundError, TaskValidationError) as exc:
                 self._display.show_error(str(exc))
@@ -1037,8 +1042,8 @@ class REPL:
             if len(args) > 1:
                 self._display.show_error("Usage: /tasks add [<path>]")
                 return
-            path = args[0] if args else None
             try:
+                path = self._normalize_optional_task_path(args[0]) if args else None
                 parent_task = self._task_manager.find_by_path(path) if path else None
             except (TaskNotFoundError, TaskValidationError) as exc:
                 self._display.show_error(str(exc))
@@ -1063,8 +1068,8 @@ class REPL:
             if len(args) != 1:
                 self._display.show_error("Usage: /tasks edit <path>")
                 return
-            path = args[0]
             try:
+                path = self._normalize_task_path_arg(args[0])
                 task = self._task_manager.find_by_path(path)
             except (TaskNotFoundError, TaskValidationError) as exc:
                 self._display.show_error(str(exc))
@@ -1088,18 +1093,18 @@ class REPL:
                     "Usage: /tasks delete [<path>]  (too many arguments)"
                 )
                 return
-            path = args[0] if args else None
-            if path:
-                try:
+            try:
+                path = self._normalize_optional_task_path(args[0]) if args else None
+                if path:
                     task = self._task_manager.find_by_path(path)
-                except (TaskNotFoundError, TaskValidationError) as exc:
-                    self._display.show_error(str(exc))
-                    return
-                confirm_msg = (
-                    f"Delete task '{task['name']}' and all its subtasks? [y/N] "
-                )
-            else:
-                confirm_msg = "Delete ALL tasks and the goal (full reset)? [y/N] "
+                    confirm_msg = (
+                        f"Delete task '{task['name']}' and all its subtasks? [y/N] "
+                    )
+                else:
+                    confirm_msg = "Delete ALL tasks and the goal (full reset)? [y/N] "
+            except (TaskNotFoundError, TaskValidationError) as exc:
+                self._display.show_error(str(exc))
+                return
             try:
                 from prompt_toolkit import prompt as _pt_prompt
 
@@ -1127,8 +1132,8 @@ class REPL:
                     "Usage: /tasks close <path>  (requires exactly one argument)"
                 )
                 return
-            path = args[0]
             try:
+                path = self._normalize_task_path_arg(args[0])
                 task = self._task_manager.find_by_path(path)
                 updated = self._task_manager.close_task(task["id"])
                 self._display.show_status(
@@ -1144,8 +1149,8 @@ class REPL:
                     "Usage: /tasks open <path>  (requires exactly one argument)"
                 )
                 return
-            path = args[0]
             try:
+                path = self._normalize_task_path_arg(args[0])
                 task = self._task_manager.find_by_path(path)
                 updated = self._task_manager.open_task(task["id"])
                 self._display.show_status(f"Task '{updated['name']}' re-opened.")
@@ -1231,9 +1236,10 @@ class REPL:
         from ai_cli.core.task_manager import (
             TaskNotFoundError,
             TaskValidationError,
+            normalize_task_path,
         )
 
-        segments = path.strip().split(".")
+        segments = normalize_task_path(path).split(".")
         for seg in segments:
             if not seg or re.fullmatch(r"[A-Za-z0-9_]+", seg) is None:
                 raise TaskValidationError(
@@ -1255,6 +1261,20 @@ class REPL:
             current_parent_id = found["id"]
         assert found is not None
         return found
+
+    @staticmethod
+    def _normalize_task_path_arg(path: str) -> str:
+        from ai_cli.core.task_manager import normalize_task_path
+
+        return normalize_task_path(path)
+
+    @staticmethod
+    def _normalize_optional_task_path(path: str) -> str | None:
+        from ai_cli.core.task_manager import normalize_task_path
+
+        if not path.strip():
+            return None
+        return normalize_task_path(path)
 
     def _tasks_add_wizard(self, parent_task: dict | None) -> dict | None:
         """Prompt for new task fields.  Returns field dict or None if cancelled."""
