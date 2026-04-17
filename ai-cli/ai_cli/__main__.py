@@ -491,9 +491,12 @@ def _cmd_repl(
     _wire_tasks(task_manager, tool_registry, workspace, permission_manager)
 
     # Load skills registry early so validation warnings are visible at startup.
-    # PR1 scope only: discovery + validation + warning surface.
-    for warning in SkillRegistry.load(root, global_dir=global_dir).warnings:
+    # PR1 scope: discovery + validation + warning surface.
+    # PR2 scope: model-facing ``skills`` tool registration when skills exist.
+    skills = SkillRegistry.load(root, global_dir=global_dir)
+    for warning in skills.warnings:
         print(f"Warning: {warning}", file=sys.stderr)
+    _wire_skills(skills, tool_registry, workspace, permission_manager)
 
     # Wire up call_agent tool if any agent specs are configured.
     agent_registry = AgentRegistry(load_agent_specs(config), parent_display=ui)
@@ -634,6 +637,21 @@ def _wire_tasks(
         tool_registry.register_instance(
             tool_cls(task_manager, workspace, permission_manager)
         )
+
+
+def _wire_skills(
+    skills: SkillRegistry,
+    tool_registry: ToolRegistry,
+    workspace: Workspace,
+    permission_manager: PermissionManager,
+) -> None:
+    """Register the model-facing ``skills`` tool when skills are configured."""
+    if not skills.has_skills:
+        return
+
+    from ai_cli.tools.skills import SkillsTool
+
+    tool_registry.register_instance(SkillsTool(skills, workspace, permission_manager))
 
 
 def _wire_mcp(
