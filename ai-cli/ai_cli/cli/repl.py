@@ -151,7 +151,7 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/tasks edit <path>", "Wizard: edit a task"),
     ("/tasks delete [<path>]", "Delete task (or all tasks+goal if no path)"),
     (
-        "/tasks note obsolete <path> <index> [--reason \"<text>\"]",
+        '/tasks note obsolete <path> <index> [--reason "<text>"]',
         "Mark an active note obsolete by index",
     ),
 ]
@@ -950,7 +950,7 @@ class REPL:
                 f"Unknown /tasks subcommand: '{sub}'. "
                 "Try /tasks, /tasks list, /tasks tree, /tasks info <path>, "
                 "/tasks add, /tasks edit <path>, /tasks delete [<path>], "
-                "/tasks note obsolete <path> <index> [--reason \"<text>\"]."
+                '/tasks note obsolete <path> <index> [--reason "<text>"].'
             )
             return
 
@@ -1171,14 +1171,14 @@ class REPL:
         if sub == "note":
             if not args or args[0].lower() != "obsolete":
                 self._display.show_error(
-                    "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                    'Usage: /tasks note obsolete <path> <index> [--reason "<text>"]'
                 )
                 return
 
             note_args = args[1:]
             if len(note_args) < 2:
                 self._display.show_error(
-                    "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                    'Usage: /tasks note obsolete <path> <index> [--reason "<text>"]'
                 )
                 return
 
@@ -1192,7 +1192,7 @@ class REPL:
                     reason = extras[1]
                 else:
                     self._display.show_error(
-                        "Usage: /tasks note obsolete <path> <index> [--reason \"<text>\"]"
+                        'Usage: /tasks note obsolete <path> <index> [--reason "<text>"]'
                     )
                     return
 
