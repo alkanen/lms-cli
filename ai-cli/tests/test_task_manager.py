@@ -625,6 +625,82 @@ class TestAddNote:
 
 
 # ---------------------------------------------------------------------------
+# obsolete_note
+# ---------------------------------------------------------------------------
+
+
+class TestObsoleteNote:
+    def test_obsolete_note_removes_from_active_notes(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        detail = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.add_note(detail["id"], "temporary blocker")
+        tm.add_note(detail["id"], "resolved")
+
+        updated = tm.obsolete_note(detail["id"], 0, reason="Superseded")
+
+        assert len(updated["notes"]) == 1
+        assert "resolved" in updated["notes"][0]
+        assert all("temporary blocker" not in n for n in updated["notes"])
+
+    def test_obsolete_note_keeps_audit_history(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        detail = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.add_note(detail["id"], "first")
+        tm.add_note(detail["id"], "second")
+        tm.obsolete_note(detail["id"], 0, reason="no longer relevant")
+
+        on_disk = _tasks_json(tmp_path)
+        raw = on_disk["tasks"][detail["id"]]
+        history = raw["note_history"]
+        assert len(history) == 2
+        obsolete = [n for n in history if n["status"] == "obsolete"]
+        assert len(obsolete) == 1
+        assert "first" in obsolete[0]["text"]
+        assert obsolete[0]["obsolete_reason"] == "no longer relevant"
+
+    def test_obsolete_note_unknown_task_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        with pytest.raises(TaskNotFoundError):
+            tm.obsolete_note("task_xxxxxx", 0)
+
+    def test_obsolete_note_out_of_range_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        detail = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.add_note(detail["id"], "only")
+        with pytest.raises(TaskValidationError, match="note_index"):
+            tm.obsolete_note(detail["id"], 3)
+
+    def test_obsolete_note_non_int_index_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        detail = tm.create_task(name="T", definition_of_done="DoD here")
+        tm.add_note(detail["id"], "only")
+        with pytest.raises(TaskValidationError, match="note_index"):
+            tm.obsolete_note(detail["id"], "0")  # type: ignore[arg-type]
+
+    def test_obsolete_note_supports_legacy_records_without_lifecycle_fields(
+        self, tmp_path
+    ):
+        tm = _make_tm(tmp_path)
+        detail = tm.create_task(name="T", definition_of_done="DoD here")
+        task = tm._cache["tasks"][detail["id"]]
+        task["notes"] = ["[2026-01-01T00:00:00.000000Z] old note"]
+        task.pop("active_note_ids", None)
+        task.pop("note_history", None)
+        tm._save(tm._cache)
+
+        updated = tm.obsolete_note(detail["id"], 0, reason="stale")
+
+        assert updated["notes"] == []
+        fetched = tm.get_task(detail["id"])
+        assert any(
+            isinstance(e, dict)
+            and e.get("status") == "obsolete"
+            and "old note" in str(e.get("text"))
+            for e in fetched.get("note_history", [])
+        )
+
+
+# ---------------------------------------------------------------------------
 # mark_done
 # ---------------------------------------------------------------------------
 

@@ -601,7 +601,7 @@ def _wire_tasks(
     workspace: Workspace,
     permission_manager: PermissionManager,
 ) -> None:
-    """Register all six task tools against *tool_registry*.
+    """Register all task tools against *tool_registry*.
 
     Task tools are always registered (no config gate).  Individual tools can
     be disabled or disallowed via the standard per-tool mechanism.
@@ -612,6 +612,7 @@ def _wire_tasks(
         TasksGetTool,
         TasksListTool,
         TasksMarkDoneTool,
+        TasksObsoleteNoteTool,
         TasksUpdateTool,
     )
 
@@ -621,6 +622,7 @@ def _wire_tasks(
         TasksCreateTool,
         TasksUpdateTool,
         TasksAddNoteTool,
+        TasksObsoleteNoteTool,
         TasksMarkDoneTool,
     ):
         tool_registry.register_instance(

@@ -529,6 +529,27 @@ class TaskOrchestrator:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _active_notes(task_detail: dict) -> list[str]:
+        """Return active notes from task detail, preferring lifecycle metadata."""
+        history = task_detail.get("note_history")
+        if isinstance(history, list):
+            active: list[str] = []
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("status") != "active":
+                    continue
+                text = entry.get("text")
+                if isinstance(text, str):
+                    active.append(text)
+            if active:
+                return active
+        notes = task_detail.get("notes", [])
+        if isinstance(notes, list):
+            return [n for n in notes if isinstance(n, str)]
+        return []
+
+    @staticmethod
     def _report_schema_instruction(extra: str = "") -> str:
         """Return the shared structured-report instruction for agent prompts."""
         instruction = (
@@ -573,6 +594,7 @@ class TaskOrchestrator:
 
     def _run_executor(self, task: dict) -> AgentResult:
         detail = self.tm.get_task(task["id"])
+        active_notes = self._active_notes(detail)
         prompt = (
             f"Execute the following task.\n\n"
             f"Task: {detail['name']}\n"
@@ -581,9 +603,9 @@ class TaskOrchestrator:
         )
         if detail.get("next_action"):
             prompt += f"Suggested next action: {detail['next_action']}\n"
-        if detail.get("notes"):
+        if active_notes:
             prompt += "\nNotes from prior work:\n"
-            for note in detail["notes"][-5:]:
+            for note in active_notes[-5:]:
                 prompt += f"  - {note}\n"
 
         prompt += self._report_schema_instruction(
@@ -665,13 +687,14 @@ class TaskOrchestrator:
 
     def _run_reviewer(self, task: dict) -> AgentResult:
         detail = self.tm.get_task(task["id"])
+        active_notes = self._active_notes(detail)
         prompt = (
             f"Review the following task.\n\n"
             f"Task: {detail['name']}\n"
             f"Definition of Done: {detail.get('definition_of_done', '')}\n"
             f"Notes:\n"
         )
-        for note in detail.get("notes", []):
+        for note in active_notes:
             prompt += f"  - {note}\n"
         prompt += (
             "\nVerify whether the Definition of Done is satisfied. "

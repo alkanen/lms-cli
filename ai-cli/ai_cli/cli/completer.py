@@ -37,7 +37,17 @@ _AT_PARTIAL_RE = re.compile(r"@(!?)((?:\\.|[^\s\\,;:!?()\[\]{}'\"<>])*)$")
 
 _INDEX_FLAGS = ["--file", "--full", "--label", "--remove"]
 _TOOLS_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
-_TASKS_SUBCOMMANDS = ["add", "close", "delete", "edit", "info", "list", "open", "tree"]
+_TASKS_SUBCOMMANDS = [
+    "add",
+    "close",
+    "delete",
+    "edit",
+    "info",
+    "list",
+    "note",
+    "open",
+    "tree",
+]
 _MCP_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
 _MCP_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
 _TASKS_REQUIRED_PATH_SUBCMDS = frozenset({"close", "edit", "info", "open"})
@@ -314,11 +324,58 @@ class REPLCompleter(Completer):
             return
 
         subcmd = parts[1].lower()
+        if subcmd == "note":
+            after = parts[2:]
+
+            # Complete verb: only "obsolete" is supported for now.
+            if not after or (len(after) == 1 and not trailing):
+                prefix = (after[0] if after else "").lower()
+                raw_len = len(after[0]) if after else 0
+                if "obsolete".startswith(prefix):
+                    yield Completion("obsolete", start_position=-raw_len)
+                return
+
+            if after[0].lower() != "obsolete":
+                return
+
+            note_args = after[1:]
+
+            # Complete the task path: /tasks note obsolete <path>
+            path_partial = self._tasks_note_obsolete_path_partial(note_args, trailing)
+            if path_partial is not None:
+                yield from self._complete_task_path(path_partial)
+                return
+
+            # Offer --reason after index is provided.
+            reason_prefix = self._tasks_note_obsolete_reason_prefix(note_args, trailing)
+            if reason_prefix is not None and "--reason".startswith(reason_prefix):
+                yield Completion("--reason", start_position=-len(reason_prefix))
+            return
+
         path_partial = self._tasks_path_partial(subcmd, parts[2:], trailing)
         if path_partial is None:
             return
 
         yield from self._complete_task_path(path_partial)
+
+    def _tasks_note_obsolete_path_partial(
+        self, note_args: list[str], trailing: bool
+    ) -> str | None:
+        if not note_args:
+            return "" if trailing else None
+        if len(note_args) == 1 and not trailing:
+            return note_args[0]
+        return None
+
+    def _tasks_note_obsolete_reason_prefix(
+        self, note_args: list[str], trailing: bool
+    ) -> str | None:
+        # note_args shape after 'obsolete': [<path>, <index>, ...]
+        if len(note_args) == 2 and trailing:
+            return ""
+        if len(note_args) == 3 and not trailing:
+            return note_args[2]
+        return None
 
     def _tasks_path_partial(
         self, subcmd: str, args: list[str], trailing: bool

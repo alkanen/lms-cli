@@ -1,16 +1,17 @@
 """
 Task tools — read and mutate the persistent task tree via TaskManager.
 
-Six tools are provided:
+Seven tools are provided:
 
-  tasks_list        List task summaries under a parent (or root).
-  tasks_get         Retrieve full details of a single task.
-  tasks_create      Create a new (sub)task.
-  tasks_update      Update fields of an existing task.
-  tasks_add_note    Append a timestamped note to a task.
-  tasks_mark_done   Mark a task done (validates subtasks and DoD).
+  tasks_list           List task summaries under a parent (or root).
+  tasks_get            Retrieve full details of a single task.
+  tasks_create         Create a new (sub)task.
+  tasks_update         Update fields of an existing task.
+  tasks_add_note       Append a timestamped note to a task.
+  tasks_obsolete_note  Mark a note obsolete and remove it from active context.
+  tasks_mark_done      Mark a task done (validates subtasks and DoD).
 
-All six share a :class:`~ai_cli.core.task_manager.TaskManager` instance
+All seven share a :class:`~ai_cli.core.task_manager.TaskManager` instance
 injected at construction time.  They use ``REGISTER_VIA_INSTANCE = True``
 because their constructors are non-standard; they are wired into registries
 in PR 3 via :meth:`~ai_cli.core.tool_registry.ToolRegistry.register_instance`.
@@ -523,6 +524,86 @@ class TasksAddNoteTool(_TaskTool):
                 self.name,
                 task_id,
                 path,
+            )
+            return {"task": task}
+
+        return self._handle(_go)
+
+
+# ---------------------------------------------------------------------------
+# TasksObsoleteNoteTool
+# ---------------------------------------------------------------------------
+
+
+class TasksObsoleteNoteTool(_TaskTool):
+    """Mark an active task note obsolete by index."""
+
+    NAME = "tasks_obsolete_note"
+    DESCRIPTION = (
+        "Mark an active note obsolete by index and remove it from active task "
+        "context used by later planning/execution/review rounds."
+    )
+
+    def definition(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            arguments=[
+                ToolArgument(
+                    "task_path",
+                    (
+                        "Dot-separated name path to the task whose note should be "
+                        "obsoleted (e.g. 'root_task.sub_task')."
+                    ),
+                    "string",
+                    required=True,
+                ),
+                ToolArgument(
+                    "note_index",
+                    "0-based index in the task's active notes list.",
+                    "integer",
+                    required=True,
+                ),
+                ToolArgument(
+                    "reason",
+                    "Optional reason for obsoleting the note.",
+                    "string",
+                    required=False,
+                ),
+            ],
+        )
+
+    def execute(self, **kwargs: Any) -> dict:
+        path, err = self._parse_task_path(kwargs)
+        if err:
+            return err
+
+        note_index = kwargs.get("note_index")
+        if not isinstance(note_index, int):
+            return self._err(
+                "validation_error", "'note_index' must be an integer.", code=400
+            )
+
+        reason = kwargs.get("reason", "")
+        if not isinstance(reason, str):
+            return self._err("validation_error", "'reason' must be a string.", code=400)
+
+        logger.debug(
+            "Task tool '%s' invoked: task_path=%r note_index=%d",
+            self.name,
+            path,
+            note_index,
+        )
+
+        def _go() -> dict:
+            task_id = self._tm.resolve_path_to_id(path)
+            task = self._tm.obsolete_note(task_id, note_index, reason=reason)
+            logger.debug(
+                "Task tool '%s': obsoleted note for task id=%s path=%r note_index=%d",
+                self.name,
+                task_id,
+                path,
+                note_index,
             )
             return {"task": task}
 

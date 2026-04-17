@@ -723,6 +723,52 @@ class TestExecutorAnswerFallback:
         assert result.partial is True
         tm.add_note.assert_not_called()
 
+    def test_executor_prompt_uses_only_active_note_history_entries(self):
+        detail = _make_task_detail(
+            "t1",
+            name="Task",
+            notes=["stale note", "active note"],
+        )
+        detail["note_history"] = [
+            {"id": "n1", "text": "stale note", "status": "obsolete"},
+            {"id": "n2", "text": "active note", "status": "active"},
+        ]
+        tm = _make_task_manager(task_detail=detail)
+        registry = _make_agent_registry(has={"executor": True})
+        executor = MagicMock()
+        executor.run.return_value = _ok_result()
+        registry.get_or_create.return_value = executor
+
+        orch = _make_orchestrator(task_manager=tm, agent_registry=registry)
+        orch._run_executor({"id": "t1", "name": "Task"})
+
+        prompt = executor.run.call_args[0][0]
+        assert "active note" in prompt
+        assert "stale note" not in prompt
+
+    def test_reviewer_prompt_uses_only_active_note_history_entries(self):
+        detail = _make_task_detail(
+            "t1",
+            name="Task",
+            notes=["stale note", "active note"],
+        )
+        detail["note_history"] = [
+            {"id": "n1", "text": "stale note", "status": "obsolete"},
+            {"id": "n2", "text": "active note", "status": "active"},
+        ]
+        tm = _make_task_manager(task_detail=detail)
+        registry = _make_agent_registry(has={"reviewer": True})
+        reviewer = MagicMock()
+        reviewer.run.return_value = _ok_result()
+        registry.get_or_create.return_value = reviewer
+
+        orch = _make_orchestrator(task_manager=tm, agent_registry=registry)
+        orch._run_reviewer({"id": "t1", "name": "Task"})
+
+        prompt = reviewer.run.call_args[0][0]
+        assert "active note" in prompt
+        assert "stale note" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # AgentRegistry.has() and AgentRegistry.reset()
