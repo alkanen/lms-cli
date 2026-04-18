@@ -152,7 +152,7 @@ class TestSlashTopLevel:
         result = _completions(_completer(skill_aliases={"planner": "planner"}), "/pl")
         assert result == ["/planner"]
 
-    def test_top_level_completion_reuses_cached_alias_union(self):
+    def test_top_level_completion_falls_back_to_cached_aliases_on_getter_error(self):
         alias_getter = MagicMock(return_value={"planner": "planner"})
         c = REPLCompleter(
             slash_commands=CMDS,
@@ -163,7 +163,7 @@ class TestSlashTopLevel:
         assert first == ["/planner"]
         assert alias_getter.call_count == 1
 
-        alias_getter.side_effect = RuntimeError("should not be called again")
+        alias_getter.side_effect = RuntimeError("alias getter unavailable")
         second = _completions(c, "/pl")
         assert second == ["/planner"]
         assert alias_getter.call_count == 2
