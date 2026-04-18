@@ -45,6 +45,7 @@ def _make_repl(
     workspace=None,
     task_manager=None,
     skill_registry=None,
+    system_prompt_builder=None,
 ) -> REPL:
     if tool_registry is None:
         effective_tool_registry = MagicMock()
@@ -69,6 +70,7 @@ def _make_repl(
         workspace=workspace or MagicMock(),
         task_manager=task_manager,
         skill_registry=skill_registry,
+        system_prompt_builder=system_prompt_builder,
     )
 
 
@@ -689,6 +691,89 @@ class TestREPLSlashCommands:
         statuses = [c[0][0] for c in display.show_status.call_args_list]
         assert any("missing SKILL.md" in msg for msg in statuses)
         assert any("1 skill(s) loaded" in msg for msg in statuses)
+
+    def test_skills_reload_replaces_session_system_prompt(self, tmp_path: Path):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        session = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+        tool_registry.get.return_value = read_file_tool
+
+        old_registry = _make_skill_registry(tmp_path, ["planner"])
+        reloaded = _make_skill_registry(tmp_path, ["reviewer"])
+
+        def _prompt_builder(registry: SkillRegistry) -> str:
+            return "prompt: " + ",".join(sorted(registry.names()))
+
+        repl = _make_repl(
+            session=session,
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=old_registry,
+            system_prompt_builder=_prompt_builder,
+        )
+
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=reloaded),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        session.set_system_message.assert_called_once_with("prompt: reviewer")
+
+    def test_skills_reload_prompt_builder_failure_rolls_back_live_prompt(
+        self, tmp_path: Path
+    ):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        session = MagicMock()
+        session.get_messages.return_value = [
+            {"role": "system", "content": "live prompt"}
+        ]
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+
+        def _get_tool(name: str):
+            if name == "read_file":
+                return read_file_tool
+            return None
+
+        tool_registry.get.side_effect = _get_tool
+
+        old_registry = _make_skill_registry(tmp_path, ["planner"])
+        reloaded = _make_skill_registry(tmp_path, ["reviewer"])
+
+        def _prompt_builder(registry: SkillRegistry) -> str:
+            names = sorted(registry.names())
+            if names == ["reviewer"]:
+                raise RuntimeError("prompt build failed")
+            return "prompt: " + ",".join(names)
+
+        repl = _make_repl(
+            session=session,
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=old_registry,
+            system_prompt_builder=_prompt_builder,
+        )
+
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=reloaded),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        assert repl._skill_registry is old_registry
+        assert session.set_system_message.call_count == 1
+        assert session.set_system_message.call_args.args == ("live prompt",)
+        display.show_error.assert_called_once()
 
     def test_skills_reload_with_no_skills_clears_read_file_skill_registry(
         self, tmp_path: Path

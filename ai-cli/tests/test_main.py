@@ -13,6 +13,7 @@ from ai_cli.__main__ import (
     _show_resume_context,
     _wire_agents,
     _wire_skills,
+    compose_system_prompt,
     load_system_prompt,
 )
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
@@ -972,6 +973,58 @@ class TestLoadSystemPrompt:
         root, global_dir = self._make_dirs(tmp_path)
         (root / _DOT_AI_CLI / "system_prompt.md").write_text(f"\n\n{_REAL_PROMPT}\n\n")
         assert load_system_prompt(root, global_dir) == _REAL_PROMPT
+
+
+class TestComposeSystemPrompt:
+    def _skills(self, tmp_path, names: list[str]) -> SkillRegistry:
+        specs: dict[str, SkillSpec] = {}
+        for name in names:
+            skill_dir = tmp_path / "skills" / name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            specs[name] = SkillSpec(
+                name=name,
+                description=f"{name} description",
+                instructions=f"{name} instructions",
+                base_dir=skill_dir,
+                scope="project",
+            )
+        return SkillRegistry(specs)
+
+    def test_returns_base_prompt_when_no_skills(self, tmp_path):
+        composed = compose_system_prompt("  Base prompt.  ", SkillRegistry({}))
+        assert composed == "Base prompt."
+
+    def test_appends_skills_section_with_guidance(self, tmp_path):
+        skills = self._skills(tmp_path, ["planner", "reviewer"])
+
+        composed = compose_system_prompt("Base prompt.", skills)
+
+        assert composed.startswith("Base prompt.")
+        assert "## Skills" in composed
+        assert "Use exactly one skill at a time." in composed
+        assert (
+            "Result envelope: top-level `status` (`success` or `error`) and `data`."
+            in composed
+        )
+        assert (
+            "Success data fields: `data.name`, `data.description`, `data.instructions`, `data.base_dir`."
+            in composed
+        )
+        assert (
+            "Not-found data fields: `data.found=false`, `data.requested_name`, `data.available_skills`."
+            in composed
+        )
+        assert "returned `data.base_dir`" in composed
+        assert "planner: planner description" in composed
+        assert "reviewer: reviewer description" in composed
+
+    def test_skills_only_prompt_when_base_is_empty(self, tmp_path):
+        skills = self._skills(tmp_path, ["planner"])
+
+        composed = compose_system_prompt("", skills)
+
+        assert composed.startswith("## Skills")
+        assert "planner: planner description" in composed
 
 
 # ---------------------------------------------------------------------------
