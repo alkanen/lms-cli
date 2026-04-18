@@ -788,22 +788,28 @@ class TestWireSkills:
 
     def test_skills_tool_not_registered_when_no_skills(self, tmp_path):
         tool_registry = MagicMock()
+        read_file_tool = MagicMock()
+        tool_registry.get.return_value = read_file_tool
         _wire_skills(
             self._skills(tmp_path, []),
             tool_registry,
             MagicMock(),
             MagicMock(),
         )
+        read_file_tool.set_skill_registry.assert_called_once()
         tool_registry.register_instance.assert_not_called()
 
     def test_skills_tool_registered_when_skills_exist(self, tmp_path):
         tool_registry = MagicMock()
+        read_file_tool = MagicMock()
+        tool_registry.get.return_value = read_file_tool
         _wire_skills(
             self._skills(tmp_path, ["alpha"]),
             tool_registry,
             MagicMock(),
             MagicMock(),
         )
+        read_file_tool.set_skill_registry.assert_called_once()
         tool_registry.register_instance.assert_called_once()
         registered = tool_registry.register_instance.call_args.args[0]
         assert registered.NAME == "skills"
