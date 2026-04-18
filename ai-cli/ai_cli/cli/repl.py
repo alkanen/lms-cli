@@ -187,6 +187,10 @@ _SLASH_COMMAND_NAMES: list[str] = list(
     dict.fromkeys(cmd.lstrip("/").split()[0] for cmd, _ in _SLASH_COMMANDS)
 )
 
+# Hard cap for unknown-command suggestion input length. Suggestions are UI sugar,
+# so we skip edit-distance work for unusually long slash tokens.
+_MAX_SUGGESTION_CMD_LEN = 128
+
 
 def skill_aliases_for_registry(
     registry: SkillRegistry,
@@ -205,7 +209,12 @@ def skill_aliases_for_registry(
     return aliases, warnings
 
 
-def _levenshtein_distance(left: str, right: str) -> int:
+def _levenshtein_distance(
+    left: str,
+    right: str,
+    *,
+    max_distance: int | None = None,
+) -> int:
     """Compute Levenshtein edit distance between two short command names."""
     if left == right:
         return 0
@@ -213,6 +222,8 @@ def _levenshtein_distance(left: str, right: str) -> int:
         return len(right)
     if not right:
         return len(left)
+    if max_distance is not None and abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
     previous = list(range(len(right) + 1))
     for i, left_char in enumerate(left, start=1):
         current = [i]
@@ -221,8 +232,13 @@ def _levenshtein_distance(left: str, right: str) -> int:
             delete_cost = previous[j] + 1
             replace_cost = previous[j - 1] + (left_char != right_char)
             current.append(min(insert_cost, delete_cost, replace_cost))
+        if max_distance is not None and min(current) > max_distance:
+            return max_distance + 1
         previous = current
-    return previous[-1]
+    distance = previous[-1]
+    if max_distance is not None and distance > max_distance:
+        return max_distance + 1
+    return distance
 
 
 class _AbortMonitor:
@@ -684,11 +700,13 @@ class REPL:
         """Return the closest slash commands/aliases under the configured threshold."""
         if not cmd:
             return []
+        if len(cmd) > _MAX_SUGGESTION_CMD_LEN:
+            return []
         candidates = sorted(set(_SLASH_COMMAND_NAMES) | set(self._skill_aliases))
         threshold = max(2, math.ceil(len(cmd) * 0.2))
         matches: list[tuple[int, str]] = []
         for candidate in candidates:
-            distance = _levenshtein_distance(cmd, candidate)
+            distance = _levenshtein_distance(cmd, candidate, max_distance=threshold)
             if distance <= threshold:
                 matches.append((distance, candidate))
         if not matches:

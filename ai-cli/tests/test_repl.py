@@ -10,6 +10,7 @@ import pytest
 from ai_cli.cli.completer import REPLCompleter
 from ai_cli.cli.repl import (
     _DEFAULT_MAX_TOOL_ROUNDS,
+    _MAX_SUGGESTION_CMD_LEN,
     _SLASH_COMMANDS,
     REPL,
     _build_keyboard_shortcuts,
@@ -836,10 +837,18 @@ class TestREPLHelpers:
         assert _levenshtein_distance("help", "hep") == 1
         assert _levenshtein_distance("planner", "plnner") == 1
 
+    def test_levenshtein_distance_bails_when_over_max_distance(self):
+        assert _levenshtein_distance("help", "xxxxxxxx", max_distance=2) == 3
+
     def test_suggestion_threshold_uses_twenty_percent_floor_of_two(self):
         repl = _make_repl()
         assert repl._suggest_slash_commands("hep") == ["help"]
         assert repl._suggest_slash_commands("wildlydifferent") == []
+
+    def test_suggestion_skips_overly_long_command_tokens(self):
+        repl = _make_repl()
+        long_cmd = "x" * (_MAX_SUGGESTION_CMD_LEN + 1)
+        assert repl._suggest_slash_commands(long_cmd) == []
 
     def test_empty_command_shows_error(self):
         display = MagicMock()
