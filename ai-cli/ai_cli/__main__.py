@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 
 from ai_cli.cli.display import create_display
-from ai_cli.cli.repl import REPL
+from ai_cli.cli.repl import REPL, _skill_aliases_for_registry
 from ai_cli.core.agent_registry import AgentRegistry, load_agent_specs
 from ai_cli.core.config_manager import ConfigError, ConfigManager
 from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
@@ -495,6 +495,9 @@ def _cmd_repl(
     # PR2 scope: model-facing ``skills`` tool registration when skills exist.
     skills = SkillRegistry.load(root, global_dir=global_dir)
     for warning in skills.warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+    _, alias_warnings = _skill_aliases_for_registry(skills)
+    for warning in alias_warnings:
         print(f"Warning: {warning}", file=sys.stderr)
     _wire_skills(skills, tool_registry, workspace, permission_manager)
 

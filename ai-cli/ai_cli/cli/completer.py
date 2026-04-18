@@ -193,6 +193,7 @@ class REPLCompleter(Completer):
         task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
         skill_registry_getter: Callable[[], SkillRegistry | None] | None = None,
+        skill_aliases_getter: Callable[[], dict[str, str]] | None = None,
         max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
         if max_path_completions < 1:
@@ -205,6 +206,7 @@ class REPLCompleter(Completer):
         self._task_manager = task_manager
         self._mcp_manager = mcp_manager
         self._skill_registry_getter = skill_registry_getter
+        self._skill_aliases_getter = skill_aliases_getter
         self._max_path_completions = max_path_completions
         self._skill_names_cache_registry: SkillRegistry | None = None
         self._skill_names_cache: tuple[str, ...] | None = None
@@ -252,7 +254,10 @@ class REPLCompleter(Completer):
         # Still typing the top-level command word (no trailing space yet).
         if len(parts) == 1 and not text.endswith(" "):
             prefix = parts[0][1:].lower()  # strip "/" and normalise case
-            for cmd in self._slash_commands:
+            dynamic_commands = sorted(
+                set(self._slash_commands) | set(self._skill_aliases())
+            )
+            for cmd in dynamic_commands:
                 if cmd.startswith(prefix):
                     yield Completion(
                         "/" + cmd,
@@ -788,3 +793,12 @@ class REPLCompleter(Completer):
         self._skill_names_cache_registry = registry
         self._skill_names_cache = names
         return list(names)
+
+    def _skill_aliases(self) -> dict[str, str]:
+        if self._skill_aliases_getter is None:
+            return {}
+        try:
+            return dict(self._skill_aliases_getter())
+        except Exception:
+            logger.warning("Skill alias completion lookup failed", exc_info=True)
+            return {}

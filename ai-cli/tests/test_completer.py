@@ -40,6 +40,7 @@ def _completer(
     workspace=None,
     task_manager=None,
     skill_registry=None,
+    skill_aliases=None,
 ) -> REPLCompleter:
     registry = None
     if tool_names is not None:
@@ -51,6 +52,7 @@ def _completer(
         workspace=workspace,
         task_manager=task_manager,
         skill_registry_getter=(lambda: skill_registry),
+        skill_aliases_getter=(lambda: skill_aliases or {}),
     )
 
 
@@ -145,6 +147,10 @@ class TestSlashTopLevel:
     def test_case_insensitive_mixed(self):
         result = _completions(_completer(), "/Ex")
         assert "/exit" in result
+
+    def test_skill_aliases_are_included_in_top_level_completion(self):
+        result = _completions(_completer(skill_aliases={"planner": "planner"}), "/pl")
+        assert result == ["/planner"]
 
 
 # ---------------------------------------------------------------------------
