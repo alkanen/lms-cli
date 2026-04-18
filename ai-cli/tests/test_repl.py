@@ -16,6 +16,7 @@ from ai_cli.cli.repl import (
 )
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
+from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,6 +41,7 @@ def _make_repl(
     display=None,
     workspace=None,
     task_manager=None,
+    skill_registry=None,
 ) -> REPL:
     return REPL(
         session=session or MagicMock(),
@@ -48,7 +50,23 @@ def _make_repl(
         display=display or MagicMock(),
         workspace=workspace or MagicMock(),
         task_manager=task_manager,
+        skill_registry=skill_registry,
     )
+
+
+def _make_skill_registry(tmp_path: Path, names: list[str]) -> SkillRegistry:
+    specs: dict[str, SkillSpec] = {}
+    for name in names:
+        skill_dir = tmp_path / "skills" / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        specs[name] = SkillSpec(
+            name=name,
+            description=f"{name} description",
+            instructions=f"{name} instructions",
+            base_dir=skill_dir,
+            scope="project",
+        )
+    return SkillRegistry(specs)
 
 
 def _make_prompt_session(*inputs):
@@ -125,6 +143,11 @@ class TestSessionClear:
 
 
 class TestREPLRun:
+    def test_constructor_preserves_provided_empty_skill_registry(self):
+        empty_registry = SkillRegistry({}, warnings=["warn"], skipped=[])
+        repl = _make_repl(skill_registry=empty_registry)
+        assert repl._skill_registry is empty_registry
+
     def test_eof_exits_loop(self):
         repl = _make_repl()
         pt = _make_prompt_session()  # immediately EOFError
@@ -469,6 +492,240 @@ class TestREPLSlashCommands:
         repl = _make_repl(tool_registry=tool_registry, display=display)
         repl._handle_slash_command("tools")
         display.show_tool_list.assert_called_once_with([])
+
+    def test_skills_calls_show_skills_simple(self, tmp_path: Path):
+        display = MagicMock()
+        repl = _make_repl(
+            display=display,
+            skill_registry=_make_skill_registry(tmp_path, ["planner", "grill-me"]),
+        )
+        repl._handle_slash_command("skills")
+        rows = display.show_skills_simple.call_args[0][0]
+        assert [row["name"] for row in rows] == ["grill-me", "planner"]
+
+    def test_skills_list_calls_show_skills_list(self, tmp_path: Path):
+        display = MagicMock()
+        repl = _make_repl(
+            display=display,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._handle_slash_command("skills list")
+        display.show_skills_list.assert_called_once()
+
+    def test_skills_info_calls_show_skill_info(self, tmp_path: Path):
+        display = MagicMock()
+        repl = _make_repl(
+            display=display,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._handle_slash_command("skills info planner")
+        info = display.show_skill_info.call_args[0][0]
+        assert info["name"] == "planner"
+        assert "description" in info
+        assert "instructions" in info
+
+    def test_skills_info_usage_error(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._handle_slash_command("skills info")
+        display.show_error.assert_called_once()
+        assert "Usage: /skills info <name>" in display.show_error.call_args[0][0]
+
+    def test_skills_parse_error_shows_error(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+        repl._handle_slash_command('skills info "broken')
+        display.show_error.assert_called_once()
+        assert "Could not parse /skills arguments" in display.show_error.call_args[0][0]
+
+    def test_skills_zero_behavior(self):
+        display = MagicMock()
+        repl = _make_repl(display=display, skill_registry=SkillRegistry({}))
+        repl._handle_slash_command("skills")
+        display.show_skills_simple.assert_called_once_with([])
+
+    def test_skills_reload_refreshes_registry_and_warns(self, tmp_path: Path):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+        tool_registry.get.return_value = read_file_tool
+        reloaded = SkillRegistry(
+            _make_skill_registry(tmp_path, ["planner"]).skills,
+            warnings=["Skill 'bad' skipped: missing SKILL.md"],
+        )
+        repl = _make_repl(
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=SkillRegistry({}),
+        )
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=reloaded),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+        read_file_tool.set_skill_registry.assert_called_once_with(reloaded)
+        tool_registry.unregister.assert_called_once_with("skills")
+        tool_registry.register_instance.assert_called_once()
+        statuses = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("missing SKILL.md" in msg for msg in statuses)
+        assert any("1 skill(s) loaded" in msg for msg in statuses)
+
+    def test_skills_reload_with_no_skills_clears_read_file_skill_registry(
+        self, tmp_path: Path
+    ):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+        tool_registry.get.return_value = read_file_tool
+        repl = _make_repl(
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=SkillRegistry({})),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        read_file_tool.set_skill_registry.assert_called_once_with(None)
+        tool_registry.unregister.assert_called_once_with("skills")
+        tool_registry.register_instance.assert_not_called()
+        display.show_error.assert_not_called()
+        statuses = [c[0][0] for c in display.show_status.call_args_list]
+        assert any("0 skill(s) loaded" in msg for msg in statuses)
+
+    def test_skills_reload_load_failure_shows_error_and_keeps_state(
+        self, tmp_path: Path
+    ):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+        old_skill_tool = MagicMock()
+
+        def _get_tool(name: str):
+            if name == "read_file":
+                return read_file_tool
+            if name == "skills":
+                return old_skill_tool
+            return None
+
+        tool_registry.get.side_effect = _get_tool
+
+        old_registry = _make_skill_registry(tmp_path, ["planner"])
+        repl = _make_repl(
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=old_registry,
+        )
+
+        with (
+            patch(
+                "ai_cli.cli.repl.SkillRegistry.load", side_effect=RuntimeError("boom")
+            ),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        assert repl._skill_registry is old_registry
+        display.show_error.assert_called_once()
+        assert "Failed to reload skills" in display.show_error.call_args[0][0]
+        tool_registry.unregister.assert_not_called()
+        tool_registry.register_instance.assert_not_called()
+        read_file_tool.set_skill_registry.assert_not_called()
+
+    def test_skills_reload_apply_failure_rolls_back(self, tmp_path: Path):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+        old_skill_tool = MagicMock()
+
+        def _get_tool(name: str):
+            if name == "read_file":
+                return read_file_tool
+            if name == "skills":
+                return old_skill_tool
+            return None
+
+        tool_registry.get.side_effect = _get_tool
+        tool_registry.register_instance.side_effect = RuntimeError("register failed")
+
+        old_registry = _make_skill_registry(tmp_path, ["planner"])
+        reloaded = _make_skill_registry(tmp_path, ["grill-me"])
+        repl = _make_repl(
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=old_registry,
+        )
+
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=reloaded),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        assert repl._skill_registry is old_registry
+        display.show_error.assert_called_once()
+        assert "Failed to reload skills" in display.show_error.call_args[0][0]
+        read_file_tool.set_skill_registry.assert_any_call(reloaded)
+        read_file_tool.set_skill_registry.assert_any_call(old_registry)
+        assert tool_registry.unregister.call_count >= 1
+        tool_registry.register_instance.assert_any_call(old_skill_tool)
+        display.show_status.assert_not_called()
+
+    def test_skills_reload_apply_failure_rolls_back_to_none_for_empty_registry(
+        self, tmp_path: Path
+    ):
+        display = MagicMock()
+        workspace = MagicMock()
+        workspace.root = tmp_path
+        tool_registry = MagicMock()
+        tool_registry.permission_manager = MagicMock()
+        read_file_tool = MagicMock()
+
+        def _get_tool(name: str):
+            if name == "read_file":
+                return read_file_tool
+            return None
+
+        tool_registry.get.side_effect = _get_tool
+        tool_registry.register_instance.side_effect = RuntimeError("register failed")
+
+        reloaded = _make_skill_registry(tmp_path, ["grill-me"])
+        repl = _make_repl(
+            display=display,
+            workspace=workspace,
+            tool_registry=tool_registry,
+            skill_registry=SkillRegistry({}),
+        )
+
+        with (
+            patch("ai_cli.cli.repl.SkillRegistry.load", return_value=reloaded),
+            patch("ai_cli.cli.repl.get_global_dir", return_value=tmp_path / "global"),
+        ):
+            repl._handle_slash_command("skills reload")
+
+        assert repl._skill_registry.has_skills is False
+        read_file_tool.set_skill_registry.assert_any_call(reloaded)
+        read_file_tool.set_skill_registry.assert_any_call(None)
+        display.show_error.assert_called_once()
 
     def test_session_calls_show_session_info(self):
         session = MagicMock()

@@ -11,6 +11,8 @@ PR1 scope:
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import ItemsView, KeysView
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +25,8 @@ logger = logging.getLogger(__name__)
 SKILL_FILENAME = "SKILL.md"
 MAX_SKILL_FILE_BYTES = 40 * 1024
 MAX_DESCRIPTION_CHARS = 1024
+MAX_SKILL_NAME_CHARS = 64
+SKILL_NAME_RE = re.compile(rf"^[a-z0-9][a-z0-9-]{{0,{MAX_SKILL_NAME_CHARS - 1}}}$")
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,18 @@ class SkillRegistry:
     def get(self, name: str) -> SkillSpec | None:
         """Return the skill for canonical *name*, or None."""
         return self._skills.get(name)
+
+    def __len__(self) -> int:
+        """Return the number of loaded skills without copying the mapping."""
+        return len(self._skills)
+
+    def names(self) -> KeysView[str]:
+        """Return a dynamic view of canonical skill names without copying."""
+        return self._skills.keys()
+
+    def items(self) -> ItemsView[str, SkillSpec]:
+        """Return a dynamic view of skill entries without copying."""
+        return self._skills.items()
 
     @classmethod
     def load(
@@ -166,6 +182,13 @@ class _SkillLoader:
         if not isinstance(name, str) or not name.strip():
             self._skip(skill_dir, "missing required frontmatter field 'name'")
             return
+        name = name.strip()
+        if not SKILL_NAME_RE.match(name):
+            self._skip(
+                skill_dir,
+                f"frontmatter 'name' must contain only lowercase letters, numbers, and hyphens, and be at most {MAX_SKILL_NAME_CHARS} characters",
+            )
+            return
         if not isinstance(description, str) or not description.strip():
             self._skip(skill_dir, "missing required frontmatter field 'description'")
             return
@@ -176,7 +199,7 @@ class _SkillLoader:
             )
             return
 
-        canonical_name = name.strip()
+        canonical_name = name
         cleaned_description = description.strip()
 
         if canonical_name != skill_dir.name:

@@ -116,6 +116,9 @@ class TestNoOpMethods:
             ("show_tool_list_all", ([],)),
             ("show_tool_info", ({},)),
             ("show_history", ([],)),
+            ("show_skills_simple", ([],)),
+            ("show_skills_list", ([],)),
+            ("show_skill_info", ({},)),
         ],
     )
     def test_noop_callable(self, display, method, args):

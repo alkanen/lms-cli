@@ -522,6 +522,7 @@ def _cmd_repl(
         agent_registry=agent_registry,
         task_manager=task_manager,
         mcp_manager=mcp_manager,
+        skill_registry=skills,
     )
     try:
         repl.run()
@@ -650,7 +651,7 @@ def _wire_skills(
     if read_file_tool is not None:
         set_skill_registry = getattr(read_file_tool, "set_skill_registry", None)
         if callable(set_skill_registry):
-            set_skill_registry(skills)
+            set_skill_registry(skills if skills.has_skills else None)
 
     if not skills.has_skills:
         return
