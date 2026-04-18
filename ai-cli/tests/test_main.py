@@ -796,7 +796,7 @@ class TestWireSkills:
             MagicMock(),
             MagicMock(),
         )
-        read_file_tool.set_skill_registry.assert_called_once()
+        read_file_tool.set_skill_registry.assert_called_once_with(None)
         tool_registry.register_instance.assert_not_called()
 
     def test_skills_tool_registered_when_skills_exist(self, tmp_path):
@@ -809,7 +809,7 @@ class TestWireSkills:
             MagicMock(),
             MagicMock(),
         )
-        read_file_tool.set_skill_registry.assert_called_once()
+        assert read_file_tool.set_skill_registry.call_args.args[0].has_skills is True
         tool_registry.register_instance.assert_called_once()
         registered = tool_registry.register_instance.call_args.args[0]
         assert registered.NAME == "skills"

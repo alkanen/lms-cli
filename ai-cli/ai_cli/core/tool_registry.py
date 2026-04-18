@@ -650,6 +650,18 @@ class ToolRegistry:
                         exc,
                     )
 
+    def unregister(self, name: str) -> None:
+        """Remove a registered tool by *name* if present."""
+        removed = self._tools.pop(name, None)
+        self._schemas.pop(name, None)
+        self._enabled.pop(name, None)
+        self._allowed.pop(name, None)
+        self._session_overrides.pop(name, None)
+        self._session_allowed_overrides.pop(name, None)
+        self._tiers.pop(name, None)
+        if removed is not None:
+            logger.debug("Unregistered tool '%s'.", name)
+
     def _apply_config(self) -> None:
         """Apply per-tool settings from the merged config over the loaded defaults.
 

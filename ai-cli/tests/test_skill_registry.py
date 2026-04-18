@@ -7,6 +7,7 @@ import pytest
 from ai_cli.core.skill_registry import (
     MAX_DESCRIPTION_CHARS,
     MAX_SKILL_FILE_BYTES,
+    MAX_SKILL_NAME_CHARS,
     SKILL_FILENAME,
     SkillRegistry,
 )
@@ -117,15 +118,49 @@ class TestSkillRegistryValidation:
 
     def test_folder_name_mismatch_warns_but_loads(self, project_root: Path, caplog):
         _write_skill(
-            project_root / ".ai-cli" / "skills" / "folder_name",
-            name="canonical_name",
+            project_root / ".ai-cli" / "skills" / "folder-name",
+            name="canonical-name",
             description="ok",
         )
         with caplog.at_level("WARNING"):
             reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
-        assert "canonical_name" in reg.skills
+        assert "canonical-name" in reg.skills
         assert any("folder name differs" in w for w in reg.warnings)
         assert "folder name differs" in caplog.text
+
+    def test_invalid_skill_name_chars_skipped_with_warning(
+        self, project_root: Path, caplog
+    ):
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "bad-name",
+            name="Bad_Name",
+            description="ok",
+        )
+        with caplog.at_level("WARNING"):
+            reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+        assert reg.skills == {}
+        assert any("lowercase letters, numbers, and hyphens" in w for w in reg.warnings)
+
+    def test_skill_name_surrounding_whitespace_is_normalized(self, project_root: Path):
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "alpha",
+            name="  alpha  ",
+            description="ok",
+        )
+        reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+        assert reg.get("alpha") is not None
+
+    def test_skill_name_too_long_skipped_with_warning(self, project_root: Path, caplog):
+        too_long_name = "a" * (MAX_SKILL_NAME_CHARS + 1)
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "bad-name",
+            name=too_long_name,
+            description="ok",
+        )
+        with caplog.at_level("WARNING"):
+            reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+        assert reg.skills == {}
+        assert any("at most 64 characters" in w for w in reg.warnings)
 
 
 class TestSkillRegistryPrecedence:
@@ -176,3 +211,45 @@ class TestSkillRegistryPrecedence:
         keys2 = list(reg2.skills.keys())
         assert keys1 == keys2
         assert set(keys1) == {"alpha", "zeta"}
+
+
+class TestSkillRegistryLen:
+    def test_len_returns_skill_count_without_needing_skills_copy(
+        self, project_root: Path
+    ):
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "alpha",
+            name="alpha",
+            description="a",
+        )
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "beta",
+            name="beta",
+            description="b",
+        )
+
+        reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+
+        assert len(reg) == 2
+
+    def test_names_returns_live_view_without_copying(self, project_root: Path):
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "alpha",
+            name="alpha",
+            description="a",
+        )
+
+        reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+
+        assert list(reg.names()) == ["alpha"]
+
+    def test_items_returns_live_view_without_copying(self, project_root: Path):
+        _write_skill(
+            project_root / ".ai-cli" / "skills" / "alpha",
+            name="alpha",
+            description="a",
+        )
+
+        reg = SkillRegistry.load(project_root, global_dir=project_root / "unused")
+
+        assert [(name, spec.name) for name, spec in reg.items()] == [("alpha", "alpha")]

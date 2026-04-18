@@ -13,11 +13,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
+
+from ai_cli.core.skill_registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ _TASKS_SUBCOMMANDS = [
     "tree",
 ]
 _MCP_SUBCOMMANDS = ["allow", "disable", "disallow", "enable", "info", "list"]
+_SKILLS_SUBCOMMANDS = ["info", "list", "reload"]
 _MCP_FLAG_SUBCMDS = frozenset({"allow", "disable", "disallow", "enable"})
 _TASKS_REQUIRED_PATH_SUBCMDS = frozenset({"close", "edit", "info", "open"})
 _TASKS_OPTIONAL_PATH_SUBCMDS = frozenset({"add", "delete", "list"})
@@ -168,9 +171,15 @@ class REPLCompleter(Completer):
     workspace:
         Workspace used to resolve and filter file-path completions for
         ``@path`` references.
+    task_manager:
+        Live TaskManager used to enumerate task paths for ``/tasks``
+        subcommands. Queried lazily on each completion request.
     mcp_manager:
         Live MCPManager used to enumerate server and tool names for ``/mcp``
         subcommands.  Queried lazily on each completion request.
+    skill_registry_getter:
+        Callable returning the current SkillRegistry for ``/skills info``
+        completions. Queried lazily so completions reflect runtime reloads.
     max_path_completions:
         Maximum number of ``@path`` completions returned per keystroke.
         Defaults to :data:`DEFAULT_MAX_PATH_COMPLETIONS`.
@@ -183,6 +192,7 @@ class REPLCompleter(Completer):
         workspace: Workspace | None = None,
         task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
+        skill_registry_getter: Callable[[], SkillRegistry | None] | None = None,
         max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
         if max_path_completions < 1:
@@ -194,7 +204,10 @@ class REPLCompleter(Completer):
         self._workspace = workspace
         self._task_manager = task_manager
         self._mcp_manager = mcp_manager
+        self._skill_registry_getter = skill_registry_getter
         self._max_path_completions = max_path_completions
+        self._skill_names_cache_registry: SkillRegistry | None = None
+        self._skill_names_cache: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------
     # Completer API
@@ -264,6 +277,42 @@ class REPLCompleter(Completer):
             yield from self._complete_index(parts, text)
         elif cmd == "mcp":
             yield from self._complete_mcp(parts, text)
+        elif cmd == "skills":
+            yield from self._complete_skills(text)
+
+    def _complete_skills(self, text: str) -> Iterable[Completion]:
+        completed, partial_raw = _tokenize_command(text)
+        trailing = text.endswith((" ", "\t"))
+        parts = list(completed)
+        if not trailing and partial_raw:
+            parts.append(_unescape(partial_raw))
+        if not parts:
+            return
+
+        if len(parts) == 1 or (len(parts) == 2 and not trailing):
+            prefix = (parts[1] if len(parts) > 1 else "").lower()
+            raw_len = len(partial_raw) if len(parts) > 1 and not trailing else 0
+            for sub in _SKILLS_SUBCOMMANDS:
+                if sub.startswith(prefix):
+                    yield Completion(sub, start_position=-raw_len)
+            return
+
+        subcmd = parts[1].lower()
+        if subcmd != "info":
+            return
+
+        if (len(parts) == 2 and trailing) or (len(parts) == 3 and not trailing):
+            prefix = parts[2] if len(parts) == 3 else ""
+            for name in self._skill_names():
+                if name.startswith(prefix):
+                    raw_len = (
+                        len(partial_raw) if len(parts) == 3 and not trailing else 0
+                    )
+                    yield Completion(
+                        _escape_path(name),
+                        start_position=-raw_len,
+                        display=name,
+                    )
 
     def _complete_tools(self, parts: list[str], text: str) -> Iterable[Completion]:
         trailing = text.endswith(" ")
@@ -715,3 +764,27 @@ class REPLCompleter(Completer):
         if self._mcp_manager is None:
             return []
         return sorted(self._mcp_manager.get_server_tools(server_name))
+
+    def _skill_names(self) -> list[str]:
+        if self._skill_registry_getter is None:
+            return []
+        try:
+            registry = self._skill_registry_getter()
+        except Exception:
+            logger.warning("Skill completion lookup failed", exc_info=True)
+            return []
+        if registry is None:
+            self._skill_names_cache_registry = None
+            self._skill_names_cache = None
+            return []
+
+        if (
+            registry is self._skill_names_cache_registry
+            and self._skill_names_cache is not None
+        ):
+            return list(self._skill_names_cache)
+
+        names = tuple(sorted(registry.names()))
+        self._skill_names_cache_registry = registry
+        self._skill_names_cache = names
+        return list(names)

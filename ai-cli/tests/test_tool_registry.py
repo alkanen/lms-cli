@@ -125,6 +125,39 @@ class TestQueries:
         assert defs[0]["function"]["name"] == "echo"
 
 
+class TestUnregister:
+    def test_unregister_is_idempotent(self, tmp_path):
+        reg = make_registry(tmp_path)
+
+        reg.unregister("echo")
+        reg.unregister("echo")
+
+        assert reg.get("echo") is None
+
+    def test_unregister_removes_tool_and_related_state(self, tmp_path):
+        reg = make_registry(tmp_path, tool_classes=[_EchoTool])
+        reg.disable_session("echo")
+        reg.disallow_session("echo")
+
+        assert "echo" in reg._tools
+        assert "echo" in reg._schemas
+        assert "echo" in reg._enabled
+        assert "echo" in reg._allowed
+        assert "echo" in reg._tiers
+        assert "echo" in reg._session_overrides
+        assert "echo" in reg._session_allowed_overrides
+
+        reg.unregister("echo")
+
+        assert "echo" not in reg._tools
+        assert "echo" not in reg._schemas
+        assert "echo" not in reg._enabled
+        assert "echo" not in reg._allowed
+        assert "echo" not in reg._tiers
+        assert "echo" not in reg._session_overrides
+        assert "echo" not in reg._session_allowed_overrides
+
+
 # ---------------------------------------------------------------------------
 # definition() validation
 # ---------------------------------------------------------------------------

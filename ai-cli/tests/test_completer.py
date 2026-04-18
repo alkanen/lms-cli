@@ -12,6 +12,7 @@ from ai_cli.cli.completer import (
     REPLCompleter,
     _tokenize_command,
 )
+from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,6 +28,7 @@ CMDS = [
     "markdown",
     "rounds",
     "session",
+    "skills",
     "tools",
     "verbose",
 ]
@@ -37,6 +39,7 @@ def _completer(
     tool_names: list[str] | None = None,
     workspace=None,
     task_manager=None,
+    skill_registry=None,
 ) -> REPLCompleter:
     registry = None
     if tool_names is not None:
@@ -47,6 +50,22 @@ def _completer(
         tool_registry=registry,
         workspace=workspace,
         task_manager=task_manager,
+        skill_registry_getter=(lambda: skill_registry),
+    )
+
+
+def _skill_registry(names: list[str]) -> SkillRegistry:
+    return SkillRegistry(
+        {
+            name: SkillSpec(
+                name=name,
+                description=f"{name} desc",
+                instructions=f"{name} instructions",
+                base_dir=Path(f"/tmp/{name}"),
+                scope="project",
+            )
+            for name in names
+        }
     )
 
 
@@ -225,6 +244,69 @@ class TestSessionSubcommands:
     def test_session_name_no_further_completions(self):
         result = _completions(_completer(), "/session name ")
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# /skills
+# ---------------------------------------------------------------------------
+
+
+class TestSkillsSubcommands:
+    def test_skills_space_offers_subcommands(self):
+        result = _completions(_completer(), "/skills ")
+        assert set(result) == {"info", "list", "reload"}
+
+    def test_skills_partial_subcommand(self):
+        result = _completions(_completer(), "/skills l")
+        assert result == ["list"]
+
+    def test_skills_info_offers_skill_names(self):
+        result = _completions(
+            _completer(skill_registry=_skill_registry(["grill-me", "planner"])),
+            "/skills info ",
+        )
+        assert set(result) == {"grill-me", "planner"}
+
+    def test_skills_info_prefix_filters_skill_names(self):
+        result = _completions(
+            _completer(skill_registry=_skill_registry(["grill-me", "planner"])),
+            "/skills info g",
+        )
+        assert result == ["grill-me"]
+
+    def test_skills_info_quoted_prefix_filters_skill_names(self):
+        result = _completions(
+            _completer(skill_registry=_skill_registry(["my-skill", "planner"])),
+            '/skills info "my',
+        )
+        assert result == ["my-skill"]
+
+    def test_skills_info_escaped_prefix_filters_skill_names(self):
+        result = _completions(
+            _completer(skill_registry=_skill_registry(["my-skill", "planner"])),
+            "/skills info my\\-s",
+        )
+        assert result == ["my-skill"]
+
+    def test_skills_reload_has_no_further_completions(self):
+        result = _completions(_completer(), "/skills reload ")
+        assert result == []
+
+    def test_skills_info_reuses_cached_names_for_same_registry(self):
+        registry = _skill_registry(["grill-me", "planner"])
+        completer = _completer(skill_registry=registry)
+
+        first = _completions(completer, "/skills info ")
+
+        original_names = registry.names
+        registry.names = MagicMock(side_effect=RuntimeError("should not be called"))
+        try:
+            second = _completions(completer, "/skills info ")
+        finally:
+            registry.names = original_names
+
+        assert set(first) == {"grill-me", "planner"}
+        assert second == first
 
 
 # ---------------------------------------------------------------------------

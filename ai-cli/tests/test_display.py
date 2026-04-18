@@ -241,6 +241,38 @@ class TestPlainDisplayToolList:
         assert "No tools" in capsys.readouterr().out
 
 
+class TestPlainDisplaySkills:
+    def test_show_skills_simple(self, capsys):
+        d = _plain()
+        d.show_skills_simple([{"name": "grill-me"}, {"name": "planner"}])
+        out = capsys.readouterr().out
+        assert "grill-me" in out
+        assert "planner" in out
+
+    def test_show_skills_list(self, capsys):
+        d = _plain()
+        d.show_skills_list(
+            [{"name": "grill-me", "description": "Ask clarifying questions"}]
+        )
+        out = capsys.readouterr().out
+        assert "grill-me" in out
+        assert "Ask clarifying questions" in out
+
+    def test_show_skill_info(self, capsys):
+        d = _plain()
+        d.show_skill_info(
+            {
+                "name": "grill-me",
+                "description": "Ask clarifying questions",
+                "instructions": "Ask one question at a time.",
+            }
+        )
+        out = capsys.readouterr().out
+        assert "grill-me" in out
+        assert "Ask clarifying questions" in out
+        assert "Ask one question at a time." in out
+
+
 class TestPlainDisplaySessionInfo:
     def test_show_session_info_prints_id_and_count(self, capsys):
         session = MagicMock()
@@ -1085,6 +1117,49 @@ class TestRichDisplaySlashCommands:
         assert "read_file" in out
         assert "path" in out
         assert "required" in out
+
+    def test_show_skills_simple(self):
+        d, buf, _ = _rich()
+        d.show_skills_simple([{"name": "grill-me"}, {"name": "planner"}])
+        out = buf.getvalue()
+        assert "grill-me" in out
+        assert "planner" in out
+
+    def test_show_skills_list(self):
+        d, buf, _ = _rich()
+        d.show_skills_list(
+            [{"name": "grill-me", "description": "Ask clarifying questions"}]
+        )
+        out = buf.getvalue()
+        assert "grill-me" in out
+        assert "Ask clarifying questions" in out
+
+    def test_show_skill_info(self):
+        d, buf, _ = _rich()
+        d.show_skill_info(
+            {
+                "name": "grill-me",
+                "description": "Ask clarifying questions",
+                "instructions": "Ask one question at a time.",
+            }
+        )
+        out = buf.getvalue()
+        assert "grill-me" in out
+        assert "Ask clarifying questions" in out
+        assert "Ask one question at a time." in out
+
+    def test_show_skill_info_respects_markdown_toggle(self):
+        d, buf, _ = _rich(markdown_enabled=False)
+        d.show_skill_info(
+            {
+                "name": "grill-me",
+                "description": "Ask clarifying questions",
+                "instructions": "# Heading\n- bullet",
+            }
+        )
+        out = buf.getvalue()
+        assert "# Heading" in out
+        assert "- bullet" in out
 
 
 class TestRichDisplayHistory:

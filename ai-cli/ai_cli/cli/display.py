@@ -250,6 +250,15 @@ class Display(ABC):
         override this to render a table.
         """
 
+    def show_skills_simple(self, skills: list[dict]) -> None:  # noqa: B027
+        """Render canonical skill names only (for bare ``/skills``)."""
+
+    def show_skills_list(self, skills: list[dict]) -> None:  # noqa: B027
+        """Render skills with canonical names and descriptions."""
+
+    def show_skill_info(self, skill: dict) -> None:  # noqa: B027
+        """Render full detail for a single skill."""
+
     def show_tasks_simple(self, tasks: list[dict]) -> None:  # noqa: B027
         """Render a compact list of unfinished root tasks (for bare ``/tasks``).
 
@@ -565,6 +574,28 @@ class PlainDisplay(Display):
                 f"persistence={row['persistence']}  "
                 f"max_rounds={row['max_tool_rounds']}  tools={tools_str}"
             )
+
+    def show_skills_simple(self, skills: list[dict]) -> None:
+        if not skills:
+            print("No skills loaded.")
+            return
+        print("\nSkills:")
+        for skill in skills:
+            print(f"  {skill['name']}")
+
+    def show_skills_list(self, skills: list[dict]) -> None:
+        if not skills:
+            print("No skills loaded.")
+            return
+        print("\nSkills:")
+        for skill in skills:
+            print(f"  {skill['name']:<20}  {skill['description']}")
+
+    def show_skill_info(self, skill: dict) -> None:
+        print(f"\nSkill: {skill['name']}")
+        print(f"Description: {skill['description']}")
+        print("Instructions:")
+        print(skill["instructions"])
 
     def show_tasks_simple(self, tasks: list[dict]) -> None:
         if not tasks:
@@ -1051,6 +1082,40 @@ class RichDisplay(Display):
         self._console.print("\nConfigured agent types:")
         self._console.print(table)
 
+    def show_skills_simple(self, skills: list[dict]) -> None:
+        if not skills:
+            self._console.print("No skills loaded.")
+            return
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Name", style="bold")
+        for skill in skills:
+            table.add_row(skill["name"])
+        self._console.print("\nSkills:")
+        self._console.print(table)
+
+    def show_skills_list(self, skills: list[dict]) -> None:
+        if not skills:
+            self._console.print("No skills loaded.")
+            return
+        table = Table(show_header=True)
+        table.add_column("Name", style="bold")
+        table.add_column("Description")
+        for skill in skills:
+            table.add_row(skill["name"], skill["description"])
+        self._console.print("\nSkills:")
+        self._console.print(table)
+
+    def show_skill_info(self, skill: dict) -> None:
+        self._console.print(f"\n[bold]Skill:[/bold] {skill['name']}")
+        self._console.print(f"[bold]Description:[/bold] {skill['description']}")
+        self._console.print("[bold]Instructions:[/bold]")
+        instructions = (
+            Markdown(skill["instructions"])
+            if self.markdown_enabled
+            else Text(skill["instructions"])
+        )
+        self._console.print(instructions)
+
     def show_tasks_simple(self, tasks: list[dict]) -> None:
         if not tasks:
             self._console.print("No unfinished tasks.")
@@ -1515,6 +1580,15 @@ class SubAgentDisplay(Display):
         pass
 
     def show_agents(self, rows: list[dict]) -> None:
+        pass
+
+    def show_skills_simple(self, skills: list[dict]) -> None:
+        pass
+
+    def show_skills_list(self, skills: list[dict]) -> None:
+        pass
+
+    def show_skill_info(self, skill: dict) -> None:
         pass
 
     def show_tasks_simple(self, tasks: list[dict]) -> None:

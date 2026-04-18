@@ -39,6 +39,7 @@ from ai_cli.cli.completer import (
 )
 from ai_cli.core.agent import Agent, AgentSpec
 from ai_cli.core.session_manager import SessionError
+from ai_cli.core.skill_registry import SkillRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
 
 try:
@@ -138,6 +139,10 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
         "/mcp allow|disallow [--persist] <server> [<tool>]",
         "Allow or disallow an MCP server or individual tool (hard gate)",
     ),
+    ("/skills", "List loaded skill names"),
+    ("/skills list", "List loaded skills with descriptions"),
+    ("/skills info <name>", "Show full details for a loaded skill"),
+    ("/skills reload", "Rescan skills and refresh runtime skill mappings"),
     ("/agents", "List configured agent types"),
     (
         "/plan [goal] [--autonomous]",
@@ -362,6 +367,7 @@ class REPL:
         agent_registry: AgentRegistry | None = None,
         task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
@@ -372,6 +378,9 @@ class REPL:
         self._agent_registry = agent_registry
         self._task_manager = task_manager
         self._mcp_manager = mcp_manager
+        self._skill_registry = (
+            skill_registry if skill_registry is not None else SkillRegistry({})
+        )
         # Orchestrator instance — created on first /plan and reused across calls.
         self._orchestrator: TaskOrchestrator | None = None
         # Maximum tool-call rounds per user turn — readable from config and
@@ -459,6 +468,7 @@ class REPL:
                     workspace=self._workspace,
                     task_manager=self._task_manager,
                     mcp_manager=self._mcp_manager,
+                    skill_registry_getter=lambda: self._skill_registry,
                     max_path_completions=max_completions,
                 ),
                 complete_while_typing=cwt,
@@ -566,6 +576,10 @@ class REPL:
             remainder = command[len(cmd) :].strip()
             self._handle_mcp_subcommand(remainder)
 
+        elif cmd == "skills":
+            remainder = command[len(cmd) :].strip()
+            self._handle_skills_subcommand(remainder)
+
         elif cmd == "agents":
             self._handle_agents_command()
 
@@ -586,6 +600,116 @@ class REPL:
             self._display.show_error(
                 f"Unknown command: /{cmd}. Type /help for a list of commands."
             )
+
+    # ------------------------------------------------------------------
+    # /skills subcommand handler
+    # ------------------------------------------------------------------
+
+    def _handle_skills_subcommand(self, remainder: str) -> None:
+        """Dispatch /skills [subcommand] [args]."""
+        try:
+            parts = shlex.split(remainder)
+        except ValueError as exc:
+            self._display.show_error(f"Could not parse /skills arguments: {exc}")
+            return
+
+        sub = parts[0].lower() if parts else ""
+
+        if not sub:
+            self._display.show_skills_simple(self._skill_rows())
+            return
+
+        if sub == "list":
+            if len(parts) != 1:
+                self._display.show_error("Usage: /skills list")
+                return
+            self._display.show_skills_list(self._skill_rows())
+            return
+
+        if sub == "info":
+            if len(parts) != 2:
+                self._display.show_error("Usage: /skills info <name>")
+                return
+            skill = self._skill_registry.get(parts[1])
+            if skill is None:
+                self._display.show_error(f"Unknown skill: '{parts[1]}'")
+                return
+            self._display.show_skill_info(
+                {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instructions": skill.instructions,
+                }
+            )
+            return
+
+        if sub == "reload":
+            if len(parts) != 1:
+                self._display.show_error("Usage: /skills reload")
+                return
+            self._reload_skills()
+            return
+
+        self._display.show_error(
+            f"Unknown /skills subcommand: '{sub}'. "
+            "Try /skills, /skills list, /skills info <name>, or /skills reload."
+        )
+
+    def _skill_rows(self) -> list[dict]:
+        rows = []
+        for name, spec in sorted(self._skill_registry.items()):
+            rows.append({"name": name, "description": spec.description})
+        return rows
+
+    def _reload_skills(self) -> None:
+        try:
+            skills = SkillRegistry.load(
+                self._workspace.root, global_dir=get_global_dir()
+            )
+            new_skills_tool = None
+            if skills.has_skills:
+                from ai_cli.tools.skills import SkillsTool
+
+                new_skills_tool = SkillsTool(
+                    skills,
+                    self._workspace,
+                    self._tool_registry.permission_manager,
+                )
+        except Exception as exc:
+            self._display.show_error(f"Failed to reload skills: {exc}")
+            return
+
+        old_skill_registry = self._skill_registry
+        old_skills_tool = self._tool_registry.get("skills")
+        read_file_tool = self._tool_registry.get("read_file")
+        set_skill_registry = None
+        if read_file_tool is not None:
+            set_skill_registry = getattr(read_file_tool, "set_skill_registry", None)
+
+        try:
+            self._skill_registry = skills
+            if callable(set_skill_registry):
+                set_skill_registry(skills if skills.has_skills else None)
+            self._tool_registry.unregister("skills")
+            if new_skills_tool is not None:
+                self._tool_registry.register_instance(new_skills_tool)
+        except Exception as exc:
+            self._skill_registry = old_skill_registry
+            if callable(set_skill_registry):
+                with contextlib.suppress(Exception):
+                    set_skill_registry(
+                        old_skill_registry if old_skill_registry.has_skills else None
+                    )
+            with contextlib.suppress(Exception):
+                self._tool_registry.unregister("skills")
+                if old_skills_tool is not None:
+                    self._tool_registry.register_instance(old_skills_tool)
+            self._display.show_error(f"Failed to reload skills: {exc}")
+            return
+
+        for warning in skills.warnings:
+            self._display.show_status(f"Warning: {warning}")
+        self._display.show_status(f"Skills reloaded: {len(skills)} skill(s) loaded.")
 
     # ------------------------------------------------------------------
     # /tools subcommand handler
