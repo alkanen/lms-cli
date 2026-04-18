@@ -10,9 +10,12 @@ import pytest
 from ai_cli.cli.completer import REPLCompleter
 from ai_cli.cli.repl import (
     _DEFAULT_MAX_TOOL_ROUNDS,
+    _MAX_SUGGESTION_CMD_LEN,
     _SLASH_COMMANDS,
     REPL,
     _build_keyboard_shortcuts,
+    _levenshtein_distance,
+    skill_aliases_for_registry,
 )
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
@@ -43,9 +46,24 @@ def _make_repl(
     task_manager=None,
     skill_registry=None,
 ) -> REPL:
+    if tool_registry is None:
+        effective_tool_registry = MagicMock()
+
+        def _tool_info(name: str):
+            if name == "skills":
+                return {
+                    "name": "skills",
+                    "enabled": True,
+                    "allowed": True,
+                }
+            return None
+
+        effective_tool_registry.tool_info.side_effect = _tool_info
+    else:
+        effective_tool_registry = tool_registry
     return REPL(
         session=session or MagicMock(),
-        tool_registry=tool_registry or MagicMock(),
+        tool_registry=effective_tool_registry,
         llm_client=llm or _make_llm(),
         display=display or MagicMock(),
         workspace=workspace or MagicMock(),
@@ -503,6 +521,104 @@ class TestREPLSlashCommands:
         rows = display.show_skills_simple.call_args[0][0]
         assert [row["name"] for row in rows] == ["grill-me", "planner"]
 
+    def test_skill_alias_invokes_llm_with_injected_message(self, tmp_path: Path):
+        repl = _make_repl(skill_registry=_make_skill_registry(tmp_path, ["planner"]))
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner draft a plan")
+
+        repl._send_to_llm.assert_called_once()
+        injected = repl._send_to_llm.call_args.args[0]
+        assert "Call the skills tool with name='planner'" in injected
+        assert "draft a plan" in injected
+
+    def test_skill_alias_without_trailing_text_still_invokes_skill(
+        self, tmp_path: Path
+    ):
+        repl = _make_repl(skill_registry=_make_skill_registry(tmp_path, ["planner"]))
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner")
+
+        repl._send_to_llm.assert_called_once()
+        injected = repl._send_to_llm.call_args.args[0]
+        assert "Call the skills tool with name='planner'" in injected
+        assert "User request:" not in injected
+
+    def test_skill_alias_preserves_multimodal_user_request(self, tmp_path: Path):
+        repl = _make_repl(skill_registry=_make_skill_registry(tmp_path, ["planner"]))
+        repl._send_to_llm = MagicMock()
+        repl._preprocess_at_references = MagicMock(
+            return_value=[
+                {"type": "text", "text": "describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                },
+            ]
+        )
+
+        repl._handle_slash_command("planner describe this @image.png")
+
+        repl._send_to_llm.assert_called_once()
+        payload = repl._send_to_llm.call_args.args[0]
+        assert isinstance(payload, list)
+        assert payload[0]["type"] == "text"
+        assert "Call the skills tool with name='planner'" in payload[0]["text"]
+        assert "User request:" in payload[0]["text"]
+        assert payload[1]["type"] == "text"
+        assert payload[2]["type"] == "image_url"
+
+    def test_skill_alias_collision_is_skipped_with_warning(self, tmp_path: Path):
+        registry = _make_skill_registry(tmp_path, ["help", "planner"])
+        aliases, warnings = skill_aliases_for_registry(registry)
+        assert aliases == {"planner": "planner"}
+        assert any(
+            "conflicts with an existing command" in warning for warning in warnings
+        )
+
+    def test_skill_alias_shows_error_when_skills_tool_disabled(self, tmp_path: Path):
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.tool_info.return_value = {
+            "name": "skills",
+            "enabled": False,
+            "allowed": True,
+        }
+        repl = _make_repl(
+            display=display,
+            tool_registry=tool_registry,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner do work")
+
+        repl._send_to_llm.assert_not_called()
+        display.show_error.assert_called_once()
+        assert "skills tool" in display.show_error.call_args[0][0]
+
+    def test_skill_alias_shows_error_when_skills_tool_disallowed(self, tmp_path: Path):
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.tool_info.return_value = {
+            "name": "skills",
+            "enabled": True,
+            "allowed": False,
+        }
+        repl = _make_repl(
+            display=display,
+            tool_registry=tool_registry,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner do work")
+
+        repl._send_to_llm.assert_not_called()
+        display.show_error.assert_called_once()
+        assert "skills tool" in display.show_error.call_args[0][0]
+
     def test_skills_list_calls_show_skills_list(self, tmp_path: Path):
         display = MagicMock()
         repl = _make_repl(
@@ -741,6 +857,55 @@ class TestREPLSlashCommands:
         display.show_error.assert_called_once()
         msg = display.show_error.call_args[0][0]
         assert "foobar" in msg
+
+    def test_unknown_command_suggests_builtin_command(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+
+        repl._handle_slash_command("hep")
+
+        msg = display.show_error.call_args[0][0]
+        assert "Did you mean /help?" in msg
+
+    def test_unknown_command_suggests_skill_alias(self, tmp_path: Path):
+        display = MagicMock()
+        repl = _make_repl(
+            display=display,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+
+        repl._handle_slash_command("plnner")
+
+        msg = display.show_error.call_args[0][0]
+        assert "Did you mean /planner?" in msg
+
+    def test_unknown_command_omits_suggestions_when_over_threshold(self):
+        display = MagicMock()
+        repl = _make_repl(display=display)
+
+        repl._handle_slash_command("wildlydifferent")
+
+        msg = display.show_error.call_args[0][0]
+        assert "Did you mean" not in msg
+
+
+class TestREPLHelpers:
+    def test_levenshtein_distance(self):
+        assert _levenshtein_distance("help", "hep") == 1
+        assert _levenshtein_distance("planner", "plnner") == 1
+
+    def test_levenshtein_distance_bails_when_over_max_distance(self):
+        assert _levenshtein_distance("help", "xxxxxxxx", max_distance=2) == 3
+
+    def test_suggestion_threshold_uses_twenty_percent_floor_of_two(self):
+        repl = _make_repl()
+        assert repl._suggest_slash_commands("hep") == ["help"]
+        assert repl._suggest_slash_commands("wildlydifferent") == []
+
+    def test_suggestion_skips_overly_long_command_tokens(self):
+        repl = _make_repl()
+        long_cmd = "x" * (_MAX_SUGGESTION_CMD_LEN + 1)
+        assert repl._suggest_slash_commands(long_cmd) == []
 
     def test_empty_command_shows_error(self):
         display = MagicMock()

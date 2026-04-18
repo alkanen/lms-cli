@@ -40,6 +40,7 @@ def _completer(
     workspace=None,
     task_manager=None,
     skill_registry=None,
+    skill_aliases=None,
 ) -> REPLCompleter:
     registry = None
     if tool_names is not None:
@@ -51,6 +52,7 @@ def _completer(
         workspace=workspace,
         task_manager=task_manager,
         skill_registry_getter=(lambda: skill_registry),
+        skill_aliases_getter=(lambda: skill_aliases or {}),
     )
 
 
@@ -145,6 +147,26 @@ class TestSlashTopLevel:
     def test_case_insensitive_mixed(self):
         result = _completions(_completer(), "/Ex")
         assert "/exit" in result
+
+    def test_skill_aliases_are_included_in_top_level_completion(self):
+        result = _completions(_completer(skill_aliases={"planner": "planner"}), "/pl")
+        assert result == ["/planner"]
+
+    def test_top_level_completion_falls_back_to_cached_aliases_on_getter_error(self):
+        alias_getter = MagicMock(return_value={"planner": "planner"})
+        c = REPLCompleter(
+            slash_commands=CMDS,
+            skill_aliases_getter=alias_getter,
+        )
+
+        first = _completions(c, "/pl")
+        assert first == ["/planner"]
+        assert alias_getter.call_count == 1
+
+        alias_getter.side_effect = RuntimeError("alias getter unavailable")
+        second = _completions(c, "/pl")
+        assert second == ["/planner"]
+        assert alias_getter.call_count == 2
 
 
 # ---------------------------------------------------------------------------
