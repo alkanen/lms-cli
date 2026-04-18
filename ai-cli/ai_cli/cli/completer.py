@@ -215,6 +215,12 @@ class REPLCompleter(Completer):
         self._max_path_completions = max_path_completions
         self._skill_names_cache_registry: SkillRegistry | None = None
         self._skill_names_cache: tuple[str, ...] | None = None
+        self._skill_aliases_cache_source: object | None = None
+        self._skill_aliases_cache: dict[str, str] | None = None
+        self._top_level_commands_cache_aliases: tuple[tuple[str, str], ...] | None = (
+            None
+        )
+        self._top_level_commands_cache: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------
     # Completer API
@@ -259,9 +265,7 @@ class REPLCompleter(Completer):
         # Still typing the top-level command word (no trailing space yet).
         if len(parts) == 1 and not text.endswith(" "):
             prefix = parts[0][1:].lower()  # strip "/" and normalise case
-            dynamic_commands = sorted(
-                set(self._slash_commands) | set(self._skill_aliases())
-            )
+            dynamic_commands = self._top_level_commands()
             for cmd in dynamic_commands:
                 if cmd.startswith(prefix):
                     yield Completion(
@@ -801,9 +805,36 @@ class REPLCompleter(Completer):
 
     def _skill_aliases(self) -> dict[str, str]:
         if self._skill_aliases_getter is None:
+            self._skill_aliases_cache_source = None
+            self._skill_aliases_cache = {}
             return {}
         try:
-            return dict(self._skill_aliases_getter())
+            aliases_obj = self._skill_aliases_getter()
         except Exception:
             logger.warning("Skill alias completion lookup failed", exc_info=True)
-            return {}
+            return dict(self._skill_aliases_cache or {})
+
+        if (
+            aliases_obj is self._skill_aliases_cache_source
+            and self._skill_aliases_cache is not None
+        ):
+            return dict(self._skill_aliases_cache)
+
+        aliases = dict(aliases_obj)
+        self._skill_aliases_cache_source = aliases_obj
+        self._skill_aliases_cache = aliases
+        return dict(aliases)
+
+    def _top_level_commands(self) -> tuple[str, ...]:
+        aliases = self._skill_aliases()
+        alias_signature = tuple(sorted(aliases.items()))
+        if (
+            alias_signature == self._top_level_commands_cache_aliases
+            and self._top_level_commands_cache is not None
+        ):
+            return self._top_level_commands_cache
+
+        commands = tuple(sorted(set(self._slash_commands) | set(aliases)))
+        self._top_level_commands_cache_aliases = alias_signature
+        self._top_level_commands_cache = commands
+        return commands

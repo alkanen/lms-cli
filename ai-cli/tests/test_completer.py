@@ -152,6 +152,20 @@ class TestSlashTopLevel:
         result = _completions(_completer(skill_aliases={"planner": "planner"}), "/pl")
         assert result == ["/planner"]
 
+    def test_top_level_completion_reuses_cached_alias_union(self):
+        alias_getter = MagicMock(return_value={"planner": "planner"})
+        c = REPLCompleter(
+            slash_commands=CMDS,
+            skill_aliases_getter=alias_getter,
+        )
+
+        first = _completions(c, "/pl")
+        assert first == ["/planner"]
+
+        alias_getter.side_effect = RuntimeError("should not be called again")
+        second = _completions(c, "/pl")
+        assert second == ["/planner"]
+
 
 # ---------------------------------------------------------------------------
 # /tools subcommands
