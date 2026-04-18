@@ -524,6 +524,7 @@ class TestREPLSlashCommands:
 
         repl._handle_slash_command("planner")
 
+        repl._send_to_llm.assert_called_once()
         injected = repl._send_to_llm.call_args.args[0]
         assert "Call the skills tool with name='planner'" in injected
         assert "User request:" not in injected
@@ -543,6 +544,7 @@ class TestREPLSlashCommands:
 
         repl._handle_slash_command("planner describe this @image.png")
 
+        repl._send_to_llm.assert_called_once()
         payload = repl._send_to_llm.call_args.args[0]
         assert isinstance(payload, list)
         assert payload[0]["type"] == "text"
