@@ -48,11 +48,17 @@ def _make_repl(
 ) -> REPL:
     if tool_registry is None:
         effective_tool_registry = MagicMock()
-        effective_tool_registry.tool_info.return_value = {
-            "name": "skills",
-            "enabled": True,
-            "allowed": True,
-        }
+
+        def _tool_info(name: str):
+            if name == "skills":
+                return {
+                    "name": "skills",
+                    "enabled": True,
+                    "allowed": True,
+                }
+            return None
+
+        effective_tool_registry.tool_info.side_effect = _tool_info
     else:
         effective_tool_registry = tool_registry
     return REPL(
