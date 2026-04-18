@@ -419,9 +419,7 @@ class REPL:
         self._skill_registry = (
             skill_registry if skill_registry is not None else SkillRegistry({})
         )
-        self._skill_aliases, self._skill_alias_warnings = skill_aliases_for_registry(
-            self._skill_registry
-        )
+        self._skill_aliases, _ = skill_aliases_for_registry(self._skill_registry)
         # Orchestrator instance — created on first /plan and reused across calls.
         self._orchestrator: TaskOrchestrator | None = None
         # Maximum tool-call rounds per user turn — readable from config and
@@ -782,7 +780,6 @@ class REPL:
 
         old_skill_registry = self._skill_registry
         old_skill_aliases = self._skill_aliases
-        old_skill_alias_warnings = self._skill_alias_warnings
         old_skills_tool = self._tool_registry.get("skills")
         read_file_tool = self._tool_registry.get("read_file")
         set_skill_registry = None
@@ -792,7 +789,6 @@ class REPL:
         try:
             self._skill_registry = skills
             self._skill_aliases = aliases
-            self._skill_alias_warnings = alias_warnings
             if callable(set_skill_registry):
                 set_skill_registry(skills if skills.has_skills else None)
             self._tool_registry.unregister("skills")
@@ -801,7 +797,6 @@ class REPL:
         except Exception as exc:
             self._skill_registry = old_skill_registry
             self._skill_aliases = old_skill_aliases
-            self._skill_alias_warnings = old_skill_alias_warnings
             if callable(set_skill_registry):
                 with contextlib.suppress(Exception):
                     set_skill_registry(
