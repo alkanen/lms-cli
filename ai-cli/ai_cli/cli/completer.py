@@ -180,6 +180,11 @@ class REPLCompleter(Completer):
     skill_registry_getter:
         Callable returning the current SkillRegistry for ``/skills info``
         completions. Queried lazily so completions reflect runtime reloads.
+    skill_aliases_getter:
+        Callable returning the current mapping of slash alias -> skill name.
+        Used for top-level slash completion so loaded skill aliases appear
+        alongside built-in commands. Queried lazily so completions reflect
+        runtime skill reloads and alias collision handling.
     max_path_completions:
         Maximum number of ``@path`` completions returned per keystroke.
         Defaults to :data:`DEFAULT_MAX_PATH_COMPLETIONS`.
