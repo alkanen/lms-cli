@@ -673,6 +673,18 @@ class REPL:
 
     def _invoke_skill_alias(self, skill_name: str, remainder: str) -> None:
         """Inject a user message that instructs the model to load and apply a skill."""
+        skills_tool_info = self._tool_registry.tool_info("skills")
+        if not isinstance(skills_tool_info, dict):
+            self._display.show_error(
+                "Skill aliases require the skills tool to be enabled and allowed."
+            )
+            return
+        if not (skills_tool_info.get("enabled") and skills_tool_info.get("allowed")):
+            self._display.show_error(
+                "Skill aliases require the skills tool to be enabled and allowed."
+            )
+            return
+
         user_request: str | list[dict] = remainder
         if remainder:
             processed = self._preprocess_at_references(remainder)

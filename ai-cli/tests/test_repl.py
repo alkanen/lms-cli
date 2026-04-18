@@ -46,9 +46,18 @@ def _make_repl(
     task_manager=None,
     skill_registry=None,
 ) -> REPL:
+    if tool_registry is None:
+        effective_tool_registry = MagicMock()
+        effective_tool_registry.tool_info.return_value = {
+            "name": "skills",
+            "enabled": True,
+            "allowed": True,
+        }
+    else:
+        effective_tool_registry = tool_registry
     return REPL(
         session=session or MagicMock(),
-        tool_registry=tool_registry or MagicMock(),
+        tool_registry=effective_tool_registry,
         llm_client=llm or _make_llm(),
         display=display or MagicMock(),
         workspace=workspace or MagicMock(),
@@ -561,6 +570,48 @@ class TestREPLSlashCommands:
         assert any(
             "conflicts with an existing command" in warning for warning in warnings
         )
+
+    def test_skill_alias_shows_error_when_skills_tool_disabled(self, tmp_path: Path):
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.tool_info.return_value = {
+            "name": "skills",
+            "enabled": False,
+            "allowed": True,
+        }
+        repl = _make_repl(
+            display=display,
+            tool_registry=tool_registry,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner do work")
+
+        repl._send_to_llm.assert_not_called()
+        display.show_error.assert_called_once()
+        assert "skills tool" in display.show_error.call_args[0][0]
+
+    def test_skill_alias_shows_error_when_skills_tool_disallowed(self, tmp_path: Path):
+        display = MagicMock()
+        tool_registry = MagicMock()
+        tool_registry.tool_info.return_value = {
+            "name": "skills",
+            "enabled": True,
+            "allowed": False,
+        }
+        repl = _make_repl(
+            display=display,
+            tool_registry=tool_registry,
+            skill_registry=_make_skill_registry(tmp_path, ["planner"]),
+        )
+        repl._send_to_llm = MagicMock()
+
+        repl._handle_slash_command("planner do work")
+
+        repl._send_to_llm.assert_not_called()
+        display.show_error.assert_called_once()
+        assert "skills tool" in display.show_error.call_args[0][0]
 
     def test_skills_list_calls_show_skills_list(self, tmp_path: Path):
         display = MagicMock()
