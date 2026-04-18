@@ -180,6 +180,11 @@ class REPLCompleter(Completer):
     skill_registry_getter:
         Callable returning the current SkillRegistry for ``/skills info``
         completions. Queried lazily so completions reflect runtime reloads.
+    skill_aliases_getter:
+        Callable returning the current mapping of slash alias -> skill name.
+        Used for top-level slash completion so loaded skill aliases appear
+        alongside built-in commands. Queried lazily so completions reflect
+        runtime skill reloads and alias collision handling.
     max_path_completions:
         Maximum number of ``@path`` completions returned per keystroke.
         Defaults to :data:`DEFAULT_MAX_PATH_COMPLETIONS`.
@@ -193,6 +198,7 @@ class REPLCompleter(Completer):
         task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
         skill_registry_getter: Callable[[], SkillRegistry | None] | None = None,
+        skill_aliases_getter: Callable[[], dict[str, str]] | None = None,
         max_path_completions: int = DEFAULT_MAX_PATH_COMPLETIONS,
     ) -> None:
         if max_path_completions < 1:
@@ -205,9 +211,14 @@ class REPLCompleter(Completer):
         self._task_manager = task_manager
         self._mcp_manager = mcp_manager
         self._skill_registry_getter = skill_registry_getter
+        self._skill_aliases_getter = skill_aliases_getter
         self._max_path_completions = max_path_completions
         self._skill_names_cache_registry: SkillRegistry | None = None
         self._skill_names_cache: tuple[str, ...] | None = None
+        self._skill_aliases_cache_source: object | None = None
+        self._skill_aliases_cache: dict[str, str] | None = None
+        self._top_level_commands_cache_aliases: tuple[str, ...] | None = None
+        self._top_level_commands_cache: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------
     # Completer API
@@ -252,7 +263,8 @@ class REPLCompleter(Completer):
         # Still typing the top-level command word (no trailing space yet).
         if len(parts) == 1 and not text.endswith(" "):
             prefix = parts[0][1:].lower()  # strip "/" and normalise case
-            for cmd in self._slash_commands:
+            dynamic_commands = self._top_level_commands()
+            for cmd in dynamic_commands:
                 if cmd.startswith(prefix):
                     yield Completion(
                         "/" + cmd,
@@ -788,3 +800,39 @@ class REPLCompleter(Completer):
         self._skill_names_cache_registry = registry
         self._skill_names_cache = names
         return list(names)
+
+    def _skill_aliases(self) -> dict[str, str]:
+        if self._skill_aliases_getter is None:
+            self._skill_aliases_cache_source = None
+            self._skill_aliases_cache = {}
+            return {}
+        try:
+            aliases_obj = self._skill_aliases_getter()
+        except Exception:
+            logger.warning("Skill alias completion lookup failed", exc_info=True)
+            return dict(self._skill_aliases_cache or {})
+
+        if (
+            aliases_obj is self._skill_aliases_cache_source
+            and self._skill_aliases_cache is not None
+        ):
+            return dict(self._skill_aliases_cache)
+
+        aliases = dict(aliases_obj)
+        self._skill_aliases_cache_source = aliases_obj
+        self._skill_aliases_cache = aliases
+        return dict(aliases)
+
+    def _top_level_commands(self) -> tuple[str, ...]:
+        aliases = self._skill_aliases()
+        alias_signature = tuple(sorted(aliases.keys()))
+        if (
+            alias_signature == self._top_level_commands_cache_aliases
+            and self._top_level_commands_cache is not None
+        ):
+            return self._top_level_commands_cache
+
+        commands = tuple(sorted(set(self._slash_commands) | set(aliases)))
+        self._top_level_commands_cache_aliases = alias_signature
+        self._top_level_commands_cache = commands
+        return commands

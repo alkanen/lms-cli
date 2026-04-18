@@ -12,6 +12,7 @@ import base64
 import contextlib
 import io
 import logging
+import math
 import os
 import re
 import select
@@ -185,6 +186,59 @@ def _build_keyboard_shortcuts(*, enable_suspend: bool) -> list[tuple[str, str]]:
 _SLASH_COMMAND_NAMES: list[str] = list(
     dict.fromkeys(cmd.lstrip("/").split()[0] for cmd, _ in _SLASH_COMMANDS)
 )
+
+# Hard cap for unknown-command suggestion input length. Suggestions are UI sugar,
+# so we skip edit-distance work for unusually long slash tokens.
+_MAX_SUGGESTION_CMD_LEN = 128
+
+
+def skill_aliases_for_registry(
+    registry: SkillRegistry,
+) -> tuple[dict[str, str], list[str]]:
+    """Return direct slash aliases for skills plus any collision warnings."""
+    aliases: dict[str, str] = {}
+    warnings: list[str] = []
+    reserved = set(_SLASH_COMMAND_NAMES)
+    for name in sorted(registry.names()):
+        if name in reserved:
+            warnings.append(
+                f"Skill '{name}': slash alias '/{name}' conflicts with an existing command and was skipped."
+            )
+            continue
+        aliases[name] = name
+    return aliases, warnings
+
+
+def _levenshtein_distance(
+    left: str,
+    right: str,
+    *,
+    max_distance: int | None = None,
+) -> int:
+    """Compute Levenshtein edit distance between two short command names."""
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    if max_distance is not None and abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (left_char != right_char)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        if max_distance is not None and min(current) > max_distance:
+            return max_distance + 1
+        previous = current
+    distance = previous[-1]
+    if max_distance is not None and distance > max_distance:
+        return max_distance + 1
+    return distance
 
 
 class _AbortMonitor:
@@ -381,6 +435,7 @@ class REPL:
         self._skill_registry = (
             skill_registry if skill_registry is not None else SkillRegistry({})
         )
+        self._skill_aliases, _ = skill_aliases_for_registry(self._skill_registry)
         # Orchestrator instance — created on first /plan and reused across calls.
         self._orchestrator: TaskOrchestrator | None = None
         # Maximum tool-call rounds per user turn — readable from config and
@@ -469,6 +524,7 @@ class REPL:
                     task_manager=self._task_manager,
                     mcp_manager=self._mcp_manager,
                     skill_registry_getter=lambda: self._skill_registry,
+                    skill_aliases_getter=lambda: self._skill_aliases,
                     max_path_completions=max_completions,
                 ),
                 complete_while_typing=cwt,
@@ -509,6 +565,12 @@ class REPL:
 
     def _handle_slash_command(self, command: str) -> None:
         cmd = command.split()[0].lower() if command.strip() else ""
+
+        skill_name = self._skill_aliases.get(cmd)
+        if skill_name is not None:
+            remainder = command[len(cmd) :].strip()
+            self._invoke_skill_alias(skill_name, remainder)
+            return
 
         if cmd == "help":
             repl_cfg = self._config.get("repl_behavior", {}) if self._config else {}
@@ -597,9 +659,75 @@ class REPL:
             )
 
         else:
+            suggestions = self._suggest_slash_commands(cmd)
+            suggestion_text = ""
+            if suggestions:
+                if len(suggestions) == 1:
+                    suggestion_text = f" Did you mean /{suggestions[0]}?"
+                else:
+                    joined = ", ".join(f"/{name}" for name in suggestions)
+                    suggestion_text = f" Did you mean one of: {joined}?"
             self._display.show_error(
-                f"Unknown command: /{cmd}. Type /help for a list of commands."
+                f"Unknown command: /{cmd}.{suggestion_text} Type /help for a list of commands."
             )
+
+    def _invoke_skill_alias(self, skill_name: str, remainder: str) -> None:
+        """Inject a user message that instructs the model to load and apply a skill."""
+        skills_tool_info = self._tool_registry.tool_info("skills")
+        if not isinstance(skills_tool_info, dict):
+            self._display.show_error(
+                "Skill aliases require the skills tool to be enabled and allowed."
+            )
+            return
+        if not (skills_tool_info.get("enabled") and skills_tool_info.get("allowed")):
+            self._display.show_error(
+                "Skill aliases require the skills tool to be enabled and allowed."
+            )
+            return
+
+        user_request: str | list[dict] = remainder
+        if remainder:
+            processed = self._preprocess_at_references(remainder)
+            if processed is None:
+                return
+            user_request = processed
+
+        injected = (
+            f"Use the skill named '{skill_name}' for this request. "
+            f"Call the skills tool with name='{skill_name}' before responding, then follow that skill's instructions."
+        )
+        if isinstance(user_request, list):
+            blocks = [{"type": "text", "text": injected}]  # regular user message
+            if user_request:
+                blocks[0]["text"] += "\n\nUser request:"
+                blocks.extend(user_request)
+            self._send_to_llm(blocks)
+            return
+
+        if user_request:
+            injected += f"\n\nUser request:\n{user_request}"
+        self._send_to_llm(injected)
+
+    def _suggest_slash_commands(self, cmd: str) -> list[str]:
+        """Return the closest slash commands/aliases under the configured threshold."""
+        if not cmd:
+            return []
+        if len(cmd) > _MAX_SUGGESTION_CMD_LEN:
+            return []
+        candidates = sorted(set(_SLASH_COMMAND_NAMES) | set(self._skill_aliases))
+        threshold = max(2, math.ceil(len(cmd) * 0.2))
+        matches: list[tuple[int, str]] = []
+        for candidate in candidates:
+            distance = _levenshtein_distance(cmd, candidate, max_distance=threshold)
+            if distance <= threshold:
+                matches.append((distance, candidate))
+        if not matches:
+            return []
+        matches.sort(key=lambda item: (item[0], item[1]))
+        best_distance = matches[0][0]
+        return [
+            candidate for distance, candidate in matches if distance == best_distance
+        ][:3]
 
     # ------------------------------------------------------------------
     # /skills subcommand handler
@@ -666,6 +794,7 @@ class REPL:
             skills = SkillRegistry.load(
                 self._workspace.root, global_dir=get_global_dir()
             )
+            aliases, alias_warnings = skill_aliases_for_registry(skills)
             new_skills_tool = None
             if skills.has_skills:
                 from ai_cli.tools.skills import SkillsTool
@@ -680,6 +809,7 @@ class REPL:
             return
 
         old_skill_registry = self._skill_registry
+        old_skill_aliases = self._skill_aliases
         old_skills_tool = self._tool_registry.get("skills")
         read_file_tool = self._tool_registry.get("read_file")
         set_skill_registry = None
@@ -688,6 +818,7 @@ class REPL:
 
         try:
             self._skill_registry = skills
+            self._skill_aliases = aliases
             if callable(set_skill_registry):
                 set_skill_registry(skills if skills.has_skills else None)
             self._tool_registry.unregister("skills")
@@ -695,6 +826,7 @@ class REPL:
                 self._tool_registry.register_instance(new_skills_tool)
         except Exception as exc:
             self._skill_registry = old_skill_registry
+            self._skill_aliases = old_skill_aliases
             if callable(set_skill_registry):
                 with contextlib.suppress(Exception):
                     set_skill_registry(
@@ -708,6 +840,8 @@ class REPL:
             return
 
         for warning in skills.warnings:
+            self._display.show_status(f"Warning: {warning}")
+        for warning in alias_warnings:
             self._display.show_status(f"Warning: {warning}")
         self._display.show_status(f"Skills reloaded: {len(skills)} skill(s) loaded.")
 
