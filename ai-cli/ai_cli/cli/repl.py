@@ -188,7 +188,7 @@ _SLASH_COMMAND_NAMES: list[str] = list(
 )
 
 
-def _skill_aliases_for_registry(
+def skill_aliases_for_registry(
     registry: SkillRegistry,
 ) -> tuple[dict[str, str], list[str]]:
     """Return direct slash aliases for skills plus any collision warnings."""
@@ -419,7 +419,7 @@ class REPL:
         self._skill_registry = (
             skill_registry if skill_registry is not None else SkillRegistry({})
         )
-        self._skill_aliases, self._skill_alias_warnings = _skill_aliases_for_registry(
+        self._skill_aliases, self._skill_alias_warnings = skill_aliases_for_registry(
             self._skill_registry
         )
         # Orchestrator instance — created on first /plan and reused across calls.
@@ -766,7 +766,7 @@ class REPL:
             skills = SkillRegistry.load(
                 self._workspace.root, global_dir=get_global_dir()
             )
-            aliases, alias_warnings = _skill_aliases_for_registry(skills)
+            aliases, alias_warnings = skill_aliases_for_registry(skills)
             new_skills_tool = None
             if skills.has_skills:
                 from ai_cli.tools.skills import SkillsTool

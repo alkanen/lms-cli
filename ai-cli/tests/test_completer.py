@@ -161,10 +161,12 @@ class TestSlashTopLevel:
 
         first = _completions(c, "/pl")
         assert first == ["/planner"]
+        assert alias_getter.call_count == 1
 
         alias_getter.side_effect = RuntimeError("should not be called again")
         second = _completions(c, "/pl")
         assert second == ["/planner"]
+        assert alias_getter.call_count == 2
 
 
 # ---------------------------------------------------------------------------

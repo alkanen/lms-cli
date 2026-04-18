@@ -14,7 +14,7 @@ from ai_cli.cli.repl import (
     REPL,
     _build_keyboard_shortcuts,
     _levenshtein_distance,
-    _skill_aliases_for_registry,
+    skill_aliases_for_registry,
 )
 from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import Session, SessionError
@@ -553,7 +553,7 @@ class TestREPLSlashCommands:
 
     def test_skill_alias_collision_is_skipped_with_warning(self, tmp_path: Path):
         registry = _make_skill_registry(tmp_path, ["help", "planner"])
-        aliases, warnings = _skill_aliases_for_registry(registry)
+        aliases, warnings = skill_aliases_for_registry(registry)
         assert aliases == {"planner": "planner"}
         assert any(
             "conflicts with an existing command" in warning for warning in warnings

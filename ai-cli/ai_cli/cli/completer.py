@@ -217,9 +217,7 @@ class REPLCompleter(Completer):
         self._skill_names_cache: tuple[str, ...] | None = None
         self._skill_aliases_cache_source: object | None = None
         self._skill_aliases_cache: dict[str, str] | None = None
-        self._top_level_commands_cache_aliases: tuple[tuple[str, str], ...] | None = (
-            None
-        )
+        self._top_level_commands_cache_aliases: tuple[str, ...] | None = None
         self._top_level_commands_cache: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------
@@ -827,7 +825,7 @@ class REPLCompleter(Completer):
 
     def _top_level_commands(self) -> tuple[str, ...]:
         aliases = self._skill_aliases()
-        alias_signature = tuple(sorted(aliases.items()))
+        alias_signature = tuple(sorted(aliases.keys()))
         if (
             alias_signature == self._top_level_commands_cache_aliases
             and self._top_level_commands_cache is not None
