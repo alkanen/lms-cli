@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     from ai_cli.core.llm_client import LLMClient
     from ai_cli.core.mcp_manager import MCPManager
     from ai_cli.core.session_manager import Session
+    from ai_cli.core.skill_registry import SkillRegistry as _SkillRegistry
     from ai_cli.core.task_manager import TaskManager
     from ai_cli.core.task_orchestrator import TaskOrchestrator
     from ai_cli.core.tool_registry import ToolRegistry
@@ -422,6 +424,7 @@ class REPL:
         task_manager: TaskManager | None = None,
         mcp_manager: MCPManager | None = None,
         skill_registry: SkillRegistry | None = None,
+        system_prompt_builder: Callable[[_SkillRegistry], str] | None = None,
     ) -> None:
         self._session = session
         self._tool_registry = tool_registry
@@ -435,6 +438,7 @@ class REPL:
         self._skill_registry = (
             skill_registry if skill_registry is not None else SkillRegistry({})
         )
+        self._system_prompt_builder = system_prompt_builder
         self._skill_aliases, _ = skill_aliases_for_registry(self._skill_registry)
         # Orchestrator instance — created on first /plan and reused across calls.
         self._orchestrator: TaskOrchestrator | None = None
@@ -816,7 +820,13 @@ class REPL:
         if read_file_tool is not None:
             set_skill_registry = getattr(read_file_tool, "set_skill_registry", None)
 
+        old_system_prompt: str | None = None
         try:
+            current_messages = self._session.get_messages()
+            if current_messages and current_messages[0].get("role") == "system":
+                current_system_prompt = current_messages[0].get("content")
+                if isinstance(current_system_prompt, str):
+                    old_system_prompt = current_system_prompt
             self._skill_registry = skills
             self._skill_aliases = aliases
             if callable(set_skill_registry):
@@ -824,6 +834,8 @@ class REPL:
             self._tool_registry.unregister("skills")
             if new_skills_tool is not None:
                 self._tool_registry.register_instance(new_skills_tool)
+            if self._system_prompt_builder is not None:
+                self._session.set_system_message(self._system_prompt_builder(skills))
         except Exception as exc:
             self._skill_registry = old_skill_registry
             self._skill_aliases = old_skill_aliases
@@ -836,6 +848,12 @@ class REPL:
                 self._tool_registry.unregister("skills")
                 if old_skills_tool is not None:
                     self._tool_registry.register_instance(old_skills_tool)
+            if (
+                self._system_prompt_builder is not None
+                and old_system_prompt is not None
+            ):
+                with contextlib.suppress(Exception):
+                    self._session.set_system_message(old_system_prompt)
             self._display.show_error(f"Failed to reload skills: {exc}")
             return
 

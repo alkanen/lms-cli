@@ -417,6 +417,41 @@ def load_system_prompt(workspace_root: Path, global_dir: Path) -> str:
     return ""
 
 
+def compose_system_prompt(base_prompt: str, skills: SkillRegistry) -> str:
+    """Return the active session system prompt with optional skills guidance."""
+    base = base_prompt.strip()
+    if not skills.has_skills:
+        return base
+
+    skill_rows = [
+        f"- {name}: {spec.description}" for name, spec in sorted(skills.items())
+    ]
+    skills_section = "\n".join(
+        [
+            "## Skills",
+            "",
+            "When a task matches one of the skills below, call the `skills` tool before taking action.",
+            "Use exactly one skill at a time.",
+            "",
+            "`skills(name)` behavior:",
+            "- Input: canonical skill name (exact match).",
+            "- Result envelope: top-level `status` (`success` or `error`) and `data`.",
+            "- Success data fields: `data.name`, `data.description`, `data.instructions`, `data.base_dir`.",
+            "- Not-found data fields: `data.found=false`, `data.requested_name`, `data.available_skills`.",
+            "",
+            "For any file reads driven by skill instructions, call `read_file` with the returned `data.base_dir`.",
+            "`read_file` enforces that paths resolve inside `data.base_dir`.",
+            "",
+            "Available skills:",
+            *skill_rows,
+        ]
+    )
+
+    if not base:
+        return skills_section
+    return f"{base}\n\n{skills_section}"
+
+
 def _cmd_repl(
     start: Path,
     global_dir: Path,
@@ -470,14 +505,6 @@ def _cmd_repl(
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve and apply the system prompt before the first LLM call.
-    system_prompt = load_system_prompt(root, global_dir)
-    if system_prompt:
-        session.set_system_message(system_prompt)
-        logger.debug("System prompt loaded (%d chars).", len(system_prompt))
-    else:
-        logger.debug("No system prompt found; omitting system message.")
-
     # Set up logging before tool loading so all subsequent activity is captured.
     setup_logging(config, session.session_dir)
     tool_registry.load()
@@ -500,6 +527,18 @@ def _cmd_repl(
     for warning in alias_warnings:
         print(f"Warning: {warning}", file=sys.stderr)
     _wire_skills(skills, tool_registry, workspace, permission_manager)
+
+    def _build_active_system_prompt(current_skills: SkillRegistry) -> str:
+        base_prompt = load_system_prompt(root, global_dir)
+        return compose_system_prompt(base_prompt, current_skills)
+
+    # Resolve and apply the active session system prompt before the first LLM call.
+    system_prompt = _build_active_system_prompt(skills)
+    if system_prompt:
+        session.set_system_message(system_prompt)
+        logger.debug("System prompt loaded (%d chars).", len(system_prompt))
+    else:
+        logger.debug("No system prompt found; omitting system message.")
 
     # Wire up call_agent tool if any agent specs are configured.
     agent_registry = AgentRegistry(load_agent_specs(config), parent_display=ui)
@@ -526,6 +565,7 @@ def _cmd_repl(
         task_manager=task_manager,
         mcp_manager=mcp_manager,
         skill_registry=skills,
+        system_prompt_builder=_build_active_system_prompt,
     )
     try:
         repl.run()
