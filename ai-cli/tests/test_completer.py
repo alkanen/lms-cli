@@ -330,6 +330,41 @@ class TestSkillsSubcommands:
         assert set(first) == {"grill-me", "planner"}
         assert second == first
 
+    def test_skills_info_refreshes_when_registry_instance_changes(self):
+        old_registry = _skill_registry(["planner"])
+        new_registry = _skill_registry(["reviewer"])
+
+        current = {"registry": old_registry}
+        completer = REPLCompleter(
+            slash_commands=CMDS,
+            skill_registry_getter=lambda: current["registry"],
+        )
+
+        before = _completions(completer, "/skills info ")
+        assert before == ["planner"]
+
+        current["registry"] = new_registry
+        after = _completions(completer, "/skills info ")
+        assert after == ["reviewer"]
+
+    def test_top_level_alias_completion_refreshes_when_aliases_change(self):
+        aliases = {"planner": "planner"}
+        completer = REPLCompleter(
+            slash_commands=CMDS,
+            skill_aliases_getter=lambda: aliases,
+        )
+
+        before = _completions(completer, "/pl")
+        assert before == ["/planner"]
+
+        aliases.clear()
+        aliases["reviewer"] = "reviewer"
+
+        old = _completions(completer, "/pl")
+        new = _completions(completer, "/re")
+        assert old == []
+        assert new == ["/reviewer"]
+
 
 # ---------------------------------------------------------------------------
 # /tasks
