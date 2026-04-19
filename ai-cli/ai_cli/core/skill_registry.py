@@ -136,7 +136,10 @@ class _SkillLoader:
 
     def _skip(self, path: Path, reason: str) -> None:
         self.skipped.append(SkippedSkill(path=path, reason=reason))
-        self._warn(f"Skill '{path.name}' skipped: {reason}")
+        self._warn(
+            f"Skill '{path.name}' skipped: {reason}. "
+            "Fix the skill directory contents and run '/skills reload' (or restart ai-cli)."
+        )
 
     def load_scope(self, scope: str, skills_dir: Path | None) -> None:
         if skills_dir is None or not skills_dir.is_dir():
@@ -204,7 +207,8 @@ class _SkillLoader:
 
         if canonical_name != skill_dir.name:
             self._warn(
-                f"Skill '{skill_dir.name}': folder name differs from frontmatter name '{canonical_name}'"
+                f"Skill '{skill_dir.name}': folder name differs from frontmatter name '{canonical_name}'. "
+                "Rename the folder or update frontmatter field 'name' to keep references predictable."
             )
 
         spec = SkillSpec(
@@ -222,7 +226,8 @@ class _SkillLoader:
 
         if scope == "project" and existing.scope == "global":
             self._warn(
-                f"Skill '{canonical_name}': project scope overrides global definition"
+                f"Skill '{canonical_name}': project scope overrides global definition. "
+                "Remove one definition if this override is unintended."
             )
             self.skills[canonical_name] = spec
             return
