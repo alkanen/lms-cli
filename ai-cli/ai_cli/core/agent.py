@@ -71,6 +71,9 @@ class AgentSpec:
     # agents running different models (or even different servers) can have
     # accurate threshold checks without needing a separate backend entry.
     context_window: int | None = None
+    # Optional allow-list for the `skills` tool. None means unrestricted
+    # (all loaded skills available). An empty list means no skills allowed.
+    skills: list[str] | None = None
 
 
 @dataclass
@@ -825,7 +828,9 @@ def build_agent_tool_registry(
     in-memory to the freshly registered instances (no config writes).
     """
     from ai_cli.core.permission_manager import PermissionManager
+    from ai_cli.core.skill_registry import SkillRegistry
     from ai_cli.core.tool_registry import ToolRegistry
+    from ai_cli.tools.skills import SkillsTool
 
     logger.info(
         "Agent '%s': building scoped tool registry from %d declared tools",
@@ -855,7 +860,35 @@ def build_agent_tool_registry(
             continue
         tool_cls = type(tool_instance)
         try:
-            if getattr(tool_cls, "REGISTER_VIA_INSTANCE", False):
+            if isinstance(tool_instance, SkillsTool):
+                source_registry = getattr(tool_instance, "_skills", None)
+                if not isinstance(source_registry, SkillRegistry):
+                    logger.warning(
+                        "Agent '%s': cannot clone skills tool (missing source SkillRegistry) — skipped",
+                        spec.name,
+                    )
+                    continue
+
+                if spec.skills is None:
+                    scoped_skills = SkillRegistry(source_registry.skills)
+                else:
+                    scoped_specs: dict = {}
+                    for configured in spec.skills:
+                        matched = source_registry.get(configured)
+                        if matched is None:
+                            logger.warning(
+                                "Agent '%s': configured skill '%s' is not loaded — skipped",
+                                spec.name,
+                                configured,
+                            )
+                            continue
+                        scoped_specs[matched.name] = matched
+                    scoped_skills = SkillRegistry(scoped_specs)
+
+                registry.register_instance(
+                    SkillsTool(scoped_skills, workspace, permission_manager)
+                )
+            elif getattr(tool_cls, "REGISTER_VIA_INSTANCE", False):
                 # Tools with REGISTER_VIA_INSTANCE = True have non-standard
                 # constructors (e.g. they require a TaskManager or other
                 # context injected at construction time) and cannot be re-

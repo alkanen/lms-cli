@@ -93,6 +93,11 @@ class TestParseAgentSpec:
         assert spec.model == "default-model"
         assert spec.max_tool_rounds == 20
 
+    def test_skills_trim_and_dedupe(self):
+        raw = {**_MINIMAL, "skills": [" planner ", "review", "planner", ""]}
+        spec = _parse_agent_spec("x", raw, {})
+        assert spec.skills == ["planner", "review"]
+
     def test_agent_overrides_defaults(self):
         defaults = {"model": "default-model", "max_tool_rounds": 20}
         raw = {**_MINIMAL, "max_tool_rounds": 5}
@@ -213,6 +218,16 @@ class TestParseAgentSpec:
         with pytest.raises(ValueError, match="must be a boolean"):
             _parse_agent_spec("bad", raw, {})
 
+    def test_skills_not_list(self):
+        raw = {**_MINIMAL, "skills": "planner"}
+        with pytest.raises(ValueError, match="'skills' must be a list of strings"):
+            _parse_agent_spec("bad", raw, {})
+
+    def test_skills_non_string_entries(self):
+        raw = {**_MINIMAL, "skills": ["planner", 1]}
+        with pytest.raises(ValueError, match="'skills' must be a list of strings"):
+            _parse_agent_spec("bad", raw, {})
+
     def test_backend_not_dict(self):
         raw = {**_MINIMAL, "backend": "http://example.com"}
         with pytest.raises(ValueError, match="'backend' must be a mapping"):
@@ -308,6 +323,50 @@ agents:
         cm = _make_config(project, yaml_text)
         specs = load_agent_specs(cm)
         assert specs["explore"].max_tool_rounds == 5
+
+    def test_agent_defaults_skills_applied(self, project):
+        yaml_text = """\
+agent_defaults:
+  skills: [planner, reviewer]
+agents:
+  explore:
+    system_message: "Search."
+    tools: [read_file, skills]
+    model: m1
+"""
+        cm = _make_config(project, yaml_text)
+        specs = load_agent_specs(cm)
+        assert specs["explore"].skills == ["planner", "reviewer"]
+
+    def test_agent_skills_override_defaults_replace(self, project):
+        yaml_text = """\
+agent_defaults:
+  skills: [planner, reviewer]
+agents:
+  explore:
+    system_message: "Search."
+    tools: [read_file, skills]
+    model: m1
+    skills: [writer]
+"""
+        cm = _make_config(project, yaml_text)
+        specs = load_agent_specs(cm)
+        assert specs["explore"].skills == ["writer"]
+
+    def test_agent_skills_empty_list_disables_inherited_defaults(self, project):
+        yaml_text = """\
+agent_defaults:
+  skills: [planner, reviewer]
+agents:
+  explore:
+    system_message: "Search."
+    tools: [read_file, skills]
+    model: m1
+    skills: []
+"""
+        cm = _make_config(project, yaml_text)
+        specs = load_agent_specs(cm)
+        assert specs["explore"].skills == []
 
     def test_invalid_agent_skipped_with_warning(self, project, caplog):
         yaml_text = """\
