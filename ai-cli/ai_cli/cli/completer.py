@@ -215,7 +215,6 @@ class REPLCompleter(Completer):
         self._max_path_completions = max_path_completions
         self._skill_names_cache_registry: SkillRegistry | None = None
         self._skill_names_cache: tuple[str, ...] | None = None
-        self._skill_aliases_cache_source: object | None = None
         self._skill_aliases_cache: dict[str, str] | None = None
         self._top_level_commands_cache_aliases: tuple[str, ...] | None = None
         self._top_level_commands_cache: tuple[str, ...] | None = None
@@ -803,7 +802,6 @@ class REPLCompleter(Completer):
 
     def _skill_aliases(self) -> dict[str, str]:
         if self._skill_aliases_getter is None:
-            self._skill_aliases_cache_source = None
             self._skill_aliases_cache = {}
             return {}
         try:
@@ -812,16 +810,9 @@ class REPLCompleter(Completer):
             logger.warning("Skill alias completion lookup failed", exc_info=True)
             return dict(self._skill_aliases_cache or {})
 
-        if (
-            aliases_obj is self._skill_aliases_cache_source
-            and self._skill_aliases_cache is not None
-        ):
-            return dict(self._skill_aliases_cache)
-
         aliases = dict(aliases_obj)
-        self._skill_aliases_cache_source = aliases_obj
         self._skill_aliases_cache = aliases
-        return dict(aliases)
+        return aliases
 
     def _top_level_commands(self) -> tuple[str, ...]:
         aliases = self._skill_aliases()
