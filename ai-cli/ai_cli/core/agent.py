@@ -864,7 +864,8 @@ def build_agent_tool_registry(
                 source_registry = getattr(tool_instance, "_skills", None)
                 if not isinstance(source_registry, SkillRegistry):
                     logger.warning(
-                        "Agent '%s': cannot clone skills tool (missing source SkillRegistry) — skipped",
+                        "Agent '%s': cannot clone skills tool (missing source SkillRegistry) — skipped. "
+                        "Ensure skills are loaded at startup or run '/skills reload', then retry.",
                         spec.name,
                     )
                     continue
@@ -877,9 +878,12 @@ def build_agent_tool_registry(
                         matched = source_registry.get(configured)
                         if matched is None:
                             logger.warning(
-                                "Agent '%s': configured skill '%s' is not loaded — skipped",
+                                "Agent '%s': configured skill '%s' is not loaded — skipped. "
+                                "Update agents.<name>.skills or add the missing SKILL.md, then run '/skills reload'. "
+                                "Currently loaded: %s",
                                 spec.name,
                                 configured,
+                                sorted(source_registry.names()),
                             )
                             continue
                         scoped_specs[matched.name] = matched
