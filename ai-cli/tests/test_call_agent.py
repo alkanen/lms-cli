@@ -492,6 +492,136 @@ class TestBuildAgentToolRegistry:
         assert global_instance.permission_required is False
         assert scoped_instance.permission_required is True
 
+    def test_skills_tool_scoped_to_configured_skills_with_warning(
+        self, tmp_path, caplog
+    ):
+        """Configured unknown skills are warned and skipped; known skills remain available."""
+        from ai_cli.cli.display import SubAgentDisplay
+        from ai_cli.core.agent import AgentSpec, build_agent_tool_registry
+        from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
+        from ai_cli.tools.skills import SkillsTool
+
+        skill_root = tmp_path / "skills"
+        alpha_dir = skill_root / "alpha"
+        beta_dir = skill_root / "beta"
+        alpha_dir.mkdir(parents=True)
+        beta_dir.mkdir(parents=True)
+        source_registry = SkillRegistry(
+            {
+                "alpha": SkillSpec(
+                    name="alpha",
+                    description="Alpha",
+                    instructions="Use alpha",
+                    base_dir=alpha_dir,
+                    scope="project",
+                ),
+                "beta": SkillSpec(
+                    name="beta",
+                    description="Beta",
+                    instructions="Use beta",
+                    base_dir=beta_dir,
+                    scope="project",
+                ),
+            }
+        )
+
+        spec = AgentSpec(
+            name="skilly",
+            system_message="Use skills carefully.",
+            tools=["skills"],
+            model="llama3:8b",
+            skills=["alpha", "missing"],
+        )
+
+        workspace = MagicMock()
+        config = MagicMock()
+        config.get.return_value = None
+        display = SubAgentDisplay()
+        global_tool_registry = MagicMock()
+        global_tool_registry.get.return_value = SkillsTool(
+            source_registry,
+            workspace,
+            MagicMock(),
+        )
+
+        with caplog.at_level("WARNING"):
+            registry = build_agent_tool_registry(
+                spec, workspace, config, display, global_tool_registry
+            )
+
+        assert "configured skill 'missing' is not loaded" in caplog.text
+        scoped_skills = registry.get("skills")
+        assert scoped_skills is not None
+        alpha = scoped_skills.execute(name="alpha")
+        assert alpha["status"] == "success"
+        assert alpha["data"]["name"] == "alpha"
+        beta = scoped_skills.execute(name="beta")
+        assert beta["status"] == "success"
+        assert beta["data"]["found"] is False
+        assert beta["data"]["available_skills"] == ["alpha"]
+
+    def test_skills_tool_unrestricted_when_agent_skills_not_configured(self, tmp_path):
+        """Without spec.skills, all loaded skills are available to the sub-agent."""
+        from ai_cli.cli.display import SubAgentDisplay
+        from ai_cli.core.agent import AgentSpec, build_agent_tool_registry
+        from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
+        from ai_cli.tools.skills import SkillsTool
+
+        skill_root = tmp_path / "skills"
+        alpha_dir = skill_root / "alpha"
+        beta_dir = skill_root / "beta"
+        alpha_dir.mkdir(parents=True)
+        beta_dir.mkdir(parents=True)
+        source_registry = SkillRegistry(
+            {
+                "alpha": SkillSpec(
+                    name="alpha",
+                    description="Alpha",
+                    instructions="Use alpha",
+                    base_dir=alpha_dir,
+                    scope="project",
+                ),
+                "beta": SkillSpec(
+                    name="beta",
+                    description="Beta",
+                    instructions="Use beta",
+                    base_dir=beta_dir,
+                    scope="project",
+                ),
+            }
+        )
+
+        spec = AgentSpec(
+            name="skilly",
+            system_message="Use skills carefully.",
+            tools=["skills"],
+            model="llama3:8b",
+        )
+
+        workspace = MagicMock()
+        config = MagicMock()
+        config.get.return_value = None
+        display = SubAgentDisplay()
+        global_tool_registry = MagicMock()
+        global_tool_registry.get.return_value = SkillsTool(
+            source_registry,
+            workspace,
+            MagicMock(),
+        )
+
+        registry = build_agent_tool_registry(
+            spec, workspace, config, display, global_tool_registry
+        )
+
+        scoped_skills = registry.get("skills")
+        assert scoped_skills is not None
+        alpha = scoped_skills.execute(name="alpha")
+        beta = scoped_skills.execute(name="beta")
+        assert alpha["status"] == "success"
+        assert alpha["data"]["name"] == "alpha"
+        assert beta["status"] == "success"
+        assert beta["data"]["name"] == "beta"
+
 
 # ---------------------------------------------------------------------------
 # CallAgentsParallelTool

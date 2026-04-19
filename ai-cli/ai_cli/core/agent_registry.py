@@ -36,6 +36,7 @@ _OPTIONAL_FIELDS: dict[str, Any] = {
     "max_tool_rounds": 10,
     "context_limit_threshold": 0.90,
     "context_window": None,
+    "skills": None,
 }
 
 _REQUIRED_FIELDS = ("system_message", "tools", "model")
@@ -51,6 +52,7 @@ _KNOWN_KEYS = {
     "max_tool_rounds",
     "context_limit_threshold",
     "context_window",
+    "skills",
 }
 
 
@@ -188,6 +190,24 @@ def _parse_agent_spec(name: str, raw: dict, defaults: dict) -> AgentSpec:
             )
         context_window = raw_context_window
 
+    raw_skills = merged.get("skills", _OPTIONAL_FIELDS["skills"])
+    skills: list[str] | None = None
+    if raw_skills is not None:
+        if not isinstance(raw_skills, list) or not all(
+            isinstance(s, str) for s in raw_skills
+        ):
+            raise ValueError(f"Agent '{name}': 'skills' must be a list of strings")
+        # Canonicalized list (trimmed, de-duplicated, order-preserving).
+        seen: set[str] = set()
+        canonical: list[str] = []
+        for skill_name in raw_skills:
+            normalized = skill_name.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            canonical.append(normalized)
+        skills = canonical
+
     backend = _parse_backend(merged.get("backend"))
 
     logger.info(
@@ -212,6 +232,7 @@ def _parse_agent_spec(name: str, raw: dict, defaults: dict) -> AgentSpec:
         max_tool_rounds=max_tool_rounds,
         context_limit_threshold=float(context_limit_threshold),
         context_window=context_window,
+        skills=skills,
     )
 
 
