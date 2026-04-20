@@ -1,0 +1,55 @@
+
+                     +-------------+
+                     | User Input  |
+                     +-------------+
+                            |
+                            v
+                     +-------------+
+              +----->|    REPL     |
+              |      +-------------+
+              |             |
+              |             v
+        tool  |      +-------------+
+       result |      |  LLMClient  |
+              |      |  streaming  |
+              |      +-------------+
+              |             |
+              |      tool call chunk
+              |             |
+              |             v
+              |      +-------------+
+              |      | ToolRegistry|
+              |      |  execute()  |
+              |      +-------------+
+              |             |
+              |             v
+              |      +--------------------+     +-------------------+
+              |      |        Tool        |     | PermissionManager |
+              |      |request_permission()|---->|  grant_always()   |
+              |      +--------------------+     +-------------------+
+              |             |                          |
+              |         granted?                 prompt user
+              |             |                          |
+              |             |             +------------------------+
+              |             |             |         Display        |
+              |             |             |show_permission_prompt()|
+              |             |             +------------------------+
+              |             |                    |
+              |             |            user grants / denies
+              |             |
+              |     yes     |     no
+              |     +-------+-------+
+              |     |               |
+              |     v               v
+              |  +-------+    +----------+
+              |  | Tool  |    | reason   |
+              |  |execute|    | returned |
+              |  +-------+    | to LLM   |
+              |     |         +----------+
+              |     v
+              |  +-------+
+              |  |Session|
+              |  |append |
+              |  +-------+
+              |     |
+              +-----+

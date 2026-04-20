@@ -1,7 +1,9 @@
-click
-enquiries
-numpy
-pyyaml
-requests
+openai
+pillow
 python-slugify
+pyyaml
+prompt_toolkit
+python-dotenv
 rich
+tiktoken
+websockets

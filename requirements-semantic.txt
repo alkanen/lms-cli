@@ -1,0 +1,10 @@
+-r requirements-embeddings.txt
+tree-sitter>=0.21
+tree-sitter-python
+tree-sitter-cpp
+tree-sitter-rust
+tree-sitter-lua
+tree-sitter-go
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-bash
