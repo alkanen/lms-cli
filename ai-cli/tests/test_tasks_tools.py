@@ -151,6 +151,7 @@ class TestDefinitions:
         assert "done" not in status_enum
         assert "blockers" in props
         assert props["blockers"]["type"] == "array"
+        assert "parent_path" in props
 
     def test_tasks_add_note_schema(self, tmp_path):
         tool, _ = _make_tool(TasksAddNoteTool, tmp_path)
@@ -249,6 +250,20 @@ class TestTasksListTool:
         assert result["error"] == "validation_error"
         tm.resolve_path_to_id.assert_not_called()
         tm.list_tasks.assert_not_called()
+
+    @pytest.mark.parametrize("literal_parent", ["None", "null"])
+    def test_list_parent_path_none_and_null_strings_are_treated_as_paths(
+        self, tmp_path, literal_parent
+    ):
+        tool, tm = _make_tool_with_mock_tm(TasksListTool)
+        tm.resolve_path_to_id.return_value = "p1"
+        tm.list_tasks.return_value = []
+
+        result = tool.execute(parent_path=literal_parent)
+
+        tm.resolve_path_to_id.assert_called_once_with(literal_parent)
+        tm.list_tasks.assert_called_once_with(parent_id="p1")
+        assert result == _ok({"tasks": []})
 
     def test_storage_error_returns_error_response(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksListTool)
@@ -434,6 +449,29 @@ class TestTasksCreateTool:
         )
         assert result == _ok({"task": detail})
 
+    @pytest.mark.parametrize("literal_parent", ["None", "null"])
+    def test_create_parent_path_none_and_null_strings_are_treated_as_paths(
+        self, tmp_path, literal_parent
+    ):
+        tool, tm = _make_tool_with_mock_tm(TasksCreateTool)
+        tm.resolve_path_to_id.return_value = "task_parent"
+        detail = {"id": "task_x", "name": "Child"}
+        tm.create_task.return_value = detail
+
+        result = tool.execute(
+            name="Child", definition_of_done="DoD here", parent_path=literal_parent
+        )
+
+        tm.resolve_path_to_id.assert_called_once_with(literal_parent)
+        tm.create_task.assert_called_once_with(
+            name="Child",
+            definition_of_done="DoD here",
+            description="",
+            parent_id="task_parent",
+            priority="medium",
+        )
+        assert result == _ok({"task": detail})
+
 
 # ---------------------------------------------------------------------------
 # TasksUpdateTool
@@ -511,6 +549,75 @@ class TestTasksUpdateTool:
         assert call_kwargs[0][0] == "task_x"
         assert "task_path" not in call_kwargs[1]
         assert call_kwargs[1]["name"] == "New"
+        assert result == _ok({"task": detail})
+
+    def test_parent_path_tilde_moves_task_to_root(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
+        tm.resolve_path_to_id.return_value = "task_x"
+        detail = {"id": "task_x", "name": "Task"}
+        tm.update_task.return_value = detail
+
+        result = tool.execute(task_path="Task", parent_path="~")
+
+        tm.resolve_path_to_id.assert_called_once_with("Task")
+        tm.update_task.assert_called_once_with("task_x", parent_id=None)
+        assert result == _ok({"task": detail})
+
+    @pytest.mark.parametrize("noop_parent_path", [None, "", "   "])
+    def test_parent_path_noop_values_are_ignored(self, tmp_path, noop_parent_path):
+        tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
+        tm.resolve_path_to_id.return_value = "task_x"
+        detail = {"id": "task_x", "name": "Task"}
+        tm.update_task.return_value = detail
+
+        result = tool.execute(
+            task_path="Task", name="Renamed", parent_path=noop_parent_path
+        )
+
+        tm.resolve_path_to_id.assert_called_once_with("Task")
+        tm.update_task.assert_called_once_with("task_x", name="Renamed")
+        assert result == _ok({"task": detail})
+
+    @pytest.mark.parametrize("parent_path", ["None", "null"])
+    def test_parent_path_none_and_null_strings_are_treated_as_paths(
+        self, tmp_path, parent_path
+    ):
+        tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
+        tm.resolve_path_to_id.side_effect = ["task_x", "task_parent"]
+        detail = {"id": "task_x", "name": "Task"}
+        tm.update_task.return_value = detail
+
+        result = tool.execute(task_path="Task", parent_path=parent_path)
+
+        assert tm.resolve_path_to_id.call_args_list[0].args == ("Task",)
+        assert tm.resolve_path_to_id.call_args_list[1].args == (parent_path,)
+        tm.update_task.assert_called_once_with("task_x", parent_id="task_parent")
+        assert result == _ok({"task": detail})
+
+    @pytest.mark.parametrize("noop_parent_path", [None, "", "   "])
+    def test_parent_path_noop_without_other_fields_returns_validation_error(
+        self, tmp_path, noop_parent_path
+    ):
+        tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
+
+        result = tool.execute(task_path="Task", parent_path=noop_parent_path)
+
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+        tm.resolve_path_to_id.assert_not_called()
+        tm.update_task.assert_not_called()
+
+    def test_parent_path_is_resolved_before_update(self, tmp_path):
+        tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
+        tm.resolve_path_to_id.side_effect = ["task_x", "parent_y"]
+        detail = {"id": "task_x", "name": "Task"}
+        tm.update_task.return_value = detail
+
+        result = tool.execute(task_path="Task", parent_path="Parent")
+
+        assert tm.resolve_path_to_id.call_args_list[0].args == ("Task",)
+        assert tm.resolve_path_to_id.call_args_list[1].args == ("Parent",)
+        tm.update_task.assert_called_once_with("task_x", parent_id="parent_y")
         assert result == _ok({"task": detail})
 
 

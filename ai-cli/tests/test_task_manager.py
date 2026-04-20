@@ -574,6 +574,72 @@ class TestUpdateTask:
         on_disk = _tasks_json(tmp_path)
         assert on_disk["tasks"][detail["id"]]["name"] == "Updated"
 
+    def test_reparent_to_root_with_none(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        parent = tm.create_task(name="Parent", definition_of_done="DoD parent")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD child", parent_id=parent["id"]
+        )
+
+        updated = tm.update_task(child["id"], parent_id=None)
+
+        assert updated["parent_id"] is None
+        parent_detail = tm.get_task(parent["id"])
+        assert all(sub["id"] != child["id"] for sub in parent_detail["subtasks"])
+        root_tasks = tm.list_tasks(parent_id=None)
+        assert any(t["id"] == child["id"] for t in root_tasks)
+
+    def test_reparent_to_another_parent(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        old_parent = tm.create_task(name="OldParent", definition_of_done="DoD old")
+        new_parent = tm.create_task(name="NewParent", definition_of_done="DoD new")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD child", parent_id=old_parent["id"]
+        )
+
+        updated = tm.update_task(child["id"], parent_id=new_parent["id"])
+
+        assert updated["parent_id"] == new_parent["id"]
+        old_subtasks = tm.get_task(old_parent["id"])["subtasks"]
+        new_subtasks = tm.get_task(new_parent["id"])["subtasks"]
+        assert all(sub["id"] != child["id"] for sub in old_subtasks)
+        assert any(sub["id"] == child["id"] for sub in new_subtasks)
+
+    def test_reparent_to_self_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        task = tm.create_task(name="Root", definition_of_done="DoD root")
+
+        with pytest.raises(TaskValidationError, match="own parent"):
+            tm.update_task(task["id"], parent_id=task["id"])
+
+    def test_reparent_to_descendant_raises(self, tmp_path):
+        tm = _make_tm(tmp_path)
+        root = tm.create_task(name="Root", definition_of_done="DoD root")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD child", parent_id=root["id"]
+        )
+
+        with pytest.raises(TaskValidationError, match="descendants"):
+            tm.update_task(root["id"], parent_id=child["id"])
+
+    def test_reparent_persists_subtask_link_when_new_parent_missing_subtask_ids(
+        self, tmp_path
+    ):
+        tm = _make_tm(tmp_path)
+        old_parent = tm.create_task(name="OldParent", definition_of_done="DoD old")
+        new_parent = tm.create_task(name="NewParent", definition_of_done="DoD new")
+        child = tm.create_task(
+            name="Child", definition_of_done="DoD child", parent_id=old_parent["id"]
+        )
+
+        del tm._cache["tasks"][new_parent["id"]]["subtask_ids"]
+        tm._save(tm._cache)
+
+        tm.update_task(child["id"], parent_id=new_parent["id"])
+
+        new_parent_detail = tm.get_task(new_parent["id"])
+        assert any(sub["id"] == child["id"] for sub in new_parent_detail["subtasks"])
+
 
 # ---------------------------------------------------------------------------
 # add_note

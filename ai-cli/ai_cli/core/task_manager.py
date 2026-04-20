@@ -688,12 +688,61 @@ class TaskManager:
             "priority",
             "next_action",
             "blockers",
+            "parent_id",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise TaskValidationError(
                 f"Unknown field(s): {sorted(unknown)}. Allowed: {sorted(allowed)}."
             )
+
+        if "parent_id" in fields:
+            requested_parent_id = fields["parent_id"]
+            if requested_parent_id is not None and not isinstance(
+                requested_parent_id, str
+            ):
+                raise TaskValidationError("'parent_id' must be a string or None.")
+            if isinstance(requested_parent_id, str):
+                if requested_parent_id not in data["tasks"]:
+                    raise TaskNotFoundError(
+                        f"Parent task not found: {requested_parent_id!r}"
+                    )
+                if requested_parent_id == task_id:
+                    raise TaskValidationError("A task cannot be its own parent.")
+
+                # Prevent reparent cycles: parent cannot be this task or a descendant.
+                visited_parent_ids: set[str] = set()
+                ancestor_id: str | None = requested_parent_id
+                while ancestor_id is not None:
+                    if ancestor_id == task_id:
+                        raise TaskValidationError(
+                            "Invalid parent: cannot move a task under one of its descendants."
+                        )
+                    if ancestor_id in visited_parent_ids:
+                        raise TaskStorageError(
+                            "Corrupted task store: cycle detected in parent links."
+                        )
+                    visited_parent_ids.add(ancestor_id)
+
+                    ancestor = data["tasks"].get(ancestor_id)
+                    if ancestor is None:
+                        raise TaskStorageError(
+                            f"Task {ancestor_id!r} is referenced but missing from storage."
+                        )
+                    ancestor = self._validate_task_record(ancestor)
+                    next_parent = ancestor.get("parent_id")
+                    if next_parent is not None and not isinstance(next_parent, str):
+                        raise TaskStorageError(
+                            f"Task {ancestor_id!r} has a corrupted 'parent_id' field."
+                        )
+                    if (
+                        isinstance(next_parent, str)
+                        and next_parent not in data["tasks"]
+                    ):
+                        raise TaskStorageError(
+                            f"Task {ancestor_id!r} references missing parent {next_parent!r}."
+                        )
+                    ancestor_id = next_parent
 
         if "name" in fields and (
             not isinstance(fields["name"], str) or not fields["name"].strip()
@@ -704,27 +753,6 @@ class TaskManager:
             if not _NAME_RE.match(new_name):
                 raise TaskValidationError(
                     "'name' must contain only letters, digits, and underscores."
-                )
-            parent_id = task.get("parent_id")
-            sibling_names_upd: set[str] = set()
-            for tid, t in data["tasks"].items():
-                if tid == task_id:
-                    continue
-                if not isinstance(t, dict):
-                    raise TaskStorageError(
-                        f"Stored task {tid!r} is malformed: expected object."
-                    )
-                if t.get("parent_id") != parent_id:
-                    continue
-                sibling_name = t.get("name")
-                if not isinstance(sibling_name, str) or not sibling_name.strip():
-                    raise TaskStorageError(
-                        f"Stored task {tid!r} is malformed: missing valid 'name'."
-                    )
-                sibling_names_upd.add(sibling_name)
-            if new_name in sibling_names_upd:
-                raise TaskValidationError(
-                    f"A task named {new_name!r} already exists under this parent."
                 )
             fields = dict(fields)
             fields["name"] = new_name
@@ -776,9 +804,88 @@ class TaskManager:
             if not isinstance(blk, list) or not all(isinstance(b, str) for b in blk):
                 raise TaskValidationError("'blockers' must be a list of strings.")
 
+        if "name" in fields or "parent_id" in fields:
+            target_parent_id = fields.get("parent_id", task.get("parent_id"))
+            target_name = fields.get("name", task.get("name"))
+            if target_parent_id is not None and not isinstance(target_parent_id, str):
+                raise TaskStorageError(
+                    f"Task {task_id!r} has a corrupted target parent reference."
+                )
+            if not isinstance(target_name, str) or not target_name.strip():
+                raise TaskStorageError(
+                    f"Task {task_id!r} has a corrupted 'name' field."
+                )
+
+            sibling_names_upd: set[str] = set()
+            for tid, t in data["tasks"].items():
+                if tid == task_id:
+                    continue
+                if not isinstance(t, dict):
+                    raise TaskStorageError(
+                        f"Stored task {tid!r} is malformed: expected object."
+                    )
+                if t.get("parent_id") != target_parent_id:
+                    continue
+                sibling_name = t.get("name")
+                if not isinstance(sibling_name, str) or not sibling_name.strip():
+                    raise TaskStorageError(
+                        f"Stored task {tid!r} is malformed: missing valid 'name'."
+                    )
+                sibling_names_upd.add(sibling_name)
+            if target_name in sibling_names_upd:
+                raise TaskValidationError(
+                    f"A task named {target_name!r} already exists under this parent."
+                )
+
+        old_parent_id = task.get("parent_id")
+        if old_parent_id is not None and not isinstance(old_parent_id, str):
+            raise TaskStorageError(
+                f"Task {task_id!r} has a corrupted 'parent_id' field."
+            )
+        new_parent_id = fields.get("parent_id", old_parent_id)
+        parent_changed = new_parent_id != old_parent_id
+        now = self._now_iso()
+
+        if parent_changed:
+            if old_parent_id is not None:
+                old_parent_raw = data["tasks"].get(old_parent_id)
+                if old_parent_raw is None:
+                    raise TaskStorageError(
+                        f"Task {task_id!r} references missing parent {old_parent_id!r}."
+                    )
+                old_parent = self._validate_task_record(old_parent_raw)
+                old_subtask_ids = old_parent.get("subtask_ids", [])
+                if not isinstance(old_subtask_ids, list) or not all(
+                    isinstance(s, str) for s in old_subtask_ids
+                ):
+                    raise TaskStorageError(
+                        f"Task {old_parent_id!r} has a corrupted 'subtask_ids' field."
+                    )
+                old_parent["subtask_ids"] = [s for s in old_subtask_ids if s != task_id]
+                old_parent["updated_at"] = now
+
+            if new_parent_id is not None:
+                new_parent_raw = data["tasks"].get(new_parent_id)
+                if new_parent_raw is None:
+                    raise TaskStorageError(
+                        f"Parent task not found while updating links: {new_parent_id!r}"
+                    )
+                new_parent = self._validate_task_record(new_parent_raw)
+                new_subtask_ids = new_parent.get("subtask_ids", [])
+                if not isinstance(new_subtask_ids, list) or not all(
+                    isinstance(s, str) for s in new_subtask_ids
+                ):
+                    raise TaskStorageError(
+                        f"Task {new_parent_id!r} has a corrupted 'subtask_ids' field."
+                    )
+                if task_id not in new_subtask_ids:
+                    new_subtask_ids.append(task_id)
+                new_parent["subtask_ids"] = new_subtask_ids
+                new_parent["updated_at"] = now
+
         for key, value in fields.items():
             task[key] = value
-        task["updated_at"] = self._now_iso()
+        task["updated_at"] = now
 
         self._save(data)
         changed = [key for key in fields if previous.get(key) != task.get(key)]

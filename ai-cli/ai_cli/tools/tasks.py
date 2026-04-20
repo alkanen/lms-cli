@@ -45,10 +45,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ROOT_PARENT_ALIASES = frozenset({"~"})
+
 # Sorted lists for ToolSchema enums — derived from TaskManager's canonical sets
 # so schema and validation never drift apart.
 _UPDATABLE_STATUSES: list[str] = sorted(UPDATABLE_STATUSES)
 _VALID_PRIORITIES: list[str] = sorted(VALID_PRIORITIES)
+_ROOT_MOVE_PARENT_ALIASES = frozenset({"~"})
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +126,10 @@ class _TaskTool(Tool):
             return None, self._err(
                 "validation_error", "'parent_path' must be a string.", code=400
             )
-        if not raw.strip():
+        normalized_raw = raw.strip()
+        if not normalized_raw:
+            return None, None
+        if normalized_raw.lower() in _ROOT_PARENT_ALIASES:
             return None, None
         try:
             return normalize_task_path(raw), None
@@ -426,6 +432,16 @@ class TasksUpdateTool(_TaskTool):
                     required=False,
                     items={"type": "string"},
                 ),
+                ToolArgument(
+                    "parent_path",
+                    (
+                        "New parent path. Use '~' to move the task to root. "
+                        "Omit this field, or provide an empty/whitespace-only string, "
+                        "to leave parent unchanged."
+                    ),
+                    "string",
+                    required=False,
+                ),
             ],
         )
 
@@ -437,6 +453,47 @@ class TasksUpdateTool(_TaskTool):
         update_fields: dict[str, Any] = {
             k: v for k, v in kwargs.items() if k != "task_path"
         }
+
+        reparent_requested = "parent_path" in update_fields
+        requested_parent_path = update_fields.pop("parent_path", None)
+
+        if not update_fields and not reparent_requested:
+            return self._err(
+                "validation_error",
+                "At least one field must be provided to update.",
+                code=400,
+            )
+
+        if reparent_requested:
+            if requested_parent_path is None:
+                # Treat null as omitted: leave parent unchanged.
+                pass
+            elif not isinstance(requested_parent_path, str):
+                return self._err(
+                    "validation_error",
+                    "'parent_path' must be a string when provided.",
+                    code=400,
+                )
+            else:
+                normalized_requested_parent = requested_parent_path.strip()
+                if not normalized_requested_parent:
+                    # Treat empty/whitespace as omitted.
+                    pass
+                elif normalized_requested_parent in _ROOT_MOVE_PARENT_ALIASES:
+                    update_fields["parent_id"] = None
+                else:
+                    try:
+                        normalized_parent_path = normalize_task_path(
+                            requested_parent_path
+                        )
+                    except TaskValidationError:
+                        return self._err(
+                            "validation_error",
+                            "'parent_path' must be a valid task path.",
+                            code=400,
+                        )
+                    update_fields["_resolved_parent_path"] = normalized_parent_path
+
         if not update_fields:
             return self._err(
                 "validation_error",
@@ -453,6 +510,11 @@ class TasksUpdateTool(_TaskTool):
 
         def _go() -> dict:
             task_id = self._tm.resolve_path_to_id(path)
+            resolved_parent_path = update_fields.pop("_resolved_parent_path", None)
+            if isinstance(resolved_parent_path, str):
+                update_fields["parent_id"] = self._tm.resolve_path_to_id(
+                    resolved_parent_path
+                )
             task = self._tm.update_task(task_id, **update_fields)
             logger.debug(
                 "Task tool '%s': updated task id=%s path=%r",

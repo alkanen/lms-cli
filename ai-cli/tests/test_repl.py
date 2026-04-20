@@ -2847,6 +2847,55 @@ class TestTasksCommand:
         assert "Usage" in display.show_error.call_args[0][0]
         tm.find_by_path.assert_not_called()
 
+    def test_edit_parent_path_tilde_moves_task_to_root(self):
+        display = MagicMock()
+        detail = _make_task_detail(name="Child", parent_id="task_parent")
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.update_task.return_value = {**detail, "parent_id": None}
+        repl = _make_repl(display=display, task_manager=tm)
+
+        with patch.object(
+            repl, "_tasks_edit_wizard", return_value={"parent_path": None}
+        ):
+            repl._handle_slash_command("tasks edit Parent.Child")
+
+        tm.update_task.assert_called_once_with(detail["id"], parent_id=None)
+        display.show_status.assert_called()
+
+    def test_edit_parent_path_none_is_noop(self):
+        display = MagicMock()
+        detail = _make_task_detail(name="Child", parent_id="task_parent")
+        tm = _make_task_manager()
+        tm.find_by_path.return_value = detail
+        tm.update_task.return_value = detail
+        repl = _make_repl(display=display, task_manager=tm)
+
+        with patch.object(repl, "_tasks_edit_wizard", return_value={"name": "Child2"}):
+            repl._handle_slash_command("tasks edit Parent.Child")
+
+        tm.update_task.assert_called_once_with(detail["id"], name="Child2")
+        display.show_status.assert_called()
+
+    def test_edit_parent_path_resolves_to_parent_id(self):
+        display = MagicMock()
+        detail = _make_task_detail(name="Child", parent_id="task_old_parent")
+        new_parent = _make_task_detail(name="NewParent")
+        tm = _make_task_manager()
+        tm.find_by_path.side_effect = [detail, new_parent]
+        tm.update_task.return_value = {**detail, "parent_id": new_parent["id"]}
+        repl = _make_repl(display=display, task_manager=tm)
+
+        with patch.object(
+            repl,
+            "_tasks_edit_wizard",
+            return_value={"parent_path": "Root.NewParent"},
+        ):
+            repl._handle_slash_command("tasks edit Root.Child")
+
+        tm.update_task.assert_called_once_with(detail["id"], parent_id=new_parent["id"])
+        display.show_status.assert_called()
+
     # ------------------------------------------------------------------
     # /tasks delete
     # ------------------------------------------------------------------
@@ -3106,6 +3155,45 @@ class TestTasksCommand:
         tm.create_task.assert_called_once()
         _, kwargs = tm.create_task.call_args
         assert kwargs.get("definition_of_done") == "at least five chars"
+
+    def test_edit_wizard_root_blank_parent_keeps_unchanged(self, monkeypatch):
+        display = MagicMock()
+        repl = _make_repl(display=display, task_manager=_make_task_manager())
+        task = _make_task_detail(name="RootTask", parent_id=None)
+
+        # name, description, dod, priority, next_action, blockers, parent
+        responses = iter(["", "", "", "", "", "", ""])
+        monkeypatch.setattr("prompt_toolkit.prompt", lambda *_a, **_kw: next(responses))
+
+        fields = repl._tasks_edit_wizard(task, current_task_path="RootTask")
+
+        assert fields == {}
+
+    def test_edit_wizard_literal_null_is_treated_as_parent_path(self, monkeypatch):
+        display = MagicMock()
+        repl = _make_repl(display=display, task_manager=_make_task_manager())
+        task = _make_task_detail(name="RootTask", parent_id=None)
+
+        # name, description, dod, priority, next_action, blockers, parent
+        responses = iter(["", "", "", "", "", "", "null"])
+        monkeypatch.setattr("prompt_toolkit.prompt", lambda *_a, **_kw: next(responses))
+
+        fields = repl._tasks_edit_wizard(task, current_task_path="RootTask")
+
+        assert fields == {"parent_path": "null"}
+
+    def test_edit_wizard_tilde_moves_non_root_to_root(self, monkeypatch):
+        display = MagicMock()
+        repl = _make_repl(display=display, task_manager=_make_task_manager())
+        task = _make_task_detail(name="Child", parent_id="task_parent")
+
+        # name, description, dod, priority, next_action, blockers, parent
+        responses = iter(["", "", "", "", "", "", "~"])
+        monkeypatch.setattr("prompt_toolkit.prompt", lambda *_a, **_kw: next(responses))
+
+        fields = repl._tasks_edit_wizard(task, current_task_path="Parent.Child")
+
+        assert fields == {"parent_path": None}
 
 
 # ---------------------------------------------------------------------------
