@@ -1360,13 +1360,22 @@ class REPL:
             except (TaskNotFoundError, TaskValidationError) as exc:
                 self._display.show_error(str(exc))
                 return
-            fields = self._tasks_edit_wizard(task)
+            fields = self._tasks_edit_wizard(task, current_task_path=path)
             if fields is None:
                 return
             if not fields:
                 self._display.show_status("No changes made.")
                 return
             try:
+                parent_path_supplied = "parent_path" in fields
+                parent_path_value = fields.pop("parent_path", None)
+                if parent_path_supplied:
+                    if isinstance(parent_path_value, str):
+                        fields["parent_id"] = self._task_manager.find_by_path(
+                            parent_path_value
+                        )["id"]
+                    else:
+                        fields["parent_id"] = None
                 updated = self._task_manager.update_task(task["id"], **fields)
                 self._display.show_status(f"Task '{updated['name']}' updated.")
             except (TaskNotFoundError, TaskValidationError) as exc:
@@ -1657,7 +1666,9 @@ class REPL:
             "priority": priority,
         }
 
-    def _tasks_edit_wizard(self, task: dict) -> dict | None:
+    def _tasks_edit_wizard(
+        self, task: dict, current_task_path: str = ""
+    ) -> dict | None:
         """Prompt for updated task fields.  Returns changed fields or None if cancelled.
 
         Enter ``~`` at any optional field to clear it to its empty/default value.
@@ -1672,7 +1683,12 @@ class REPL:
             "Leave blank to keep current value, ~ to clear, Ctrl+C to cancel."
         )
 
-        def _ask(label: str, current: str, clearable: bool = False) -> object:
+        def _ask(
+            label: str,
+            current: str,
+            clearable: bool = False,
+            show_clear_hint: bool = True,
+        ) -> object:
             """Prompt with current value shown.
 
             Returns:
@@ -1681,7 +1697,7 @@ class REPL:
               - the new string value otherwise
               - ``None`` if the user cancelled (EOFError / KeyboardInterrupt)
             """
-            hint = " (~ to clear)" if clearable else ""
+            hint = " (~ to clear)" if clearable and show_clear_hint else ""
             try:
                 raw = _pt_prompt(f"  {label}{hint} [{current!r}]: ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -1737,6 +1753,23 @@ class REPL:
                 self._display.show_status("Cancelled.")
                 return None
 
+            if current_task_path and "." in current_task_path:
+                current_parent_path = current_task_path.rsplit(".", 1)[0]
+                current_parent_display = current_parent_path
+            else:
+                current_parent_path = None
+                current_parent_display = "<root>"
+
+            raw_parent = _ask(
+                "Parent path (~ to move to root; empty keeps unchanged)",
+                current_parent_display,
+                clearable=True,
+                show_clear_hint=False,
+            )
+            if raw_parent is None:
+                self._display.show_status("Cancelled.")
+                return None
+
         except (EOFError, KeyboardInterrupt):
             self._display.show_status("Cancelled.")
             return None
@@ -1763,6 +1796,20 @@ class REPL:
             fields["next_action"] = next_action_val
         if blockers != task.get("blockers", []):
             fields["blockers"] = blockers
+
+        if raw_parent is _CLEAR:
+            parent_path: str | None = None
+        else:
+            parent_raw_str = str(raw_parent).strip()
+            if not parent_raw_str or parent_raw_str == "<root>":
+                parent_path = current_parent_path
+            else:
+                parent_path = self._normalize_task_path_arg(parent_raw_str)
+
+        existing_parent = current_parent_path
+
+        if parent_path != existing_parent:
+            fields["parent_path"] = parent_path
 
         return fields
 
