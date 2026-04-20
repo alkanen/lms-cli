@@ -1,19 +1,42 @@
-# Makefile for LMS CLI
+# Makefile for ai-cli
 
-.PHONY: run lint test typecheck
+.PHONY: run format check test build dist clean
 
-# Use the Python binary from the virtual environment
 PYTHON := ./env/bin/python
+RUFF   := ./env/bin/ruff
+MYPY   := ./env/bin/mypy
 
+# Run the application
 run:
-	$(PYTHON) main.py rich
+	$(PYTHON) -m ai_cli
 
-lint:
-	$(PYTHON) -m black lms_cli tests
-	$(PYTHON) -m flake8 lms_cli tests
+# Apply formatting and auto-fix safe lint issues
+format:
+	echo "Perform formatting"
+	$(RUFF) format ai_cli tests
+	$(RUFF) check --fix ai_cli tests
 
+# Check only — no changes written (suitable for CI / pre-commit)
+check:
+	echo "Run formatting and type checks"
+	$(RUFF) format --check ai_cli tests
+	$(RUFF) check ai_cli tests
+	$(MYPY) ai_cli
+
+# Run the test suite
 test:
+	echo "Run pytest"
 	$(PYTHON) -m pytest tests
 
-typecheck:
-	$(PYTHON) -m mypy lms_cli
+# Build a wheel (and sdist) into dist/
+build:
+	$(PYTHON) -m build
+
+# Alias
+dist: build
+
+# Remove build artifacts
+clean:
+	rm -rf dist/ build/ ai_cli.egg-info/
+
+.SILENT:
