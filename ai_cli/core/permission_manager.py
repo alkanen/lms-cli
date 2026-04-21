@@ -95,7 +95,9 @@ class PermissionManager:
             ``(allowed, reason_or_choice)`` where the second element is:
 
             * empty string on ``yes`` / ``always`` / always-grant bypass
-            * the user-supplied suggestion on ``custom``
+            * ``"User denied tool request with message: <text>"`` on ``custom``
+              when the user supplied a non-empty message, or
+              ``"Permission denied."`` if the message was empty
             * the chosen extra-option string on a tool-specific choice
               (caller is responsible for acting on it, e.g. scoped grant)
             * ``"Permission denied."`` on ``no`` or unrecognised input
@@ -140,10 +142,20 @@ class PermissionManager:
             logger.info("Permission granted for '%s' (always)", tool_name)
             return True, ""
         if choice == PERM_CUSTOM:
-            logger.info(
-                "Permission denied for '%s' (custom suggestion provided)", tool_name
+            if user_text:
+                logger.info(
+                    "Permission denied for '%s' (custom suggestion provided)", tool_name
+                )
+            else:
+                logger.info(
+                    "Permission denied for '%s' (custom, no message)", tool_name
+                )
+            message = (
+                f"User denied tool request with message: {user_text}"
+                if user_text.strip()
+                else "Permission denied."
             )
-            return False, user_text
+            return False, message
         # anything unrecognised
         logger.info(
             "Permission denied for '%s' (unrecognised choice %r)", tool_name, choice
