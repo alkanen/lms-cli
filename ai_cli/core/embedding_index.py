@@ -168,7 +168,7 @@ def _chunk_id(
 
     line_key = str(start_line) if start_line is not None else "doc"
     key = f"{file_path}\x00{chunk_type}\x00{line_key}\x00{ordinal}"
-    return _xxhash.xxh64(key.encode()).hexdigest()
+    return str(_xxhash.xxh64(key.encode()).hexdigest())
 
 
 def _file_hash(content: bytes) -> str:
@@ -177,7 +177,7 @@ def _file_hash(content: bytes) -> str:
         import hashlib
 
         return hashlib.sha256(content).hexdigest()[:16]
-    return _xxhash.xxh64(content).hexdigest()
+    return str(_xxhash.xxh64(content).hexdigest())
 
 
 # ---------------------------------------------------------------------------

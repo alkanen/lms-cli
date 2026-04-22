@@ -36,7 +36,19 @@ class TestRequest:
         pm = make_manager(PERM_CUSTOM, "Try /tmp instead.")
         allowed, reason = pm.request("read_file", "Read /etc/hosts?")
         assert allowed is False
-        assert reason == "Try /tmp instead."
+        assert reason == "User denied tool request with message: Try /tmp instead."
+
+    def test_custom_empty_message_returns_permission_denied(self):
+        pm = make_manager(PERM_CUSTOM, "")
+        allowed, reason = pm.request("read_file", "Read /etc/hosts?")
+        assert allowed is False
+        assert reason == "Permission denied."
+
+    def test_custom_whitespace_message_returns_permission_denied(self):
+        pm = make_manager(PERM_CUSTOM, "   ")
+        allowed, reason = pm.request("read_file", "Read /etc/hosts?")
+        assert allowed is False
+        assert reason == "Permission denied."
 
     def test_unrecognised_choice_denies(self):
         pm = make_manager("something_else")
@@ -58,7 +70,7 @@ class TestRequest:
         pm = make_manager("CUSTOM", "Try /tmp instead.")
         allowed, reason = pm.request("read_file", "Read /etc/hosts?")
         assert allowed is False
-        assert reason == "Try /tmp instead."
+        assert reason == "User denied tool request with message: Try /tmp instead."
 
     def test_choice_always_is_case_insensitive(self):
         pm = make_manager("ALWAYS")
