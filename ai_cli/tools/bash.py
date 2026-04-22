@@ -21,7 +21,18 @@ from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30
+_DEFAULT_MAX_OUTPUT_CHARS = 1024
 _ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+_CAPTURE_MODES = ("stdout", "stderr", "interleaved", "separate")
+
+
+def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
+    """Return *(text, truncated)* where *text* is at most *max_chars* characters."""
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
 
 if TYPE_CHECKING:
     from ai_cli.core.permission_manager import PermissionManager
@@ -176,6 +187,30 @@ class BashTool(Tool):
                     argument_type="string",
                     required=True,
                 ),
+                ToolArgument(
+                    name="capture",
+                    description=(
+                        "Which output stream(s) to capture. "
+                        "'stdout' (default) captures stdout only. "
+                        "'stderr' captures stderr only. "
+                        "'interleaved' merges stderr into stdout. "
+                        "'separate' returns stdout and stderr as separate fields."
+                    ),
+                    argument_type="string",
+                    required=False,
+                    enum=list(_CAPTURE_MODES),
+                ),
+                ToolArgument(
+                    name="max_output_chars",
+                    description=(
+                        "Maximum number of characters to return from captured output "
+                        f"(default {_DEFAULT_MAX_OUTPUT_CHARS}). Output beyond this "
+                        "limit is truncated."
+                    ),
+                    argument_type="integer",
+                    required=False,
+                    minimum=1,
+                ),
             ],
         )
 
@@ -183,7 +218,26 @@ class BashTool(Tool):
     # Execution
     # ------------------------------------------------------------------
 
-    def execute(self, *, command: str) -> dict:  # type: ignore[override]
+    def execute(  # type: ignore[override]
+        self,
+        *,
+        command: str,
+        capture: str = "stdout",
+        max_output_chars: int = _DEFAULT_MAX_OUTPUT_CHARS,
+    ) -> dict:
+        if capture not in _CAPTURE_MODES:
+            return self._err(
+                "invalid_arguments",
+                f"Invalid capture mode {capture!r}. Must be one of: "
+                + ", ".join(_CAPTURE_MODES),
+                400,
+            )
+        if max_output_chars < 1:
+            return self._err(
+                "invalid_arguments",
+                f"max_output_chars must be >= 1, got {max_output_chars}.",
+                400,
+            )
         try:
             args = shlex.split(command)
         except ValueError as exc:
@@ -201,10 +255,25 @@ class BashTool(Tool):
                 400,
             )
         logger.debug("bash: running %r (%d arg(s))", args[0], len(args) - 1)
+
+        # Build stream kwargs for subprocess based on capture mode.
+        if capture == "interleaved":
+            stream_kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+            }
+        elif capture == "stderr":
+            stream_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE}
+        elif capture == "separate":
+            stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        else:
+            # stdout only — stderr is captured solely for error reporting on non-zero exit
+            stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+
         try:
             proc = subprocess.run(
                 args,
-                capture_output=True,
+                **stream_kwargs,
                 text=True,
                 timeout=_DEFAULT_TIMEOUT,
                 cwd=self._workspace.root,
@@ -223,11 +292,33 @@ class BashTool(Tool):
         except Exception as exc:
             logger.exception("bash: unexpected error running %r", args[0])
             return self._err("execution_error", str(exc), 500)
+
         if proc.returncode != 0:
             logger.debug("bash: %r exited with status %d", args[0], proc.returncode)
             message = f"Command exited with status {proc.returncode}."
-            if proc.stderr:
-                message = f"{message} {proc.stderr.strip()}"
+            # interleaved merges stderr into stdout; proc.stderr is None in that mode
+            raw_error = (proc.stdout if capture == "interleaved" else proc.stderr) or ""
+            if raw_error:
+                error_output, _ = _truncate(raw_error.strip(), max_output_chars)
+                message = f"{message} {error_output}"
             return self._err("execution_error", message, 400)
-        logger.debug("bash: %r succeeded, stdout=%d chars", args[0], len(proc.stdout))
-        return self._ok({"output": proc.stdout})
+
+        if capture == "separate":
+            stdout_text, stdout_truncated = _truncate(
+                proc.stdout or "", max_output_chars
+            )
+            stderr_text, stderr_truncated = _truncate(
+                proc.stderr or "", max_output_chars
+            )
+            data: dict[str, Any] = {"stdout": stdout_text, "stderr": stderr_text}
+            if stdout_truncated or stderr_truncated:
+                data["warning"] = f"Output truncated at {max_output_chars} characters"
+        else:
+            raw = (proc.stderr or "") if capture == "stderr" else (proc.stdout or "")
+            logger.debug("bash: %r succeeded, output=%d chars", args[0], len(raw))
+            text, truncated = _truncate(raw, max_output_chars)
+            data = {"output": text}
+            if truncated:
+                data["warning"] = f"Output truncated at {max_output_chars} characters"
+
+        return self._ok(data)
