@@ -91,6 +91,31 @@ class TestDefinition:
         d = tool.definition().schema()
         assert d["function"]["parameters"]["properties"]["command"]["type"] == "string"
 
+    def test_capture_in_schema(self):
+        tool = make_tool()
+        props = tool.definition().schema()["function"]["parameters"]["properties"]
+        assert "capture" in props
+        assert props["capture"]["type"] == "string"
+        assert set(props["capture"]["enum"]) == {
+            "stdout",
+            "stderr",
+            "interleaved",
+            "separate",
+        }
+
+    def test_max_output_chars_in_schema(self):
+        tool = make_tool()
+        props = tool.definition().schema()["function"]["parameters"]["properties"]
+        assert "max_output_chars" in props
+        assert props["max_output_chars"]["type"] == "integer"
+        assert props["max_output_chars"]["minimum"] == 1
+
+    def test_capture_and_max_output_chars_not_required(self):
+        tool = make_tool()
+        required = tool.definition().schema()["function"]["parameters"]["required"]
+        assert "capture" not in required
+        assert "max_output_chars" not in required
+
 
 # ---------------------------------------------------------------------------
 # execute()
@@ -399,3 +424,253 @@ class TestResetSessionState:
         tool.reset_session_state()
         assert len(tool._exact_grants) == 0
         assert len(tool._pattern_grants) == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: capture modes
+# ---------------------------------------------------------------------------
+
+
+class TestCapture:
+    def test_default_capture_returns_stdout(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hello\n", stderr="ignored"),
+        ):
+            result = tool.execute(command="echo hello")
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "hello\n"
+
+    def test_capture_stdout_explicit(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="out\n", stderr="err\n"),
+        ):
+            result = tool.execute(command="echo out", capture="stdout")
+        assert result["data"]["output"] == "out\n"
+        assert "stderr" not in result["data"]
+
+    def test_capture_stderr(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="", stderr="err text\n"),
+        ):
+            result = tool.execute(command="ls missing", capture="stderr")
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "err text\n"
+        assert "stdout" not in result["data"]
+
+    def test_capture_interleaved(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="merged\n"),
+        ):
+            result = tool.execute(command="echo merged", capture="interleaved")
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "merged\n"
+
+    def test_capture_interleaved_subprocess_kwargs(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hi", capture="interleaved")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["stderr"] == subprocess.STDOUT
+
+    def test_capture_separate_returns_both_fields(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="out\n", stderr="err\n"),
+        ):
+            result = tool.execute(command="echo out", capture="separate")
+        assert result["status"] == "success"
+        assert result["data"]["stdout"] == "out\n"
+        assert result["data"]["stderr"] == "err\n"
+        assert "output" not in result["data"]
+
+    def test_capture_stdout_subprocess_kwargs(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hi", capture="stdout")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["stdout"] == subprocess.PIPE
+        assert kwargs["stderr"] == subprocess.PIPE
+
+    def test_capture_stdout_nonzero_exit_includes_stderr(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stderr="something went wrong", returncode=1),
+        ):
+            result = tool.execute(command="false", capture="stdout")
+        assert result["status"] == "error"
+        assert "something went wrong" in result["message"]
+
+    def test_nonzero_exit_error_output_is_truncated(self):
+        tool = make_tool(permission_required=False)
+        long_stderr = "e" * 200
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stderr=long_stderr, returncode=1),
+        ):
+            result = tool.execute(command="false", max_output_chars=10)
+        assert result["status"] == "error"
+        assert len(result["message"]) < 200
+
+    def test_capture_stderr_subprocess_uses_devnull_for_stdout(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hi", capture="stderr")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["stdout"] == subprocess.DEVNULL
+        assert kwargs["stderr"] == subprocess.PIPE
+
+    def test_invalid_capture_returns_error(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="echo hi", capture="bogus")
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_zero_max_output_chars_returns_error(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="echo hi", max_output_chars=0)
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_negative_max_output_chars_returns_error(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="echo hi", max_output_chars=-5)
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+
+    def test_capture_interleaved_nonzero_exit_includes_merged_output(self):
+        # With stderr=STDOUT, proc.stderr is None; merged output is in proc.stdout.
+        tool = make_tool(permission_required=False)
+        mock_proc = _completed(stdout="merged error output\n", returncode=1)
+        mock_proc.stderr = None
+        with patch("ai_cli.tools.bash.subprocess.run", return_value=mock_proc):
+            result = tool.execute(command="false", capture="interleaved")
+        assert result["status"] == "error"
+        assert "merged error output" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: truncation
+# ---------------------------------------------------------------------------
+
+
+class TestTruncation:
+    def test_output_within_limit_has_no_warning(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hi\n"),
+        ):
+            result = tool.execute(command="echo hi", max_output_chars=100)
+        assert "warning" not in result["data"]
+        assert result["data"]["output"] == "hi\n"
+
+    def test_output_exceeding_limit_is_truncated(self):
+        tool = make_tool(permission_required=False)
+        long_output = "x" * 200
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout=long_output),
+        ):
+            result = tool.execute(command="echo x", max_output_chars=10)
+        assert result["status"] == "success"
+        assert len(result["data"]["output"]) == 10
+        assert "warning" in result["data"]
+        assert "10" in result["data"]["warning"]
+
+    def test_output_at_exactly_limit_has_no_warning(self):
+        tool = make_tool(permission_required=False)
+        exact_output = "a" * 10
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout=exact_output),
+        ):
+            result = tool.execute(command="echo a", max_output_chars=10)
+        assert "warning" not in result["data"]
+
+    def test_multibyte_characters_truncated_by_char_count(self):
+        # Each '€' is 3 UTF-8 bytes; truncation must count characters, not bytes.
+        tool = make_tool(permission_required=False)
+        euro_output = "€" * 20
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout=euro_output),
+        ):
+            result = tool.execute(command="echo euro", max_output_chars=5)
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "€" * 5
+        assert "warning" in result["data"]
+
+    def test_separate_capture_warns_when_stdout_truncated(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="x" * 20, stderr="ok"),
+        ):
+            result = tool.execute(
+                command="echo x", capture="separate", max_output_chars=5
+            )
+        assert "warning" in result["data"]
+
+    def test_separate_capture_warns_when_stderr_truncated(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="ok", stderr="e" * 20),
+        ):
+            result = tool.execute(
+                command="echo ok", capture="separate", max_output_chars=5
+            )
+        assert "warning" in result["data"]
+
+    def test_separate_capture_no_warning_when_both_within_limit(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="out", stderr="err"),
+        ):
+            result = tool.execute(
+                command="echo out", capture="separate", max_output_chars=100
+            )
+        assert "warning" not in result["data"]
+
+    def test_default_max_output_chars_is_1024(self):
+        tool = make_tool(permission_required=False)
+        # 1024 chars fits, no warning
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="a" * 1024),
+        ):
+            result = tool.execute(command="echo a")
+        assert "warning" not in result["data"]
+        # 1025 chars truncates
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="a" * 1025),
+        ):
+            result = tool.execute(command="echo a")
+        assert "warning" in result["data"]
+
+    def test_warning_message_says_characters(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="x" * 200),
+        ):
+            result = tool.execute(command="echo x", max_output_chars=10)
+        assert "characters" in result["data"]["warning"]
