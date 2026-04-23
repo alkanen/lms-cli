@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from ai_cli.tools.bash import BashTool, _normalize
+from ai_cli.tools.bash import BashTool, _split_env_vars
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,34 +39,6 @@ class TestClassAttributes:
 
     def test_disabled_by_default(self):
         assert BashTool.DISABLED_BY_DEFAULT is True
-
-
-# ---------------------------------------------------------------------------
-# _normalize()
-# ---------------------------------------------------------------------------
-
-
-class TestNormalize:
-    def test_collapses_whitespace(self):
-        assert _normalize("echo  hello") == "echo hello"
-
-    def test_strips_leading_trailing(self):
-        assert _normalize("  ls  ") == "ls"
-
-    def test_handles_quoted_args(self):
-        # shlex.join re-quotes tokens that contain shell metacharacters, so
-        # the canonical form preserves token boundaries.
-        assert _normalize("python3 -c 'print(1)'") == "python3 -c 'print(1)'"
-
-    def test_spaces_in_token_preserved(self):
-        assert _normalize('rm "file with spaces.txt"') == "rm 'file with spaces.txt'"
-
-    def test_distinct_from_unquoted_spaces(self):
-        assert _normalize('rm "a b"') != _normalize("rm a b")
-
-    def test_invalid_shlex_falls_back_to_strip(self):
-        result = _normalize("echo 'unclosed")
-        assert isinstance(result, str)
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +177,15 @@ class TestExecute:
         assert result["status"] == "error"
         assert result["error"] == "invalid_command"
 
-    def test_env_var_prefix_returns_clear_error(self):
+    def test_env_var_prefix_strips_and_executes(self):
         tool = make_tool(permission_required=False)
-        result = tool.execute(command="A=1 ls -la")
-        assert result["status"] == "error"
-        assert result["error"] == "invalid_command"
-        assert "Phase 3" in result["message"]
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed("out\n")
+        ) as mock_run:
+            result = tool.execute(command="A=1 ls -la")
+        assert result["status"] == "success"
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == ["ls", "-la"]
 
     def test_subprocess_called_with_timeout(self):
         tool = make_tool(permission_required=False)
@@ -258,16 +233,20 @@ class TestExecuteLog:
         tool = make_tool()
         assert tool.execute_log(command="echo 'unclosed") == "<unparseable command>"
 
-    def test_env_var_prefix_stripped_shows_command(self):
+    def test_env_var_values_shown_in_log(self):
         tool = make_tool()
         result = tool.execute_log(command="SECRET_TOKEN=abc123 python3 script.py")
-        assert result == "python3 script.py"
-        assert "abc123" not in (result or "")
+        assert result is not None
+        assert "python3" in result
+        assert "abc123" in result
 
-    def test_multiple_env_vars_stripped(self):
+    def test_multiple_env_vars_shown_in_log(self):
         tool = make_tool()
         result = tool.execute_log(command="A=1 B=2 ls -la")
-        assert result == "ls -la"
+        assert result is not None
+        assert "A=1" in result
+        assert "B=2" in result
+        assert "ls" in result
 
     def test_only_env_vars_returns_empty_label(self):
         tool = make_tool()
@@ -371,6 +350,22 @@ class TestRequestPermission:
         tool.on_permission_granted("always: ls *", command="ls ./docs")
         allowed, _ = tool.request_permission("run ls", command="ls -la ./src")
         assert allowed is True
+
+    def test_pattern_grant_matches_bare_no_arg_command(self):
+        # "ls *" must also match bare "ls" with no arguments.
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always: ls *", command="ls")
+        allowed, _ = tool.request_permission("run ls", command="ls")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_pattern_grant_bare_command_does_not_match_different_exe(self):
+        # "ls *" must not match "lsblk" — the space position in the pattern is fixed.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        tool.on_permission_granted("always: ls *", command="ls")
+        allowed, _ = tool.request_permission("run lsblk", command="lsblk")
+        assert allowed is False
 
     def test_pattern_grant_does_not_match_different_exe(self):
         tool = make_tool(permission_required=True)
@@ -674,3 +669,191 @@ class TestTruncation:
         ):
             result = tool.execute(command="echo x", max_output_chars=10)
         assert "characters" in result["data"]["warning"]
+
+
+# ---------------------------------------------------------------------------
+# _split_env_vars()
+# ---------------------------------------------------------------------------
+
+
+class TestSplitEnvVars:
+    def test_no_env_vars(self):
+        env, cmd = _split_env_vars(["ls", "-la"])
+        assert env == {}
+        assert cmd == ["ls", "-la"]
+
+    def test_single_env_var(self):
+        env, cmd = _split_env_vars(["A=1", "ls"])
+        assert env == {"A": "1"}
+        assert cmd == ["ls"]
+
+    def test_multiple_env_vars(self):
+        env, cmd = _split_env_vars(["A=1", "B=hello", "python3", "script.py"])
+        assert env == {"A": "1", "B": "hello"}
+        assert cmd == ["python3", "script.py"]
+
+    def test_only_env_vars_returns_empty_cmd(self):
+        env, cmd = _split_env_vars(["A=1", "B=2"])
+        assert env == {"A": "1", "B": "2"}
+        assert cmd == []
+
+    def test_empty_tokens_returns_empty(self):
+        env, cmd = _split_env_vars([])
+        assert env == {}
+        assert cmd == []
+
+    def test_value_with_equals_sign(self):
+        env, cmd = _split_env_vars(["URL=http://x?a=b", "curl"])
+        assert env == {"URL": "http://x?a=b"}
+        assert cmd == ["curl"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: environment variable support
+# ---------------------------------------------------------------------------
+
+
+class TestEnvVars:
+    def test_env_var_passed_to_subprocess(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed("123\n")
+        ) as mock_run:
+            tool.execute(command="MYVAR=123 python3 -c 'print(1)'")
+        kwargs = mock_run.call_args[1]
+        assert "env" in kwargs
+        assert kwargs["env"] is not None
+        assert kwargs["env"]["MYVAR"] == "123"
+
+    def test_env_var_inherits_parent_env(self):
+        import os
+
+        tool = make_tool(permission_required=False)
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": "/tmp/bin", "HOME": "/tmp/home", "MY_VAR": "original"},
+                clear=True,
+            ),
+            patch(
+                "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            ) as mock_run,
+        ):
+            tool.execute(command="MY_VAR=abc python3 -c 'pass'")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["env"] is not None
+        assert kwargs["env"]["PATH"] == "/tmp/bin"
+        assert kwargs["env"]["HOME"] == "/tmp/home"
+        assert kwargs["env"]["MY_VAR"] == "abc"
+
+    def test_no_env_var_passes_none_as_env(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="ls -la")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["env"] is None
+
+    def test_env_var_does_not_modify_parent_process_env(self):
+        import os
+
+        tool = make_tool(permission_required=False)
+        with (
+            patch.dict(os.environ, {"PATH": "/tmp/bin"}, clear=True),
+            patch("ai_cli.tools.bash.subprocess.run", return_value=_completed()),
+        ):
+            before = dict(os.environ)
+            tool.execute(command="SECRET=leaked ls")
+            assert os.environ == before
+            assert "SECRET" not in os.environ
+
+    def test_subprocess_called_with_cmd_tokens_not_env_prefix(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="A=1 B=2 ls -la ./docs")
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == ["ls", "-la", "./docs"]
+
+    def test_multiple_env_vars_all_passed(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="A=1 B=hello C=world python3 -c 'pass'")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["env"]["A"] == "1"
+        assert kwargs["env"]["B"] == "hello"
+        assert kwargs["env"]["C"] == "world"
+
+    def test_only_env_vars_no_command_returns_error(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="A=1 B=2")
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_command"
+
+    def test_grant_key_same_var_name_different_value_matches(self):
+        # Same env var NAME, different value → same grant key → should match.
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted(
+            "always: MYVAR=* python3 *", command="MYVAR=123 python3 script.py"
+        )
+        allowed, _ = tool.request_permission(
+            "run", command="MYVAR=456 python3 other.py"
+        )
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_grant_key_different_env_var_names_do_not_match(self):
+        # Different env var NAMES → different grant key → must NOT silently match.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        tool.on_permission_granted("always", command="MYVAR=123 python3 script.py")
+        allowed, _ = tool.request_permission(
+            "run", command="PATH=/evil python3 script.py"
+        )
+        assert allowed is False
+
+    def test_exact_grant_env_var_name_scoped(self):
+        tool = make_tool(permission_required=True)
+        # Grant stored with MYVAR should match same MYVAR with a different value.
+        tool.on_permission_granted("always", command="MYVAR=123 python3 script.py")
+        allowed, _ = tool.request_permission(
+            "run", command="MYVAR=999 python3 script.py"
+        )
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_extra_permission_options_includes_env_var_names_not_values(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(
+            command="MYVAR=secret123 python3 script.py"
+        )
+        assert "always" in opts
+        assert any("python3" in o for o in opts)
+        assert any("MYVAR=*" in o for o in opts)
+        assert not any("secret123" in o for o in opts)
+
+    def test_grant_key_env_var_order_independent(self):
+        # A=1 B=2 cmd and B=2 A=1 cmd must produce the same grant key.
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="A=1 B=2 python3 script.py")
+        allowed, _ = tool.request_permission(
+            "run", command="B=99 A=42 python3 script.py"
+        )
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_extra_permission_options_env_var_order_stable(self):
+        # Options must be identical regardless of env var declaration order.
+        tool = make_tool()
+        opts_ab = tool.extra_permission_options(command="A=1 B=2 python3 script.py")
+        opts_ba = tool.extra_permission_options(command="B=2 A=1 python3 script.py")
+        assert opts_ab == opts_ba
+
+    def test_extra_permission_options_env_var_only_returns_always_only(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(command="A=1 B=2")
+        assert opts == ["always"]
