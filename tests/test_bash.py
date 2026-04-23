@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from ai_cli.tools.bash import BashTool, _split_env_vars
+from ai_cli.tools.bash import BashTool, _chain_summary, _parse_chain, _split_env_vars
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -857,3 +857,403 @@ class TestEnvVars:
         tool = make_tool()
         opts = tool.extra_permission_options(command="A=1 B=2")
         assert opts == ["always"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: _parse_chain()
+# ---------------------------------------------------------------------------
+
+
+class TestParseChain:
+    def test_single_command_returns_one_segment(self):
+        segs = _parse_chain("ls -la")
+        assert len(segs) == 1
+        assert segs[0][0] is None
+        assert segs[0][1] == "ls -la"
+
+    def test_pipe_returns_two_segments(self):
+        segs = _parse_chain("cat foo | grep bar")
+        assert len(segs) == 2
+        assert segs[0] == (None, "cat foo")
+        assert segs[1] == ("|", "grep bar")
+
+    def test_pipe_three_segments(self):
+        segs = _parse_chain("cat foo | grep bar | wc -l")
+        assert len(segs) == 3
+        assert segs[0][0] is None
+        assert segs[1][0] == "|"
+        assert segs[2][0] == "|"
+
+    def test_and_operator(self):
+        segs = _parse_chain("ls && cat foo")
+        assert len(segs) == 2
+        assert segs[0] == (None, "ls")
+        assert segs[1][0] == "&&"
+
+    def test_or_operator(self):
+        segs = _parse_chain("ls missing || echo not_found")
+        assert len(segs) == 2
+        assert segs[0] == (None, "ls missing")
+        assert segs[1][0] == "||"
+
+    def test_quoted_pipe_not_treated_as_operator(self):
+        segs = _parse_chain("echo 'hello | world'")
+        assert len(segs) == 1
+
+    def test_empty_command_returns_empty_list(self):
+        segs = _parse_chain("")
+        assert segs == []
+
+    def test_invalid_quoting_raises_value_error(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            _parse_chain("echo 'unclosed")
+
+    def test_segments_are_canonical_shlex_join(self):
+        segs = _parse_chain("ls -la ./docs | grep foo")
+        assert segs[0][1] == "ls -la ./docs"
+        assert segs[1][1] == "grep foo"
+
+    def test_mixed_operators(self):
+        segs = _parse_chain("ls && cat foo || echo done")
+        assert len(segs) == 3
+        assert segs[0][0] is None
+        assert segs[1][0] == "&&"
+        assert segs[2][0] == "||"
+
+    def test_semicolon_operator(self):
+        segs = _parse_chain("ls; echo done")
+        assert len(segs) == 2
+        assert segs[0] == (None, "ls")
+        assert segs[1][0] == ";"
+
+    def test_trailing_pipe_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="ends with"):
+            _parse_chain("ls |")
+
+    def test_trailing_and_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="ends with"):
+            _parse_chain("ls &&")
+
+    def test_leading_pipe_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="starts with"):
+            _parse_chain("| grep foo")
+
+    def test_leading_semicolon_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="starts with"):
+            _parse_chain("; echo hi")
+
+    def test_unquoted_hash_not_treated_as_comment(self):
+        # shlex defaults commenters='#'; disable it so # is a literal token.
+        segs = _parse_chain("echo hello#world")
+        assert len(segs) == 1
+        assert "hello#world" in segs[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: _chain_summary()
+# ---------------------------------------------------------------------------
+
+
+class TestChainSummary:
+    def test_single_segment(self):
+        segs = [(None, "cat foo")]
+        assert _chain_summary(segs) == "cat"
+
+    def test_pipe_two_segments(self):
+        segs = _parse_chain("cat foo | grep bar")
+        assert _chain_summary(segs) == "cat | grep"
+
+    def test_three_segments(self):
+        segs = _parse_chain("cat foo | grep bar | wc -l")
+        assert _chain_summary(segs) == "cat | grep | wc"
+
+    def test_and_operator_in_summary(self):
+        segs = _parse_chain("ls ./src && cat README")
+        assert _chain_summary(segs) == "ls && cat"
+
+    def test_or_operator_in_summary(self):
+        segs = _parse_chain("ls missing || echo done")
+        assert _chain_summary(segs) == "ls || echo"
+
+    def test_env_var_stripped_from_summary(self):
+        segs = _parse_chain("MYVAR=1 python3 script.py | grep ok")
+        assert _chain_summary(segs) == "python3 | grep"
+
+    def test_mixed_operators_in_summary(self):
+        segs = _parse_chain("ls && cat foo || echo done")
+        assert _chain_summary(segs) == "ls && cat || echo"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: chain permission (acceptance criteria)
+# ---------------------------------------------------------------------------
+
+
+class TestChainPermission:
+    def test_pipe_chain_prompts_each_unapproved_segment(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat foo | grep bar")
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_chain_summary_appears_in_question(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat foo | grep bar")
+        first_call = tool._permission_manager.request.call_args_list[0]
+        question = first_call.kwargs.get("question") or first_call.args[1]
+        assert "cat | grep" in question
+
+    def test_all_segments_approved_returns_true(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is True
+
+    def test_first_segment_denied_returns_false_immediately(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is False
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_second_segment_denied_returns_false(self):
+        tool = make_tool(permission_required=True)
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (True, "yes")
+            return (False, "Permission denied.")
+
+        tool._permission_manager.request.side_effect = side_effect
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is False
+        assert call_count[0] == 2
+
+    def test_always_grant_stored_before_later_denial(self):
+        tool = make_tool(permission_required=True)
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (True, "always")
+            return (False, "Permission denied.")
+
+        tool._permission_manager.request.side_effect = side_effect
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is False
+        # The always grant for the first segment must be stored despite later denial.
+        assert len(tool._exact_grants) == 1
+
+    def test_already_granted_segment_skips_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        # Grant the first segment.
+        tool.on_permission_granted("always", command="cat foo")
+        tool.request_permission("run", command="cat foo | grep bar")
+        # Only the second segment should be prompted.
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_all_segments_granted_skips_all_prompts(self):
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="cat foo")
+        tool.on_permission_granted("always", command="grep bar")
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_and_chain_permission(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="ls && cat foo")
+        assert allowed is True
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_or_chain_permission(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="ls missing || echo done")
+        assert allowed is True
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_semicolon_chain_permission(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="ls; echo done")
+        assert allowed is True
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_semicolon_bypasses_permission_grant_treated_as_chain(self):
+        # "grep bar; rm -rf /" must NOT be covered by a "grep *" pattern grant.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always: grep *", command="grep bar")
+        tool.request_permission("run", command="grep bar; rm -rf /")
+        # grep bar is auto-granted; rm -rf / must still prompt.
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_malformed_chain_trailing_op_returns_error_from_execute(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="ls |")
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_command"
+
+    def test_malformed_chain_leading_op_returns_error_from_execute(self):
+        tool = make_tool(permission_required=False)
+        result = tool.execute(command="| grep foo")
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_command"
+
+    def test_pattern_grant_covers_chain_segment(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always: grep *", command="grep bar")
+        tool.request_permission("run", command="cat foo | grep baz")
+        # grep baz is covered by pattern — only cat foo needs prompting.
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_single_command_still_uses_existing_logic(self):
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="echo hello")
+        allowed, _ = tool.request_permission("run", command="echo hello")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_one_time_grant_not_reused_on_next_call(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        # First call: both segments approved one-time.
+        tool.request_permission("run", command="cat foo | grep bar")
+        call_count_after_first = tool._permission_manager.request.call_count
+        # Second call: no always-grant stored, so both segments prompted again.
+        tool.request_permission("run", command="cat foo | grep bar")
+        assert tool._permission_manager.request.call_count == call_count_after_first * 2
+
+    def test_permission_not_required_skips_all_prompts(self):
+        tool = make_tool(permission_required=False)
+        allowed, _ = tool.request_permission("run", command="cat foo | grep bar")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: chain execute()
+# ---------------------------------------------------------------------------
+
+
+class TestChainExecute:
+    def test_chain_uses_shell_true(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed("result\n")
+        ) as mock_run:
+            tool.execute(command="cat foo | grep bar")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_chain_passes_original_command_string(self):
+        tool = make_tool(permission_required=False)
+        cmd = "cat foo | grep bar"
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed("result\n")
+        ) as mock_run:
+            tool.execute(command=cmd)
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == cmd
+
+    def test_chain_returns_stdout(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="matched\n"),
+        ):
+            result = tool.execute(command="cat foo | grep bar")
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "matched\n"
+
+    def test_chain_nonzero_exit_returns_error(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(returncode=1, stderr="no match"),
+        ):
+            result = tool.execute(command="cat foo | grep missing")
+        assert result["status"] == "error"
+        assert result["error"] == "execution_error"
+        assert "status 1" in result["message"]
+
+    def test_chain_timeout_returns_error(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="cat", timeout=30),
+        ):
+            result = tool.execute(command="cat foo | sleep 999")
+        assert result["status"] == "error"
+        assert result["error"] == "execution_error"
+        assert "timed out" in result["message"]
+
+    def test_chain_capture_separate(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="out\n", stderr="err\n"),
+        ):
+            result = tool.execute(command="cat foo | grep bar", capture="separate")
+        assert result["status"] == "success"
+        assert result["data"]["stdout"] == "out\n"
+        assert result["data"]["stderr"] == "err\n"
+
+    def test_chain_capture_interleaved_kwargs(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="cat foo | grep bar", capture="interleaved")
+        kwargs = mock_run.call_args[1]
+        assert kwargs["stderr"] == subprocess.STDOUT
+
+    def test_single_command_does_not_use_shell_true(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="ls -la")
+        _, kwargs = mock_run.call_args
+        assert not kwargs.get("shell")
+
+    def test_chain_execute_log_shows_raw_command(self):
+        tool = make_tool()
+        cmd = "cat foo | grep bar"
+        result = tool.execute_log(command=cmd)
+        assert result == cmd
+
+    def test_chain_execute_log_truncates_long_command(self):
+        tool = make_tool()
+        cmd = "cat " + "x" * 30 + " | grep " + "y" * 30
+        result = tool.execute_log(command=cmd)
+        assert result is not None
+        assert len(result) == 60
+        assert result.endswith("...")
+
+    def test_semicolon_chain_uses_shell_true(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed("done\n")
+        ) as mock_run:
+            tool.execute(command="ls; echo done")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True

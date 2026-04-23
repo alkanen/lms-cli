@@ -56,6 +56,69 @@ def _env_grant_prefix(env_vars: dict[str, str]) -> str:
     return " ".join(f"{key}=*" for key in sorted(env_vars))
 
 
+_CHAIN_OPS = frozenset({"||", "&&", "|", ";"})
+
+
+def _parse_chain(command: str) -> list[tuple[str | None, str]]:
+    """Split *command* on shell chain operators (``|``, ``&&``, ``||``, ``;``).
+
+    Returns a list of ``(operator, segment)`` pairs; the first operator is
+    ``None``.  Each segment string is the canonical ``shlex.join()`` of its
+    parsed tokens, so it can be passed back to ``shlex.split()`` or
+    ``_grant_key()`` without loss.
+
+    Raises ``ValueError`` if the command cannot be parsed (e.g. unclosed
+    quotes).
+    """
+    lex = shlex.shlex(command, posix=True, punctuation_chars="|&;")
+    lex.commenters = ""
+    lex.whitespace_split = True
+    tokens = list(lex)  # raises ValueError on bad quoting
+
+    segments: list[tuple[str | None, str]] = []
+    current_tokens: list[str] = []
+    current_op: str | None = None
+
+    for token in tokens:
+        if token in _CHAIN_OPS:
+            if current_tokens:
+                segments.append((current_op, shlex.join(current_tokens)))
+            current_op = token
+            current_tokens = []
+        else:
+            current_tokens.append(token)
+
+    if current_tokens:
+        segments.append((current_op, shlex.join(current_tokens)))
+    elif current_op is not None:
+        raise ValueError(f"Command ends with chain operator {current_op!r}")
+
+    if segments and segments[0][0] is not None:
+        raise ValueError(f"Command starts with chain operator {segments[0][0]!r}")
+
+    return segments
+
+
+def _chain_summary(segments: list[tuple[str | None, str]]) -> str:
+    """Return a compact chain summary: executables and operators only.
+
+    Example: segments from ``"cat foo | grep bar | awk '{print $2}'"``
+    becomes ``"cat | grep | awk"``.
+    """
+    parts: list[str] = []
+    for op, segment in segments:
+        if op is not None:
+            parts.append(op)
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            parts.append(segment)
+            continue
+        _, cmd_tokens = _split_env_vars(tokens)
+        parts.append(cmd_tokens[0] if cmd_tokens else segment)
+    return " ".join(parts)
+
+
 def _grant_key(command: str) -> str:
     """Return the normalised command key for grant matching.
 
@@ -113,6 +176,17 @@ class BashTool(Tool):
         if not self.permission_required:
             return True, ""
         cmd = kwargs.get("command", "")
+
+        # Detect chain operators — route to per-segment flow if found.
+        try:
+            segments = _parse_chain(cmd) if cmd else []
+        except ValueError:
+            segments = []
+
+        if len(segments) > 1:
+            return self._request_chain_permission(segments)
+
+        # Single command — existing grant-check logic.
         if cmd:
             normalized = _grant_key(cmd)
             if normalized in self._exact_grants:
@@ -129,6 +203,43 @@ class BashTool(Tool):
                     )
                     return True, ""
         return super().request_permission(action, **kwargs)
+
+    def _request_chain_permission(
+        self, segments: list[tuple[str | None, str]]
+    ) -> tuple[bool, str]:
+        """Request per-segment permission for a chained command.
+
+        Always-type grants are recorded immediately so they survive even when
+        a later segment is denied.
+        """
+        summary = _chain_summary(segments)
+        for op, segment in segments:
+            normalized = _grant_key(segment)
+
+            if normalized in self._exact_grants:
+                logger.debug("bash: chain segment %r exact grant matched", segment)
+                continue
+            if any(
+                fnmatch.fnmatch(normalized, p) or fnmatch.fnmatch(normalized + " ", p)
+                for p in self._pattern_grants
+            ):
+                logger.debug("bash: chain segment %r pattern grant matched", segment)
+                continue
+
+            op_str = f" {op}" if op else ""
+            segment_action = f"Chain: {summary}\nRun{op_str}: {segment}"
+            allowed, choice_or_reason = super().request_permission(
+                segment_action, command=segment
+            )
+
+            # Store grant immediately — before checking later segments.
+            if allowed and choice_or_reason:
+                self.on_permission_granted(choice_or_reason, command=segment)
+
+            if not allowed:
+                return False, choice_or_reason
+
+        return True, ""
 
     def extra_permission_options(self, **kwargs: Any) -> list[str]:
         """Return extra permission options for *command*.
@@ -188,6 +299,14 @@ class BashTool(Tool):
         if not cmd:
             return "<empty command>"
         try:
+            segments = _parse_chain(cmd)
+        except ValueError:
+            return "<unparseable command>"
+        if len(segments) > 1:
+            # Show raw command for chains — shlex.join would quote the operators.
+            return cmd if len(cmd) <= 60 else f"{cmd[:57]}..."
+        # Single command — show canonical (env values visible, not secret).
+        try:
             tokens = shlex.split(cmd)
         except ValueError:
             return "<unparseable command>"
@@ -196,7 +315,6 @@ class BashTool(Tool):
         _, cmd_tokens = _split_env_vars(tokens)
         if not cmd_tokens:
             return "<empty command>"
-        # Env vars come from the model so their values are not secret; show them.
         summary = shlex.join(tokens)
         return summary if len(summary) <= 60 else f"{summary[:57]}..."
 
@@ -209,7 +327,8 @@ class BashTool(Tool):
             name=self.name,
             description=(
                 "Run a shell command on the client computer and return its output. "
-                "The command is parsed via shlex and executed directly."
+                "Supports piping, boolean operators (&&, ||), and semicolons; "
+                "each segment requires separate user approval."
             ),
             arguments=[
                 ToolArgument(
@@ -269,22 +388,15 @@ class BashTool(Tool):
                 f"max_output_chars must be >= 1, got {max_output_chars}.",
                 400,
             )
+
+        # Detect chain operators to choose execution strategy.
         try:
-            args = shlex.split(command)
+            segments = _parse_chain(command)
         except ValueError as exc:
             logger.debug("bash: shlex parse failed: %s", exc)
             return self._err("invalid_command", f"Failed to parse command: {exc}", 400)
-        if not args:
-            return self._err("invalid_command", "Command is empty.", 400)
-        env_vars, cmd_args = _split_env_vars(args)
-        if not cmd_args:
-            return self._err(
-                "invalid_command",
-                "Command is empty after stripping environment variables. "
-                "Expected an executable after env assignments, like `A=1 ls`.",
-                400,
-            )
-        logger.debug("bash: running %r (%d arg(s))", cmd_args[0], len(cmd_args) - 1)
+
+        is_chain = len(segments) > 1
 
         # Build stream kwargs for subprocess based on capture mode.
         if capture == "interleaved":
@@ -297,40 +409,79 @@ class BashTool(Tool):
         elif capture == "separate":
             stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
         else:
-            # stdout only — stderr is captured solely for error reporting on non-zero exit
+            # stdout only — stderr captured for error reporting on non-zero exit
             stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
 
-        subprocess_env = {**os.environ, **env_vars} if env_vars else None
-        try:
-            proc = subprocess.run(
-                cmd_args,
-                **stream_kwargs,
-                text=True,
-                timeout=_DEFAULT_TIMEOUT,
-                cwd=self._workspace.root,
-                stdin=subprocess.DEVNULL,
-                env=subprocess_env,
-            )
-        except FileNotFoundError:
-            logger.debug("bash: executable not found: %r", cmd_args[0])
-            return self._err(
-                "execution_error", f"Command not found: {cmd_args[0]}", 400
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "bash: %r timed out after %ds", cmd_args[0], _DEFAULT_TIMEOUT
-            )
-            return self._err(
-                "execution_error",
-                f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
-                408,
-            )
-        except Exception as exc:
-            logger.exception("bash: unexpected error running %r", cmd_args[0])
-            return self._err("execution_error", str(exc), 500)
+        if is_chain:
+            logger.debug("bash: running chain command via shell")
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    **stream_kwargs,
+                    text=True,
+                    timeout=_DEFAULT_TIMEOUT,
+                    cwd=self._workspace.root,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "bash: chain command timed out after %ds", _DEFAULT_TIMEOUT
+                )
+                return self._err(
+                    "execution_error",
+                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
+                    408,
+                )
+            except Exception as exc:
+                logger.exception("bash: unexpected error running chain command")
+                return self._err("execution_error", str(exc), 500)
+        else:
+            if not segments:
+                return self._err("invalid_command", "Command is empty.", 400)
+            args = shlex.split(command)
+            if not args:
+                return self._err("invalid_command", "Command is empty.", 400)
+            env_vars, cmd_args = _split_env_vars(args)
+            if not cmd_args:
+                return self._err(
+                    "invalid_command",
+                    "Command is empty after stripping environment variables. "
+                    "Expected an executable after env assignments, like `A=1 ls`.",
+                    400,
+                )
+            logger.debug("bash: running %r (%d arg(s))", cmd_args[0], len(cmd_args) - 1)
+            subprocess_env = {**os.environ, **env_vars} if env_vars else None
+            try:
+                proc = subprocess.run(
+                    cmd_args,
+                    **stream_kwargs,
+                    text=True,
+                    timeout=_DEFAULT_TIMEOUT,
+                    cwd=self._workspace.root,
+                    stdin=subprocess.DEVNULL,
+                    env=subprocess_env,
+                )
+            except FileNotFoundError:
+                logger.debug("bash: executable not found: %r", cmd_args[0])
+                return self._err(
+                    "execution_error", f"Command not found: {cmd_args[0]}", 400
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "bash: %r timed out after %ds", cmd_args[0], _DEFAULT_TIMEOUT
+                )
+                return self._err(
+                    "execution_error",
+                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
+                    408,
+                )
+            except Exception as exc:
+                logger.exception("bash: unexpected error running %r", cmd_args[0])
+                return self._err("execution_error", str(exc), 500)
 
         if proc.returncode != 0:
-            logger.debug("bash: %r exited with status %d", cmd_args[0], proc.returncode)
+            logger.debug("bash: command exited with status %d", proc.returncode)
             message = f"Command exited with status {proc.returncode}."
             # interleaved merges stderr into stdout; proc.stderr is None in that mode
             raw_error = (proc.stdout if capture == "interleaved" else proc.stderr) or ""
@@ -351,7 +502,7 @@ class BashTool(Tool):
                 data["warning"] = f"Output truncated at {max_output_chars} characters"
         else:
             raw = (proc.stderr or "") if capture == "stderr" else (proc.stdout or "")
-            logger.debug("bash: %r succeeded, output=%d chars", cmd_args[0], len(raw))
+            logger.debug("bash: command succeeded, output=%d chars", len(raw))
             text, truncated = _truncate(raw, max_output_chars)
             data = {"output": text}
             if truncated:
