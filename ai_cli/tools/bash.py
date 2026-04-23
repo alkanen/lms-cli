@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -39,17 +40,40 @@ if TYPE_CHECKING:
     from ai_cli.core.workspace import Workspace
 
 
-def _normalize(command: str) -> str:
-    """Tokenise *command* and rejoin canonically, preserving token boundaries.
+def _split_env_vars(tokens: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Split leading KEY=val tokens from *tokens*, returning (env_dict, remainder)."""
+    env: dict[str, str] = {}
+    for i, token in enumerate(tokens):
+        if not _ENV_VAR_RE.match(token):
+            return env, tokens[i:]
+        key, _, val = token.partition("=")
+        env[key] = val
+    return env, []
 
-    Uses ``shlex.join`` so that tokens containing spaces are re-quoted, making
-    ``rm "file with spaces.txt"`` and ``rm file with spaces.txt`` produce
-    distinct keys rather than collapsing to the same string.
+
+def _env_grant_prefix(env_vars: dict[str, str]) -> str:
+    """Return a sorted ``KEY=*`` prefix string for grant keys and permission options."""
+    return " ".join(f"{key}=*" for key in sorted(env_vars))
+
+
+def _grant_key(command: str) -> str:
+    """Return the normalised command key for grant matching.
+
+    Leading env var assignments are included by variable name only, not by
+    value. This makes grants sensitive to which leading env vars are present
+    (for example, adding or removing ``PATH=...`` or ``LD_PRELOAD=...`` changes
+    the key), but changing the value of an already-present env var does not.
     """
     try:
-        return shlex.join(shlex.split(command))
+        tokens = shlex.split(command)
     except ValueError:
         return command.strip()
+    env_vars, cmd_tokens = _split_env_vars(tokens)
+    cmd_key = shlex.join(cmd_tokens)
+    if not env_vars:
+        return cmd_key
+    env_key = _env_grant_prefix(env_vars)
+    return f"{env_key} {cmd_key}" if cmd_key else env_key
 
 
 class BashTool(Tool):
@@ -90,12 +114,16 @@ class BashTool(Tool):
             return True, ""
         cmd = kwargs.get("command", "")
         if cmd:
-            normalized = _normalize(cmd)
+            normalized = _grant_key(cmd)
             if normalized in self._exact_grants:
                 logger.debug("bash: exact grant matched — skipping prompt")
                 return True, ""
             for pattern in self._pattern_grants:
-                if fnmatch.fnmatch(normalized, pattern):
+                # Also try with a trailing space so that a bare no-arg command
+                # (e.g. "ls") matches its own "ls *" wildcard grant.
+                if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(
+                    normalized + " ", pattern
+                ):
                     logger.debug(
                         "bash: pattern grant %r matched — skipping prompt", pattern
                     )
@@ -124,16 +152,22 @@ class BashTool(Tool):
             return ["always"]
         if not tokens:
             return ["always"]
-        if len(tokens) == 1:
-            return ["always", f"always: {tokens[0]} *"]
-        leading = shlex.join(tokens[:-1])
-        return ["always", f"always: {leading} *"]
+        env_vars, cmd_tokens = _split_env_vars(tokens)
+        if not cmd_tokens:
+            return ["always"]
+        env_prefix = _env_grant_prefix(env_vars)
+        if len(cmd_tokens) == 1:
+            exe_part = f"{env_prefix} {cmd_tokens[0]}" if env_prefix else cmd_tokens[0]
+            return ["always", f"always: {exe_part} *"]
+        leading = shlex.join(cmd_tokens[:-1])
+        cmd_part = f"{env_prefix} {leading}" if env_prefix else leading
+        return ["always", f"always: {cmd_part} *"]
 
     def on_permission_granted(self, choice: str, **kwargs: Any) -> None:
         cmd = kwargs.get("command", "")
         if not cmd:
             return
-        normalized = _normalize(cmd)
+        normalized = _grant_key(cmd)
         if not normalized:
             return
         if choice == "always":
@@ -159,14 +193,11 @@ class BashTool(Tool):
             return "<unparseable command>"
         if not tokens:
             return "<empty command>"
-        # Strip leading KEY=value tokens so env var values are never written to
-        # logs.  Phase 3 will add proper env var support to execute() itself.
-        exe_idx = next(
-            (i for i, t in enumerate(tokens) if not _ENV_VAR_RE.match(t)), len(tokens)
-        )
-        if exe_idx >= len(tokens):
+        _, cmd_tokens = _split_env_vars(tokens)
+        if not cmd_tokens:
             return "<empty command>"
-        summary = shlex.join(tokens[exe_idx:])
+        # Env vars come from the model so their values are not secret; show them.
+        summary = shlex.join(tokens)
         return summary if len(summary) <= 60 else f"{summary[:57]}..."
 
     # ------------------------------------------------------------------
@@ -245,16 +276,15 @@ class BashTool(Tool):
             return self._err("invalid_command", f"Failed to parse command: {exc}", 400)
         if not args:
             return self._err("invalid_command", "Command is empty.", 400)
-        if _ENV_VAR_RE.match(args[0]):
-            logger.debug("bash: rejected env-var prefix in args[0]=%r", args[0])
+        env_vars, cmd_args = _split_env_vars(args)
+        if not cmd_args:
             return self._err(
                 "invalid_command",
-                "Environment variable prefixes (e.g. KEY=val) are not supported "
-                "until Phase 3. Run the command without the prefix or set the "
-                "variable in a prior step.",
+                "Command is empty after stripping environment variables. "
+                "Expected an executable after env assignments, like `A=1 ls`.",
                 400,
             )
-        logger.debug("bash: running %r (%d arg(s))", args[0], len(args) - 1)
+        logger.debug("bash: running %r (%d arg(s))", cmd_args[0], len(cmd_args) - 1)
 
         # Build stream kwargs for subprocess based on capture mode.
         if capture == "interleaved":
@@ -270,31 +300,37 @@ class BashTool(Tool):
             # stdout only — stderr is captured solely for error reporting on non-zero exit
             stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
 
+        subprocess_env = {**os.environ, **env_vars} if env_vars else None
         try:
             proc = subprocess.run(
-                args,
+                cmd_args,
                 **stream_kwargs,
                 text=True,
                 timeout=_DEFAULT_TIMEOUT,
                 cwd=self._workspace.root,
                 stdin=subprocess.DEVNULL,
+                env=subprocess_env,
             )
         except FileNotFoundError:
-            logger.debug("bash: executable not found: %r", args[0])
-            return self._err("execution_error", f"Command not found: {args[0]}", 400)
+            logger.debug("bash: executable not found: %r", cmd_args[0])
+            return self._err(
+                "execution_error", f"Command not found: {cmd_args[0]}", 400
+            )
         except subprocess.TimeoutExpired:
-            logger.warning("bash: %r timed out after %ds", args[0], _DEFAULT_TIMEOUT)
+            logger.warning(
+                "bash: %r timed out after %ds", cmd_args[0], _DEFAULT_TIMEOUT
+            )
             return self._err(
                 "execution_error",
                 f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
                 408,
             )
         except Exception as exc:
-            logger.exception("bash: unexpected error running %r", args[0])
+            logger.exception("bash: unexpected error running %r", cmd_args[0])
             return self._err("execution_error", str(exc), 500)
 
         if proc.returncode != 0:
-            logger.debug("bash: %r exited with status %d", args[0], proc.returncode)
+            logger.debug("bash: %r exited with status %d", cmd_args[0], proc.returncode)
             message = f"Command exited with status {proc.returncode}."
             # interleaved merges stderr into stdout; proc.stderr is None in that mode
             raw_error = (proc.stdout if capture == "interleaved" else proc.stderr) or ""
@@ -315,7 +351,7 @@ class BashTool(Tool):
                 data["warning"] = f"Output truncated at {max_output_chars} characters"
         else:
             raw = (proc.stderr or "") if capture == "stderr" else (proc.stdout or "")
-            logger.debug("bash: %r succeeded, output=%d chars", args[0], len(raw))
+            logger.debug("bash: %r succeeded, output=%d chars", cmd_args[0], len(raw))
             text, truncated = _truncate(raw, max_output_chars)
             data = {"output": text}
             if truncated:
