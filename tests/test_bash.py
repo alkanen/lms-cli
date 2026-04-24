@@ -5,7 +5,15 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from ai_cli.tools.bash import BashTool, _chain_summary, _parse_chain, _split_env_vars
+from ai_cli.tools.bash import (
+    BashTool,
+    _chain_summary,
+    _parse_chain,
+    _parse_redirections,
+    _redir_pattern_match,
+    _split_env_vars,
+    _tokenize_segment,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -910,10 +918,17 @@ class TestParseChain:
         with pytest.raises(ValueError):
             _parse_chain("echo 'unclosed")
 
-    def test_segments_are_canonical_shlex_join(self):
+    def test_segments_are_raw_substrings(self):
         segs = _parse_chain("ls -la ./docs | grep foo")
         assert segs[0][1] == "ls -la ./docs"
         assert segs[1][1] == "grep foo"
+
+    def test_chain_preserves_redirect_in_segment(self):
+        # Redirect operator must NOT be re-quoted by shlex.join — it must be
+        # detectable by _parse_redirections in a chained segment.
+        segs = _parse_chain("echo hi>out.txt | wc")
+        assert segs[0][1] == "echo hi>out.txt"
+        assert segs[1][1] == "wc"
 
     def test_mixed_operators(self):
         segs = _parse_chain("ls && cat foo || echo done")
@@ -957,6 +972,44 @@ class TestParseChain:
         segs = _parse_chain("echo hello#world")
         assert len(segs) == 1
         assert "hello#world" in segs[0][1]
+
+    def test_consecutive_and_operators_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Empty segment"):
+            _parse_chain("ls && && echo")
+
+    def test_consecutive_pipe_operators_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Empty segment"):
+            _parse_chain("ls | | grep foo")
+
+    def test_consecutive_or_operators_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Empty segment"):
+            _parse_chain("ls || || echo done")
+
+    def test_mixed_consecutive_operators_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Empty segment"):
+            _parse_chain("ls | && echo")
+
+    def test_quoted_chain_operator_is_not_rejected(self):
+        # echo "&&" — the && is inside double-quotes; must NOT be treated as a
+        # trailing chain operator (shlex would strip the quotes and misidentify it).
+        segs = _parse_chain('echo "&&"')
+        assert len(segs) == 1
+        assert segs[0][0] is None
+
+    def test_trailing_operator_detected_via_scan(self):
+        # echo hello && — trailing && should still be caught via scan state.
+        import pytest
+
+        with pytest.raises(ValueError, match="ends with"):
+            _parse_chain("echo hello &&")
 
 
 # ---------------------------------------------------------------------------
@@ -1257,3 +1310,733 @@ class TestChainExecute:
             tool.execute(command="ls; echo done")
         _, kwargs = mock_run.call_args
         assert kwargs.get("shell") is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: _tokenize_segment()
+# ---------------------------------------------------------------------------
+
+
+class TestTokenizeSegment:
+    def test_plain_words(self):
+        toks = _tokenize_segment("ls -la ./docs")
+        assert [v for v, *_ in toks] == ["ls", "-la", "./docs"]
+
+    def test_redirect_op_split_out(self):
+        toks = _tokenize_segment("echo hi>out.txt")
+        values = [v for v, *_ in toks]
+        assert values == ["echo", "hi", ">", "out.txt"]
+
+    def test_append_op(self):
+        toks = _tokenize_segment("echo hi>>log.txt")
+        assert [v for v, *_ in toks] == ["echo", "hi", ">>", "log.txt"]
+
+    def test_2_adjacent_to_op(self):
+        toks = _tokenize_segment("ls 2>&1")
+        vals = [v for v, *_ in toks]
+        assert vals == ["ls", "2", ">", "&1"]
+        # raw_end of "2" == raw_start of ">"
+        two_end = toks[1][2]
+        gt_start = toks[2][1]
+        assert two_end == gt_start
+
+    def test_2_space_separated_from_op(self):
+        toks = _tokenize_segment("echo 2 > out.txt")
+        vals = [v for v, *_ in toks]
+        assert vals == ["echo", "2", ">", "out.txt"]
+        two_end = toks[1][2]
+        gt_start = toks[2][1]
+        assert two_end != gt_start  # NOT adjacent
+
+    def test_single_quoted_string_preserves_content(self):
+        toks = _tokenize_segment("echo '> not a redirect'")
+        assert toks[1][0] == "> not a redirect"
+
+    def test_raw_positions_are_accurate(self):
+        # For an unquoted-only input the raw slice must equal the token value.
+        text = "cat<input.txt"
+        toks = _tokenize_segment(text)
+        for val, start, end in toks:
+            assert 0 <= start < end <= len(text)
+            assert text[start:end] == val
+
+    def test_dq_backslash_escapes_special_chars(self):
+        # Inside double-quotes, backslash escapes \, $, `, ", newline.
+        toks = _tokenize_segment(r'echo "\\"')
+        assert toks[1][0] == "\\"  # one literal backslash
+
+    def test_dq_backslash_preserved_for_non_special(self):
+        # Inside double-quotes, backslash before non-special char is kept literally.
+        toks = _tokenize_segment(r'echo "\>"')
+        assert toks[1][0] == r"\>"  # backslash preserved — not stripped
+
+    def test_dq_backslash_gt_not_a_redirect(self):
+        # echo "\>" — the > is escaped inside double-quotes, so not a redirect.
+        cmd, redirs = _parse_redirections(r'echo "\>"')
+        assert redirs == []
+        assert r"\>" in cmd
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: _parse_redirections()
+# ---------------------------------------------------------------------------
+
+
+class TestParseRedirections:
+    def test_no_redirections(self):
+        cmd, redirs = _parse_redirections("ls -la")
+        assert cmd == "ls -la"
+        assert redirs == []
+
+    def test_stdout_redirect(self):
+        cmd, redirs = _parse_redirections("cat file > output.txt")
+        assert cmd == "cat file"
+        assert redirs == ["> output.txt"]
+
+    def test_stdout_append(self):
+        cmd, redirs = _parse_redirections("echo hello >> log.txt")
+        assert cmd == "echo hello"
+        assert redirs == [">> log.txt"]
+
+    def test_stderr_to_stdout(self):
+        cmd, redirs = _parse_redirections("ls path 2>&1")
+        assert cmd == "ls path"
+        assert redirs == ["2>&1"]
+
+    def test_stderr_redirect(self):
+        cmd, redirs = _parse_redirections("ls missing 2> err.txt")
+        assert cmd == "ls missing"
+        assert redirs == ["2> err.txt"]
+
+    def test_stderr_append(self):
+        cmd, redirs = _parse_redirections("cmd 2>> err.log")
+        assert cmd == "cmd"
+        assert redirs == ["2>> err.log"]
+
+    def test_stdin_redirect(self):
+        cmd, redirs = _parse_redirections("cat < input.txt")
+        assert cmd == "cat"
+        assert redirs == ["< input.txt"]
+
+    def test_multiple_redirections(self):
+        cmd, redirs = _parse_redirections("cmd > out.txt 2>&1")
+        assert cmd == "cmd"
+        assert "> out.txt" in redirs
+        assert "2>&1" in redirs
+        assert len(redirs) == 2
+
+    def test_empty_segment(self):
+        cmd, redirs = _parse_redirections("")
+        assert cmd == ""
+        assert redirs == []
+
+    def test_quoted_redirect_string_not_treated_as_redirect(self):
+        # A quoted string whose content starts with ">" but is not a standalone
+        # ">" token (e.g. "> not a redirect") is correctly left in the command.
+        cmd, redirs = _parse_redirections("echo '> not a redirect'")
+        assert redirs == []
+        assert "echo" in cmd
+
+    def test_quoted_standalone_operator_is_not_a_redirect(self):
+        # A single-quoted ">" is a literal argument, not a redirection operator.
+        cmd, redirs = _parse_redirections("echo '>' foo")
+        assert redirs == []
+        assert ">" in cmd
+
+    def test_dangling_redirect_operator_treated_as_arg(self):
+        # A trailing ">" with no following filename is absorbed into command.
+        cmd, redirs = _parse_redirections("ls >")
+        assert ">" in cmd
+        assert redirs == []
+
+    def test_stdout_to_devnull(self):
+        cmd, redirs = _parse_redirections("cmd > /dev/null 2>&1")
+        assert cmd == "cmd"
+        assert "> /dev/null" in redirs
+        assert "2>&1" in redirs
+
+    def test_path_with_spaces_in_filename(self):
+        # Raw form preserves quoting so the stored grant key reflects the original form.
+        cmd, redirs = _parse_redirections("echo hi > 'my file.txt'")
+        assert cmd == "echo hi"
+        assert redirs == ["> 'my file.txt'"]
+
+    def test_stdout_redirect_no_whitespace(self):
+        cmd, redirs = _parse_redirections("echo hi >output.txt")
+        assert cmd == "echo hi"
+        assert redirs == ["> output.txt"]
+
+    def test_stderr_redirect_no_whitespace(self):
+        cmd, redirs = _parse_redirections("ls 2>err.txt")
+        assert cmd == "ls"
+        assert redirs == ["2> err.txt"]
+
+    def test_append_redirect_no_whitespace(self):
+        cmd, redirs = _parse_redirections("echo hi >>log.txt")
+        assert cmd == "echo hi"
+        assert redirs == [">> log.txt"]
+
+    def test_stdin_redirect_no_whitespace(self):
+        cmd, redirs = _parse_redirections("cat <input.txt")
+        assert cmd == "cat"
+        assert redirs == ["< input.txt"]
+
+    def test_stderr_append_no_whitespace(self):
+        cmd, redirs = _parse_redirections("cmd 2>>err.log")
+        assert cmd == "cmd"
+        assert redirs == ["2>> err.log"]
+
+    def test_no_whitespace_redirect_does_not_affect_2_to_1(self):
+        # "2>&1" must still be treated as self-contained, not split as "2>" + "&1".
+        cmd, redirs = _parse_redirections("ls 2>&1")
+        assert cmd == "ls"
+        assert redirs == ["2>&1"]
+
+    def test_operator_adjacent_to_preceding_word(self):
+        # "echo hi>out.txt" — operator immediately follows a non-digit word.
+        cmd, redirs = _parse_redirections("echo hi>out.txt")
+        assert cmd == "echo hi"
+        assert redirs == ["> out.txt"]
+
+    def test_stdin_redirect_adjacent_to_preceding_word(self):
+        # "cat<input.txt" — "<" immediately follows the command name.
+        cmd, redirs = _parse_redirections("cat<input.txt")
+        assert cmd == "cat"
+        assert redirs == ["< input.txt"]
+
+    def test_append_adjacent_to_preceding_word(self):
+        cmd, redirs = _parse_redirections("echo hi>>log.txt")
+        assert cmd == "echo hi"
+        assert redirs == [">> log.txt"]
+
+    def test_space_separated_digit_is_not_fd_prefix(self):
+        # "echo 2 > out.txt" prints "2" to out.txt (stdout redirect); the "2"
+        # must NOT be absorbed as an fd prefix — it is a command argument.
+        cmd, redirs = _parse_redirections("echo 2 > out.txt")
+        assert cmd == "echo 2"
+        assert redirs == ["> out.txt"]
+
+    def test_adjacent_digit_is_fd_prefix(self):
+        # "ls 2>&1" has no space between "2" and ">", so "2" IS the fd prefix.
+        cmd, redirs = _parse_redirections("ls 2>&1")
+        assert cmd == "ls"
+        assert redirs == ["2>&1"]
+
+    def test_adjacent_digit_fd_redirect_to_file(self):
+        cmd, redirs = _parse_redirections("cmd 2>err.txt")
+        assert cmd == "cmd"
+        assert redirs == ["2> err.txt"]
+
+    def test_quoted_digit_not_absorbed_as_fd_prefix(self):
+        # Shell requires an unquoted integer for an IO number: '2'>file means
+        # "print '2' to file" (stdout redirect), NOT a stderr redirect.
+        cmd, redirs = _parse_redirections("echo '2'>out.txt")
+        assert cmd == "echo 2"
+        assert redirs == ["> out.txt"]
+
+    def test_backslash_escaped_digit_not_absorbed_as_fd_prefix(self):
+        # \2 is an escaped literal "2" — not a bare integer IO number.
+        cmd, redirs = _parse_redirections(r"echo \2>out.txt")
+        assert cmd == r"echo 2"
+        assert redirs == ["> out.txt"]
+
+    def test_space_separated_digit_not_absorbed_even_when_adjacent_op_appears_later(
+        self,
+    ):
+        # "echo 2 > out.txt 2>err.txt": the first ">" has a space before it so
+        # "2" must NOT be absorbed as its fd prefix, even though "2>" appears
+        # later in the segment (a false-positive from a global substring check).
+        cmd, redirs = _parse_redirections("echo 2 > out.txt 2>err.txt")
+        assert cmd == "echo 2"
+        assert "> out.txt" in redirs
+        assert "2> err.txt" in redirs
+        assert len(redirs) == 2
+
+    def test_quoted_fd_target_treated_as_filename(self):
+        # cmd >'&1' — the &1 is quoted, so not an fd-dup target.
+        # Raw form preserves the quoting so grant for "> '&1'" != grant for "> &1".
+        cmd, redirs = _parse_redirections("cmd >'&1'")
+        assert cmd == "cmd"
+        assert redirs == ["> '&1'"]
+
+    def test_backslash_fd_target_treated_as_filename(self):
+        # cmd >\&1 — the & is escaped, so not an fd-dup target.
+        # Raw form preserves the backslash.
+        cmd, redirs = _parse_redirections(r"cmd >\&1")
+        assert cmd == "cmd"
+        assert redirs == [r"> \&1"]
+
+    def test_space_before_fd_target_treated_as_filename(self):
+        # cmd > &1 — space between op and &1, so not fd-dup → file named "&1".
+        cmd, redirs = _parse_redirections("cmd > &1")
+        assert cmd == "cmd"
+        assert redirs == ["> &1"]
+
+    def test_adjacent_unquoted_fd_target_is_fd_dup(self):
+        # cmd >&1 — adjacent and unquoted → genuine fd-dup.
+        cmd, redirs = _parse_redirections("cmd >&1")
+        assert cmd == "cmd"
+        assert redirs == [">&1"]
+
+    def test_space_between_op_and_ampersand_digit_is_filename(self):
+        # "cmd > &1 other" — &1 is not adjacent to >, so not fd-dup; treated as filename.
+        cmd, redirs = _parse_redirections("cmd > &1 other")
+        assert redirs == ["> &1"]
+        assert "other" in cmd
+
+    def test_single_quoted_gt_is_not_redirect(self):
+        # echo '>' foo — the > is quoted, so it is a literal argument.
+        cmd, redirs = _parse_redirections("echo '>' foo")
+        assert redirs == []
+        assert ">" in cmd
+
+    def test_backslash_escaped_gt_is_not_redirect(self):
+        # echo \> foo — the > is backslash-escaped, so it is a literal argument.
+        cmd, redirs = _parse_redirections(r"echo \> foo")
+        assert redirs == []
+        assert ">" in cmd
+
+    def test_double_quoted_gt_is_not_redirect(self):
+        # echo ">" foo — the > is inside double-quotes, so it is a literal argument.
+        cmd, redirs = _parse_redirections('echo ">" foo')
+        assert redirs == []
+        assert ">" in cmd
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: permission flow for redirections
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectionPermission:
+    def test_stdout_redirect_two_prompts(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat file > output.txt")
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_stderr_to_stdout_two_prompts(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="ls path 2>&1")
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_redirect_denial_denies_whole_call(self):
+        tool = make_tool(permission_required=True)
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            call_count[0] += 1
+            return (
+                (True, "yes") if call_count[0] == 1 else (False, "Permission denied.")
+            )
+
+        tool._permission_manager.request.side_effect = side_effect
+        allowed, _ = tool.request_permission("run", command="cat file > output.txt")
+        assert allowed is False
+        assert call_count[0] == 2
+
+    def test_command_denial_skips_redirect_check(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        allowed, _ = tool.request_permission("run", command="cat file > output.txt")
+        assert allowed is False
+        # Command denied → redirect never prompted.
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_redirect_exact_grant_skips_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always", redirection="> output.txt")
+        tool.request_permission("run", command="cat file > output.txt")
+        tool._permission_manager.request.assert_not_called()
+
+    def test_redirect_pattern_grant_skips_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > *", redirection="> output.txt")
+        tool.request_permission("run", command="cat file > other.txt")
+        tool._permission_manager.request.assert_not_called()
+
+    def test_redirect_path_pattern_grant(self):
+        tool = make_tool(permission_required=True)
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > ./docs/*", redirection="> ./docs/out.txt")
+        allowed, _ = tool.request_permission("run", command="cat file > ./docs/new.txt")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_append_not_covered_by_redirect_grant(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="echo hello")
+        tool.on_permission_granted("always: > *", redirection="> output.txt")
+        # ">>" should NOT be covered by the "> *" pattern.
+        tool.request_permission("run", command="echo hello >> log.txt")
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_wildcard_grant_does_not_match_absolute_path(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > *", redirection="> output.txt")
+        # "> *" must NOT cover absolute paths like "> /etc/passwd".
+        tool.request_permission("run", command="cat file > /etc/passwd")
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_dir_wildcard_grant_does_not_match_subdirectory(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > ./docs/*", redirection="> ./docs/out.txt")
+        # "> ./docs/*" must NOT cover deeper paths like "> ./docs/sub/file".
+        tool.request_permission("run", command="cat file > ./docs/sub/file")
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_no_redirect_single_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat file")
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_permission_not_required_skips_redirect_check(self):
+        tool = make_tool(permission_required=False)
+        allowed, _ = tool.request_permission("run", command="cat file > output.txt")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_shell_meta_redir_not_auto_approved_by_wildcard_grant(self):
+        # A wildcard grant "> *" must NOT auto-approve a target containing '$'.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > *", redirection="> output.txt")
+        # Simulate: the model passes a redirection target with a shell metachar.
+        # _redir_is_granted must return False for "$(rm -rf /)", forcing a prompt.
+        tool.request_permission("run", command="cat file > '$(rm -rf /)'")
+        assert tool._permission_manager.request.call_count >= 1
+
+    def test_backtick_redir_not_auto_approved_by_wildcard_grant(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="cat file")
+        tool.on_permission_granted("always: > *", redirection="> output.txt")
+        tool.request_permission("run", command="cat file > '`id`'")
+        assert tool._permission_manager.request.call_count >= 1
+
+    def test_redirect_always_grant_survives_later_denial(self):
+        # An always grant on the redirect must be stored even if a later
+        # segment in a chain is denied.
+        tool = make_tool(permission_required=True)
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (True, "always")  # command: cat file — always grant
+            if call_count[0] == 2:
+                return (True, "always")  # redirect: > out.txt — always grant
+            return (False, "Permission denied.")  # grep: denied
+
+        tool._permission_manager.request.side_effect = side_effect
+        allowed, _ = tool.request_permission(
+            "run", command="cat file > out.txt | grep foo"
+        )
+        assert allowed is False
+        # Both always grants must be stored.
+        assert "cat file" in tool._exact_grants
+        assert "> out.txt" in tool._exact_grants
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: extra_permission_options for redirections
+# ---------------------------------------------------------------------------
+
+
+class TestRedirPatternMatch:
+    def test_star_matches_plain_filename(self):
+        assert _redir_pattern_match("> out.txt", "> *") is True
+
+    def test_star_does_not_match_absolute_path(self):
+        assert _redir_pattern_match("> /etc/passwd", "> *") is False
+
+    def test_star_does_not_cross_slash(self):
+        assert _redir_pattern_match("> ./docs/out.txt", "> *") is False
+
+    def test_dir_star_matches_direct_child(self):
+        assert _redir_pattern_match("> ./docs/out.txt", "> ./docs/*") is True
+
+    def test_dir_star_does_not_match_subdirectory(self):
+        assert _redir_pattern_match("> ./docs/sub/file", "> ./docs/*") is False
+
+    def test_dir_star_does_not_match_absolute_path(self):
+        assert _redir_pattern_match("> /etc/passwd", "> ./docs/*") is False
+
+    def test_exact_match_no_wildcard(self):
+        assert _redir_pattern_match("2>&1", "2>&1") is True
+
+    def test_exact_match_no_wildcard_mismatch(self):
+        assert _redir_pattern_match("2>&2", "2>&1") is False
+
+    def test_append_operator(self):
+        assert _redir_pattern_match(">> log.txt", ">> *") is True
+
+    def test_stdout_pattern_does_not_match_append(self):
+        assert _redir_pattern_match(">> log.txt", "> *") is False
+
+    def test_star_does_not_match_windows_absolute_path(self):
+        # "> *" must not cover Windows absolute paths containing backslashes.
+        assert _redir_pattern_match(r"> C:\Windows\system32\file", "> *") is False
+
+    def test_star_does_not_cross_backslash(self):
+        # "*" must not cross a Windows directory separator.
+        assert _redir_pattern_match(r"> dir\file.txt", "> *") is False
+
+    def test_backslash_dir_star_matches_direct_child(self):
+        # A pattern with a literal backslash prefix can match its direct children.
+        assert _redir_pattern_match(r"> dir\file.txt", r"> dir\*") is True
+
+    def test_backslash_dir_star_does_not_match_subdirectory(self):
+        assert _redir_pattern_match(r"> dir\sub\file", r"> dir\*") is False
+
+    def test_question_mark_matches_single_char(self):
+        assert _redir_pattern_match("> out.txt", "> out.???") is True
+
+    def test_question_mark_does_not_cross_slash(self):
+        assert _redir_pattern_match("> a/b", "> a?b") is False
+
+    def test_bracket_class_matches(self):
+        assert _redir_pattern_match("> out.txt", "> out.[tT]xt") is True
+
+    def test_bracket_class_no_match(self):
+        assert _redir_pattern_match("> out.txt", "> out.[xyz]xt") is False
+
+    def test_unclosed_bracket_treated_as_literal(self):
+        # An unclosed '[' is treated as a literal character, not a class.
+        assert _redir_pattern_match("> [out.txt", "> [out.txt") is True
+
+    def test_negated_bracket_class_matches(self):
+        # "[!a]" in fnmatch means "not a" — must be translated to "[^a]" in regex.
+        assert _redir_pattern_match("> out.txt", "> out.[!x]xt") is True
+
+    def test_negated_bracket_class_no_match(self):
+        assert _redir_pattern_match("> out.txt", "> out.[!t]xt") is False
+
+    def test_quoted_target_grant_does_not_match_unquoted_expanding_form(self):
+        # Approving "> '$(id)'" must NOT auto-approve "> $(id)" (unquoted).
+        # The raw form is stored so the two are different exact grant keys.
+        cmd, redirs_quoted = _parse_redirections("cmd > '$(id)'")
+        cmd2, redirs_unquoted = _parse_redirections("cmd > $(id)")
+        assert redirs_quoted == ["> '$(id)'"]
+        assert redirs_unquoted == ["> $(id)"]
+        assert redirs_quoted[0] != redirs_unquoted[0]
+
+
+class TestRedirectionExtraOptions:
+    def test_redirect_with_file_has_two_options(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> output.txt")
+        assert "always" in opts
+        assert len(opts) == 2
+
+    def test_redirect_wildcard_no_parent_dir(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> output.txt")
+        assert "always: > *" in opts
+
+    def test_redirect_wildcard_uses_parent_dir(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> ./docs/output.txt")
+        assert "always: > ./docs/*" in opts
+
+    def test_redirect_no_file_only_always(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="2>&1")
+        assert opts == ["always"]
+
+    def test_append_redirect_wildcard(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection=">> /tmp/log.txt")
+        assert "always: >> /tmp/*" in opts
+
+    def test_stdin_redirect_wildcard(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="< input.txt")
+        assert "always: < *" in opts
+
+    def test_stderr_redirect_wildcard(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="2> err.txt")
+        assert "always: 2> *" in opts
+
+    def test_root_level_file_no_double_slash(self):
+        # dirname("/out.txt") == "/" — must emit "> /*" not "> //*".
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> /out.txt")
+        assert "always: > /*" in opts
+        assert "always: > //*" not in opts
+
+    def test_backslash_separator_parent(self):
+        # On POSIX, os.path.dirname("dir\\file.txt") returns "" — we'd lose the
+        # parent.  The separator-aware split must give "> dir\\*" instead of "> *".
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection=r"> dir\file.txt")
+        assert r"always: > dir\*" in opts
+
+    def test_quoted_filename_falls_back_to_exact_only(self):
+        # A quoted target like "'./docs/out.txt'" would produce a malformed
+        # pattern ">'./docs/*" (unbalanced quote); offer only "always".
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> './docs/out.txt'")
+        assert opts == ["always"]
+
+    def test_quoted_simple_filename_falls_back_to_exact_only(self):
+        # Even a simply-quoted filename like "'out.txt'" skips the wildcard option.
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> 'out.txt'")
+        assert opts == ["always"]
+
+    def test_shell_meta_in_filename_suppresses_wildcard_option(self):
+        # A target like "> $HOME/file" contains a metachar; wildcard grant would
+        # never fire (blocked in _redir_is_granted), so only "always" is offered.
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> $HOME/file.txt")
+        assert opts == ["always"]
+
+    def test_backtick_in_filename_suppresses_wildcard_option(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> `id`.txt")
+        assert opts == ["always"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: execute() with redirections
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectionExecute:
+    def test_stdout_redirect_uses_shell(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hello > /tmp/out.txt")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_stdout_redirect_passes_full_command_string(self):
+        tool = make_tool(permission_required=False)
+        cmd = "echo hello > /tmp/out.txt"
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command=cmd)
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == cmd
+
+    def test_plain_command_no_redirect_does_not_use_shell(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="ls -la")
+        _, kwargs = mock_run.call_args
+        assert not kwargs.get("shell")
+
+    def test_redirect_execute_log_shows_raw_command(self):
+        tool = make_tool()
+        cmd = "echo hello > output.txt"
+        assert tool.execute_log(command=cmd) == cmd
+
+    def test_redirect_execute_log_truncates_long_command(self):
+        tool = make_tool()
+        cmd = "echo " + "x" * 30 + " > " + "y" * 30
+        result = tool.execute_log(command=cmd)
+        assert result is not None
+        assert len(result) == 60
+        assert result.endswith("...")
+
+    def test_stdout_redirect_no_whitespace_uses_shell(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hi >output.txt")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_stderr_redirect_no_whitespace_permission_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="ls 2>err.txt")
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_operator_adjacent_to_word_uses_shell(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="echo hi>output.txt")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_operator_adjacent_to_word_two_permission_prompts(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="echo hi>output.txt")
+        assert tool._permission_manager.request.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: redirections inside chained commands
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectionInChain:
+    def test_chain_redirect_in_first_segment_prompts_separately(self):
+        # "echo hi>out.txt | wc" must produce 3 prompts:
+        # 1) echo hi (command), 2) >out.txt (redirect), 3) wc (command)
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="echo hi>out.txt | wc")
+        assert tool._permission_manager.request.call_count == 3
+
+    def test_chain_redirect_denial_in_first_segment_denies_chain(self):
+        # Denying the redirect in segment 1 aborts the whole chain.
+        tool = make_tool(permission_required=True)
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            call_count[0] += 1
+            return (
+                (True, "yes") if call_count[0] == 1 else (False, "Permission denied.")
+            )
+
+        tool._permission_manager.request.side_effect = side_effect
+        allowed, _ = tool.request_permission("run", command="echo hi>out.txt | wc")
+        assert allowed is False
+        assert call_count[0] == 2  # cmd approved, redirect denied → stop
+
+    def test_chain_redirect_grant_skips_redirect_prompt(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.on_permission_granted("always", command="echo hi")
+        # _parse_redirections normalises the redirect with a space: "> out.txt"
+        tool.on_permission_granted("always", redirection="> out.txt")
+        # Only "wc" needs prompting.
+        tool.request_permission("run", command="echo hi>out.txt | wc")
+        assert tool._permission_manager.request.call_count == 1
+
+    def test_chain_redirect_and_operator_prompts_each_segment(self):
+        # "cmd > out.txt && other" → 3 prompts: cmd, redirect, other
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cmd > out.txt && other")
+        assert tool._permission_manager.request.call_count == 3
+
+    def test_chain_redirect_in_second_segment_prompts_correctly(self):
+        # "cat foo | grep bar > out.txt" → 3 prompts: cat, grep, redirect
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat foo | grep bar > out.txt")
+        assert tool._permission_manager.request.call_count == 3
