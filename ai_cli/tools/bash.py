@@ -42,6 +42,29 @@ _REDIR_SHELL_META_RE = re.compile(r"[$`(){}!]")
 _CAPTURE_MODES = ("stdout", "stderr", "interleaved", "separate")
 # POSIX: inside double-quotes a backslash only escapes these characters.
 _DQ_ESCAPE = frozenset('\\\n$`"')
+# Characters that cannot begin a heredoc WORD delimiter.  Any character not
+# in this set is accepted as a valid delimiter start, matching the shell
+# grammar where a heredoc delimiter is any WORD token.
+_HEREDOC_NON_WORD = frozenset(" \t\n|&;()<>`")
+# Shell keywords that introduce a command position: after one of these words,
+# the next token can be (( or [[ as a compound command.
+_CMD_INTRODUCING_WORDS = frozenset(
+    {
+        "if",
+        "elif",
+        "while",
+        "until",
+        "for",
+        "then",
+        "do",
+        "else",
+        "!",
+        "case",
+        "select",
+        "function",
+        "time",
+    }
+)
 
 
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
@@ -49,6 +72,211 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars], True
+
+
+def _has_heredoc(segment: str) -> bool:
+    """Return True if *segment* contains a shell heredoc operator (``<<``).
+
+    Tracks quoting state (single-quoted, double-quoted, and ANSI-C
+    ``$'...'``) and nesting depth for the specific bash compound constructs
+    ``$((…))``, ``((…))``, and ``[[…]]`` so that ``<<`` used as an
+    arithmetic or comparison operator is not mistaken for a heredoc.
+
+    ``$((`` is tracked regardless of position (arithmetic expansion can
+    appear mid-expression, e.g. ``echo $((1<<2))``).  ``((`` and ``[[``
+    are tracked only when they appear at a *command-start* position —
+    immediately after a chain operator, open parenthesis, or newline, or
+    at the beginning of the segment.  After an ordinary word such as
+    ``echo``, the same ``((`` / ``[[`` tokens are literal arguments and
+    must not block subsequent heredoc detection.
+
+    ANSI-C quoting (``$'...'``) is handled separately from plain
+    ``'...'``: inside ``$'...'``, backslash escapes are honoured so that
+    ``\\'`` does not close the string prematurely.
+
+    When an unquoted ``<<`` is found outside those tracked constructs, the
+    delimiter check accepts any character that is not whitespace or a shell
+    metacharacter (``_HEREDOC_NON_WORD``).  This covers the full range of
+    bash/POSIX heredoc delimiter forms: quoted strings (``'…'`` / ``"…"``),
+    backslash-escaped characters (``\\EOF``), identifiers, digit-start words
+    (``<<1``), dash-start words (``<< -EOF``), and parameter-expanded words
+    (``<<$DELIM``).
+
+    Additional tokens or operators after the delimiter (e.g. ``<<EOF | wc``,
+    ``<<EOF >out.txt``) are ignored; the function returns True as soon as the
+    delimiter is confirmed.
+    """
+    n = len(segment)
+    i = 0
+    in_single = False
+    in_ansi_c = False  # True while inside $'...' ANSI-C quoting
+    in_double = False
+    depth = 0  # nesting depth of (( )) / [[ ]] / $(( )) constructs
+    # True at the start of the segment and after chain operators, subshell
+    # opens, or shell keywords that introduce a command position (if, then,
+    # do, while, …).  (( and [[ only enter depth-tracking mode at command-
+    # start positions; after an ordinary word they are literal arguments.
+    at_cmd_start = True
+    # Start position of the current unquoted word, or -1 when not in a word.
+    # Used to detect reserved words at word boundaries.
+    word_start: int = -1
+    # True if the current word started when at_cmd_start was already True.
+    # Only words that begin at a command position are treated as reserved words;
+    # identical tokens used as arguments (e.g. "echo if [[") are not.
+    word_started_at_cmd_start: bool = True
+    # Set when the next word is a redirection target (e.g. after ">" or "<").
+    # After that target word is consumed, at_cmd_start is restored to True so
+    # that (( / [[ following a leading redirect are tracked correctly.
+    skip_redir_target: bool = False
+
+    def _end_word(pos: int) -> None:
+        """Check if the word ending at *pos* is a command-introducing keyword."""
+        nonlocal at_cmd_start, word_start, word_started_at_cmd_start, skip_redir_target
+        if word_start >= 0:
+            word = segment[word_start:pos]
+            if skip_redir_target:
+                # This word was a redirection target; we're back at cmd position.
+                at_cmd_start = True
+                skip_redir_target = False
+            elif word_started_at_cmd_start:
+                if word in _CMD_INTRODUCING_WORDS:
+                    at_cmd_start = True
+                elif _ENV_VAR_RE.match(word):
+                    # Env-var assignment prefix: still at command position.
+                    at_cmd_start = True
+                elif _REDIR_OP_RE.match(word):
+                    # Redirect operator (e.g. ">", ">>", "2>"): next word is
+                    # the target; restore at_cmd_start after consuming it.
+                    skip_redir_target = True
+        word_start = -1
+
+    while i < n:
+        c = segment[i]
+        if c == "\\" and (not in_single or in_ansi_c):
+            # Outside quotes: skip any backslash-escaped character.
+            # Inside $'...': backslash is also an escape (e.g. \' does not
+            # close the string), so consume both chars to stay in-quote.
+            i += 2
+            continue
+        if (
+            c == "$"
+            and not in_single
+            and not in_double
+            and i + 1 < n
+            and segment[i + 1] == "'"
+        ):
+            # ANSI-C quoting: $'...' — backslash escapes are active inside.
+            _end_word(i)
+            in_single = True
+            in_ansi_c = True
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            _end_word(i)
+            if in_single:
+                in_single = False
+                in_ansi_c = False
+            else:
+                in_single = True
+                # in_ansi_c stays False: plain '...' does not honour escapes.
+            # Entering or exiting a quote is part of a word token, so clear
+            # command-start — a following [[ / (( is a literal argument.
+            at_cmd_start = False
+        elif c == '"' and not in_single:
+            _end_word(i)
+            in_double = not in_double
+            at_cmd_start = False  # same: quote is part of a word token
+        elif not in_single and not in_double:
+            if c in " \t":
+                # Horizontal whitespace ends the current word.  Check for a
+                # command-introducing keyword; preserve at_cmd_start otherwise.
+                _end_word(i)
+                i += 1
+                continue
+            if c == "\n":
+                _end_word(i)
+                at_cmd_start = True
+                i += 1
+                continue
+            # $((: arithmetic expansion — suppress heredoc detection regardless
+            # of position (may appear mid-expression, e.g. echo $((1<<2))).
+            if c == "$" and segment.startswith("$((", i):
+                _end_word(i)
+                depth += 1
+                at_cmd_start = False
+                i += 3
+                continue
+            # )) or ]]: close the innermost tracked construct.
+            if depth > 0 and (
+                segment.startswith("))", i) or segment.startswith("]]", i)
+            ):
+                word_start = -1
+                depth = max(0, depth - 1)
+                i += 2
+                continue
+            # ( and [: may be the start of (( or [[.  Call _end_word() BEFORE
+            # consulting at_cmd_start so that "if((" (no space between keyword
+            # and compound command) is handled correctly — _end_word("if")
+            # sets at_cmd_start=True, then the (( check fires at the same
+            # character position.
+            if c in "([":
+                _end_word(i)
+                if at_cmd_start and segment.startswith("((", i):
+                    depth += 1
+                    at_cmd_start = False
+                    i += 2
+                    continue
+                if at_cmd_start and segment.startswith("[[", i):
+                    depth += 1
+                    at_cmd_start = False
+                    i += 2
+                    continue
+                # Lone ( or [ — subshell open or standalone bracket.
+                # Inside a tracked construct (depth > 0) they may be nested
+                # parentheses in arithmetic (e.g. $(( (1+2) ))) and must not
+                # re-enable (( or [[ openers at the next character.
+                if depth == 0:
+                    at_cmd_start = True
+            # Other chain operators and open-brace reset command-start.
+            elif c in "|&;{":
+                _end_word(i)
+                at_cmd_start = True
+            elif c == "<" and depth == 0:
+                _end_word(i)
+                # Count consecutive unquoted '<' characters.
+                j = i
+                while j < n and segment[j] == "<":
+                    j += 1
+                if j - i == 2:  # exactly "<<" — candidate heredoc operator
+                    k = j
+                    # Optional heredoc-strip flag.
+                    if k < n and segment[k] == "-":
+                        k += 1
+                    # Skip optional horizontal whitespace before the delimiter.
+                    while k < n and segment[k] in " \t":
+                        k += 1
+                    # Accept any character that can begin a shell WORD — i.e.
+                    # anything that is not whitespace or a shell metacharacter.
+                    if k < n and segment[k] not in _HEREDOC_NON_WORD:
+                        return True
+                elif j - i == 1:  # single "<" — stdin redirect; target follows
+                    # Don't clear at_cmd_start: after the target word, we restore
+                    # it to True so that (( / [[ after a leading redirect are
+                    # correctly identified as compound commands.
+                    skip_redir_target = True
+                    i = j
+                    continue
+                at_cmd_start = False
+                i = j
+                continue
+            else:
+                # Regular word character.
+                if word_start < 0:
+                    word_started_at_cmd_start = at_cmd_start
+                    word_start = i
+                at_cmd_start = False
+        i += 1
+    return False
 
 
 if TYPE_CHECKING:
@@ -487,6 +715,37 @@ class BashTool(Tool):
             return True, ""
         cmd = kwargs.get("command", "")
 
+        if _has_heredoc(cmd):
+            # Heredoc: bypass chain parsing entirely and treat the whole command
+            # as one-time permission with no grant storage.
+            #
+            # We cannot safely run _parse_chain on a heredoc command because the
+            # body may contain operator characters (|, &&) or unmatched quotes that
+            # the parser would mis-classify as real chain operators.  Treating the
+            # whole command as one-time is the safest approach; it means that even
+            # non-heredoc segments in a mixed chain (e.g. "echo hi | cat <<EOF\n…")
+            # lose their per-segment grant granularity, but that trade-off avoids
+            # incorrect permission splits.
+            #
+            # extra_permission_options() returns ["always"] for heredoc, which
+            # intercepts the universal always-choice so that PermissionManager
+            # cannot create a session-wide grant.  We discard the choice on
+            # success so that on_permission_granted() is never invoked and no
+            # grant is stored for heredoc commands.
+            #
+            # _request_permission_as("bash_heredoc", …) is used instead of
+            # super().request_permission() so that a pre-existing tool-wide
+            # always-grant for "bash" cannot silently bypass prompting.  Heredocs
+            # must always prompt because their body content is dynamic and cannot
+            # be granted in advance.
+            heredoc_note = (
+                ' (heredoc: one-time approval only — "always" will not be saved)'
+            )
+            allowed, hd_choice = self._request_permission_as(
+                "bash_heredoc", action + heredoc_note, command=cmd
+            )
+            return allowed, hd_choice if not allowed else ""
+
         try:
             segments = _parse_chain(cmd) if cmd else []
         except ValueError:
@@ -583,6 +842,11 @@ class BashTool(Tool):
 
         cmd = kwargs.get("command", "")
         if not cmd:
+            return ["always"]
+        if _has_heredoc(cmd):
+            # Heredoc content is dynamic — no persistent grant is meaningful.
+            # "always" intercepts the universal always-choice so that
+            # PermissionManager cannot create a session-wide bash grant.
             return ["always"]
         try:
             tokens = shlex.split(cmd)
@@ -766,18 +1030,27 @@ class BashTool(Tool):
             )
 
         # Detect chain operators / redirections to choose execution strategy.
-        try:
-            segments = _parse_chain(command)
-        except ValueError as exc:
-            logger.debug("bash: shlex parse failed: %s", exc)
-            return self._err("invalid_command", f"Failed to parse command: {exc}", 400)
-
-        is_chain = len(segments) > 1
-        # Redirections in a single-segment command also require shell semantics.
-        # Use the original command string for redirection detection; _parse_chain
-        # returns raw substrings, but the single-segment fast-path re-parses the
-        # full original string so that redirection operators are always detectable.
-        has_redirections = not is_chain and bool(_parse_redirections(command)[1])
+        # Heredoc syntax (<<MARKER) must be detected first: the heredoc body can
+        # contain unmatched quotes or operator characters that shlex would reject,
+        # so we bypass _parse_chain entirely for heredoc commands.
+        has_heredoc = _has_heredoc(command)
+        segments: list[tuple[str | None, str]] = []
+        is_chain = False
+        has_redirections = False
+        if not has_heredoc:
+            try:
+                segments = _parse_chain(command)
+            except ValueError as exc:
+                logger.debug("bash: shlex parse failed: %s", exc)
+                return self._err(
+                    "invalid_command", f"Failed to parse command: {exc}", 400
+                )
+            is_chain = len(segments) > 1
+            # Redirections in a single-segment command also require shell semantics.
+            # Use the original command string for redirection detection; _parse_chain
+            # returns raw substrings, but the single-segment fast-path re-parses the
+            # full original string so that redirection operators are always detectable.
+            has_redirections = not is_chain and bool(_parse_redirections(command)[1])
 
         # Build stream kwargs for subprocess based on capture mode.
         if capture == "interleaved":
@@ -793,11 +1066,12 @@ class BashTool(Tool):
             # stdout only — stderr captured for error reporting on non-zero exit
             stream_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
 
-        if is_chain or has_redirections:
+        if is_chain or has_redirections or has_heredoc:
             logger.debug(
-                "bash: running command via shell (chain=%s, redirs=%s)",
+                "bash: running command via shell (chain=%s, redirs=%s, heredoc=%s)",
                 is_chain,
                 has_redirections,
+                has_heredoc,
             )
             try:
                 proc = subprocess.run(

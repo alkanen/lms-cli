@@ -328,6 +328,28 @@ class Tool(ABC):
             ``(allowed, reason_or_choice)`` — see ``PermissionManager.request()``
             for the full description of the second element.
         """
+        return self._request_permission_as(self.name, action, **kwargs)
+
+    def _request_permission_as(
+        self, tool_name: str, action: str, **kwargs: Any
+    ) -> tuple[bool, str]:
+        """Like :meth:`request_permission` but registers the prompt under *tool_name*.
+
+        Use this when a subclass needs to prompt under a distinct tool identity
+        so that the request is not auto-approved by an existing tool-wide
+        always-grant stored under ``self.name``.  The question still displays
+        ``self.name`` so the user sees which tool is asking; only the grant-
+        lookup key changes.
+
+        Parameters
+        ----------
+        tool_name:
+            The key used by ``PermissionManager`` for always-grant lookup.
+        action:
+            Human-readable description of the action (forwarded verbatim).
+        **kwargs:
+            Forwarded to ``extra_permission_options()``.
+        """
         if not self.permission_required:
             logger.debug(
                 "Permission not required for '%s' — bypassing prompt", self.name
@@ -336,7 +358,7 @@ class Tool(ABC):
 
         extra = self.extra_permission_options(**kwargs)
         return self._permission_manager.request(
-            tool_name=self.name,
+            tool_name=tool_name,
             question=f"[{self.name}] {action}",
             extra_options=extra or None,
         )
