@@ -144,3 +144,24 @@ Detect heredoc syntax (`<<MARKER` ... `MARKER`) in the command string. When a he
 - [ ] Selecting `yes` executes once; the next identical call prompts again
 - [ ] A non-heredoc segment in the same chain still offers `always` options
 - [ ] Tests cover: heredoc execution, no always option offered, re-prompt on identical call, mixed heredoc + normal segment chain
+
+---
+
+## Phase 8: Process substitution
+
+**User stories**: `<(cmd)` and `>(cmd)` syntax detected; inner command receives its own permission check; bash invoked explicitly.
+
+### What to build
+
+Detect bash process substitution (`<(...)` and `>(...)`) in command segments. When present, extract each inner command and run it through the same permission flow as a top-level command — the inner command is checked before the outer command executes. Denying any inner command denies the whole call. Because process substitution is bash-specific (not POSIX sh), the tool must invoke `bash -c` rather than `sh -c` (or the system default shell) whenever a process substitution is detected. Grant matching for inner commands uses the same exact + fnmatch logic as regular command segments; grants stored for inner commands are session-scoped and cleared by `reset_session_state()`.
+
+### Acceptance criteria
+
+- [ ] `base64 -i <(echo -n "test")` executes correctly and returns `dGVzdA==`
+- [ ] The inner `echo -n "test"` receives its own permission prompt before the outer command runs
+- [ ] Denying the inner command returns `permission_denied`; the outer command is not executed
+- [ ] An `always` grant for the inner command auto-approves it on subsequent calls
+- [ ] `>(cmd)` output process substitution is detected and checked the same way as `<(cmd)`
+- [ ] When process substitution is present the tool invokes `bash`, not `sh`
+- [ ] Commands without process substitution are unaffected (no shell change)
+- [ ] Tests cover: basic `<(cmd)` execution, inner command denial, always grant for inner command, `>(cmd)`, no regression on plain commands
