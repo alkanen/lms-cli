@@ -9,12 +9,18 @@ access to the client machine.
 
 from __future__ import annotations
 
+import codecs
 import fnmatch
+import locale
 import logging
 import os
 import re
+import selectors
 import shlex
+import signal
 import subprocess
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
@@ -23,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_MAX_OUTPUT_CHARS = 1024
+_READ_CHUNK = 4096
 _ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Matches a redirection operator token: bare (">", ">>", "<") or with an
 # optional fd prefix ("2>", "2>>").
@@ -72,6 +79,234 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars], True
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Kill *proc* and its entire process group (all spawned children).
+
+    Requires the process to have been started with ``start_new_session=True``
+    so that ``proc.pid`` is the process group leader.  Falls back to
+    ``proc.kill()`` on platforms where ``os.killpg`` is unavailable (Windows).
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        proc.kill()
+
+
+def _run_popen(
+    args: list[str] | str,
+    *,
+    shell: bool,
+    capture: str,
+    stream_kwargs: dict[str, Any],
+    max_output_chars: int,
+    cwd: str | os.PathLike[str],
+    env: dict[str, str] | None,
+    timeout: float,
+) -> tuple[int, str, str, bool]:
+    """Run *args* with Popen; return ``(returncode, stdout_text, stderr_text, truncated)``.
+
+    For the three single-pipe capture modes (``stdout``, ``stderr``,
+    ``interleaved``), output is read incrementally and the subprocess is
+    killed as soon as *max_output_chars* characters have been collected.
+    Peak memory for those modes is bounded by *max_output_chars* plus a
+    small read-buffer overhead.
+
+    ``separate`` mode uses ``communicate()`` (buffered) because streaming
+    two pipes simultaneously without deadlock requires threading or ``select``;
+    that complexity is deferred to a follow-up.  Peak memory for ``separate``
+    scales with total subprocess output.
+
+    Returned values per capture mode:
+
+    ``stdout``
+        *stdout_text* — streamed stdout; *stderr_text* — background-drained
+        stderr (for error reporting on non-zero exit).
+    ``stderr``
+        *stdout_text* — ``""``; *stderr_text* — streamed stderr.
+    ``interleaved``
+        *stdout_text* — merged stream; *stderr_text* — ``""``.
+    ``separate``
+        Both fields from ``communicate()``, each independently truncated.
+    """
+    # Detect the locale encoding once so all decode calls are consistent.
+    _encoding = locale.getpreferredencoding(False)
+
+    # Binary mode: we decode manually with an incremental codec so that
+    # multibyte characters split across read boundaries are handled correctly.
+    proc = subprocess.Popen(
+        args,
+        shell=shell,
+        **stream_kwargs,
+        text=False,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+
+    if capture == "separate":
+        # separate mode: communicate() handles both pipes; see docstring above.
+        try:
+            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            proc.communicate()
+            raise
+        stdout_str = (stdout_raw or b"").decode(_encoding, errors="replace")
+        stderr_str = (stderr_raw or b"").decode(_encoding, errors="replace")
+        stdout_text, stdout_trunc = _truncate(stdout_str, max_output_chars)
+        stderr_text, stderr_trunc = _truncate(stderr_str, max_output_chars)
+        return proc.returncode, stdout_text, stderr_text, stdout_trunc or stderr_trunc
+
+    # Single-pipe streaming path.
+    primary_pipe = proc.stderr if capture == "stderr" else proc.stdout
+    if primary_pipe is None:
+        _kill(proc)
+        raise ValueError(
+            f"Expected subprocess {'stderr' if capture == 'stderr' else 'stdout'} "
+            f"to be piped for capture={capture!r}; stream_kwargs is misconfigured."
+        )
+    # Use the raw fd for selectors and os.read(): no buffering layer hides
+    # already-consumed bytes, keeping the selector and reads in sync.
+    primary_fd = primary_pipe.fileno()
+
+    # For stdout mode, stderr is piped so it can be included in error messages
+    # on non-zero exit.  Drain it in a background thread to prevent the
+    # subprocess from stalling when its stderr pipe buffer fills.  Buffer at
+    # most max_output_chars characters; keep draining (discarding) beyond that
+    # so the subprocess is never stalled by a full pipe.
+    stderr_chunks: list[str] = []
+    stderr_total = 0
+    drain_thread: threading.Thread | None = None
+    if capture == "stdout" and proc.stderr is not None:
+        _stderr_pipe = proc.stderr
+
+        def _drain() -> None:
+            nonlocal stderr_total
+            try:
+                while True:
+                    chunk_bytes = _stderr_pipe.read(_READ_CHUNK)
+                    if not chunk_bytes:
+                        break
+                    chunk = chunk_bytes.decode(_encoding, errors="replace")
+                    remaining = max_output_chars - stderr_total
+                    if remaining <= 0:
+                        continue
+                    if len(chunk) > remaining:
+                        stderr_chunks.append(chunk[:remaining])
+                        stderr_total += remaining
+                    else:
+                        stderr_chunks.append(chunk)
+                        stderr_total += len(chunk)
+            except (OSError, ValueError):
+                # OSError: pipe broken; ValueError: pipe closed by main thread
+                # while this thread was still blocked in read().
+                pass
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+
+    # Incremental decoder: correctly reassembles multibyte characters that
+    # are split across successive raw reads.
+    decoder = codecs.getincrementaldecoder(_encoding)(errors="replace")
+    chunks: list[str] = []
+    total = 0
+    truncated = False
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(primary_fd, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                _kill(proc)
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            try:
+                ready = sel.select(timeout=remaining_time)
+            except InterruptedError:
+                # Signal interrupted the select; retry if time remains.
+                continue
+            if not ready:
+                _kill(proc)
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            try:
+                chunk_bytes = os.read(primary_fd, _READ_CHUNK)
+            except InterruptedError:
+                # Signal interrupted the read; retry from the top.
+                continue
+            if not chunk_bytes:
+                # EOF: flush any incomplete multibyte sequence held by the decoder.
+                chunk = decoder.decode(b"", final=True)
+                if chunk:
+                    to_take = max_output_chars - total
+                    if len(chunk) > to_take:
+                        if to_take > 0:
+                            chunks.append(chunk[:to_take])
+                        truncated = True
+                        if proc.poll() is None:
+                            _kill(proc)
+                    else:
+                        chunks.append(chunk)
+                        total += len(chunk)
+                break
+            chunk = decoder.decode(chunk_bytes)
+            if not chunk:
+                # Incomplete multibyte sequence; wait for more bytes.
+                continue
+            to_take = max_output_chars - total
+            if len(chunk) > to_take:
+                if to_take > 0:
+                    chunks.append(chunk[:to_take])
+                    total += to_take
+                truncated = True
+                if proc.poll() is None:
+                    proc.kill()
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total == max_output_chars:
+                if proc.poll() is None:
+                    # Process still running: it must have more output pending.
+                    truncated = True
+                    _kill(proc)
+                else:
+                    # Process exited; check if the pipe already has buffered
+                    # bytes beyond the limit before declaring no truncation.
+                    ready_now = sel.select(timeout=0)
+                    if ready_now and os.read(primary_fd, _READ_CHUNK):
+                        truncated = True
+                break
+    finally:
+        sel.close()
+        primary_pipe.close()
+        # Guard against a process that closes stdout early but keeps running.
+        wait_remaining = deadline - time.monotonic()
+        if wait_remaining > 0:
+            try:
+                proc.wait(timeout=wait_remaining)
+            except subprocess.TimeoutExpired:
+                _kill(proc)
+                proc.wait()
+        else:
+            if proc.poll() is None:
+                _kill(proc)
+                proc.wait()
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            proc.wait()
+        if drain_thread is not None:
+            drain_thread.join(timeout=2.0)
+        _stderr = proc.stderr
+        if _stderr is not None and not _stderr.closed:
+            _stderr.close()
+
+    primary_text = "".join(chunks)
+    stderr_output = "".join(stderr_chunks)
+
+    if capture == "stderr":
+        return proc.returncode, "", primary_text, truncated
+    return proc.returncode, primary_text, stderr_output, truncated
 
 
 def _has_heredoc(segment: str) -> bool:
@@ -1074,14 +1309,15 @@ class BashTool(Tool):
                 has_heredoc,
             )
             try:
-                proc = subprocess.run(
+                returncode, stdout_text, stderr_text, truncated = _run_popen(
                     command,
                     shell=True,
-                    **stream_kwargs,
-                    text=True,
-                    timeout=_DEFAULT_TIMEOUT,
+                    capture=capture,
+                    stream_kwargs=stream_kwargs,
+                    max_output_chars=max_output_chars,
                     cwd=self._workspace.root,
-                    stdin=subprocess.DEVNULL,
+                    env=None,
+                    timeout=_DEFAULT_TIMEOUT,
                 )
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -1112,14 +1348,15 @@ class BashTool(Tool):
             logger.debug("bash: running %r (%d arg(s))", cmd_args[0], len(cmd_args) - 1)
             subprocess_env = {**os.environ, **env_vars} if env_vars else None
             try:
-                proc = subprocess.run(
+                returncode, stdout_text, stderr_text, truncated = _run_popen(
                     cmd_args,
-                    **stream_kwargs,
-                    text=True,
-                    timeout=_DEFAULT_TIMEOUT,
+                    shell=False,
+                    capture=capture,
+                    stream_kwargs=stream_kwargs,
+                    max_output_chars=max_output_chars,
                     cwd=self._workspace.root,
-                    stdin=subprocess.DEVNULL,
                     env=subprocess_env,
+                    timeout=_DEFAULT_TIMEOUT,
                 )
             except FileNotFoundError:
                 logger.debug("bash: executable not found: %r", cmd_args[0])
@@ -1139,31 +1376,33 @@ class BashTool(Tool):
                 logger.exception("bash: unexpected error running %r", cmd_args[0])
                 return self._err("execution_error", str(exc), 500)
 
-        if proc.returncode != 0:
-            logger.debug("bash: command exited with status %d", proc.returncode)
-            message = f"Command exited with status {proc.returncode}."
-            # interleaved merges stderr into stdout; proc.stderr is None in that mode
-            raw_error = (proc.stdout if capture == "interleaved" else proc.stderr) or ""
+        # A process we killed to enforce the output limit exits with a negative
+        # signal-based returncode on POSIX (e.g. -9 for SIGKILL).  That is not
+        # a genuine command failure.  A non-zero exit that merely coincides with
+        # truncation (process exited before we killed it) is still a real failure.
+        # separate mode uses communicate() so the returncode is always genuine.
+        killed_for_truncation = capture != "separate" and truncated and returncode < 0
+        genuine_failure = returncode != 0 and not killed_for_truncation
+        if genuine_failure:
+            logger.debug("bash: command exited with status %d", returncode)
+            message = f"Command exited with status {returncode}."
+            # interleaved: error info is in stdout_text (merged stream).
+            raw_error = (
+                stdout_text if capture == "interleaved" else stderr_text
+            ).strip()
             if raw_error:
-                error_output, _ = _truncate(raw_error.strip(), max_output_chars)
+                error_output, _ = _truncate(raw_error, max_output_chars)
                 message = f"{message} {error_output}"
             return self._err("execution_error", message, 400)
 
         if capture == "separate":
-            stdout_text, stdout_truncated = _truncate(
-                proc.stdout or "", max_output_chars
-            )
-            stderr_text, stderr_truncated = _truncate(
-                proc.stderr or "", max_output_chars
-            )
             data: dict[str, Any] = {"stdout": stdout_text, "stderr": stderr_text}
-            if stdout_truncated or stderr_truncated:
+            if truncated:
                 data["warning"] = f"Output truncated at {max_output_chars} characters"
         else:
-            raw = (proc.stderr or "") if capture == "stderr" else (proc.stdout or "")
-            logger.debug("bash: command succeeded, output=%d chars", len(raw))
-            text, truncated = _truncate(raw, max_output_chars)
-            data = {"output": text}
+            output = stderr_text if capture == "stderr" else stdout_text
+            logger.debug("bash: command succeeded, output=%d chars", len(output))
+            data = {"output": output}
             if truncated:
                 data["warning"] = f"Output truncated at {max_output_chars} characters"
 
