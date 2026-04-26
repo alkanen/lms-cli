@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
+import tempfile
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from ai_cli.tools.bash import (
     BashTool,
@@ -12,6 +17,7 @@ from ai_cli.tools.bash import (
     _parse_chain,
     _parse_redirections,
     _redir_pattern_match,
+    _run_popen,
     _split_env_vars,
     _tokenize_segment,
 )
@@ -103,36 +109,34 @@ class TestDefinition:
 # ---------------------------------------------------------------------------
 
 
-def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> MagicMock:
-    proc = MagicMock()
-    proc.stdout = stdout
-    proc.stderr = stderr
-    proc.returncode = returncode
-    return proc
+def _run_result(
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+    truncated: bool = False,
+) -> tuple[int, str, str, bool]:
+    """Mock return value for _run_popen: (returncode, stdout, stderr, truncated)."""
+    return (returncode, stdout, stderr, truncated)
 
 
 class TestExecute:
     def test_basic_command_returns_stdout(self):
         tool = make_tool(permission_required=False)
-        with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("hello\n")
-        ):
+        with patch("ai_cli.tools.bash._run_popen", return_value=_run_result("hello\n")):
             result = tool.execute(command="echo hello")
         assert result["status"] == "success"
         assert result["data"]["output"] == "hello\n"
 
     def test_output_key_present_on_success(self):
         tool = make_tool(permission_required=False)
-        with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("test\n")
-        ):
+        with patch("ai_cli.tools.bash._run_popen", return_value=_run_result("test\n")):
             result = tool.execute(command="echo test")
         assert "output" in result["data"]
 
     def test_subprocess_receives_parsed_args(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="ls -la ./src")
         mock_run.assert_called_once()
@@ -142,8 +146,8 @@ class TestExecute:
     def test_nonzero_exit_returns_execution_error(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(returncode=1, stderr="no such file"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(returncode=1, stderr="no such file"),
         ):
             result = tool.execute(command="ls missing")
         assert result["status"] == "error"
@@ -154,8 +158,8 @@ class TestExecute:
     def test_nonzero_exit_without_stderr(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(returncode=2),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(returncode=2),
         ):
             result = tool.execute(command="false")
         assert result["status"] == "error"
@@ -163,7 +167,7 @@ class TestExecute:
 
     def test_file_not_found_returns_execution_error(self):
         tool = make_tool(permission_required=False)
-        with patch("ai_cli.tools.bash.subprocess.run", side_effect=FileNotFoundError()):
+        with patch("ai_cli.tools.bash._run_popen", side_effect=FileNotFoundError()):
             result = tool.execute(command="no_such_exe arg")
         assert result["status"] == "error"
         assert result["error"] == "execution_error"
@@ -172,7 +176,7 @@ class TestExecute:
     def test_timeout_returns_execution_error(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
+            "ai_cli.tools.bash._run_popen",
             side_effect=subprocess.TimeoutExpired(cmd="sleep", timeout=30),
         ):
             result = tool.execute(command="sleep 999")
@@ -189,7 +193,7 @@ class TestExecute:
     def test_env_var_prefix_strips_and_executes(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("out\n")
+            "ai_cli.tools.bash._run_popen", return_value=_run_result("out\n")
         ) as mock_run:
             result = tool.execute(command="A=1 ls -la")
         assert result["status"] == "success"
@@ -199,7 +203,7 @@ class TestExecute:
     def test_subprocess_called_with_timeout(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="true")
         _, kwargs = mock_run.call_args
@@ -439,8 +443,8 @@ class TestCapture:
     def test_default_capture_returns_stdout(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hello\n", stderr="ignored"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hello\n", stderr="ignored"),
         ):
             result = tool.execute(command="echo hello")
         assert result["status"] == "success"
@@ -449,8 +453,8 @@ class TestCapture:
     def test_capture_stdout_explicit(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="out\n", stderr="err\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="out\n", stderr="err\n"),
         ):
             result = tool.execute(command="echo out", capture="stdout")
         assert result["data"]["output"] == "out\n"
@@ -459,8 +463,8 @@ class TestCapture:
     def test_capture_stderr(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="", stderr="err text\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="", stderr="err text\n"),
         ):
             result = tool.execute(command="ls missing", capture="stderr")
         assert result["status"] == "success"
@@ -470,8 +474,8 @@ class TestCapture:
     def test_capture_interleaved(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="merged\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="merged\n"),
         ):
             result = tool.execute(command="echo merged", capture="interleaved")
         assert result["status"] == "success"
@@ -480,17 +484,17 @@ class TestCapture:
     def test_capture_interleaved_subprocess_kwargs(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hi", capture="interleaved")
         kwargs = mock_run.call_args[1]
-        assert kwargs["stderr"] == subprocess.STDOUT
+        assert kwargs["stream_kwargs"]["stderr"] == subprocess.STDOUT
 
     def test_capture_separate_returns_both_fields(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="out\n", stderr="err\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="out\n", stderr="err\n"),
         ):
             result = tool.execute(command="echo out", capture="separate")
         assert result["status"] == "success"
@@ -501,18 +505,18 @@ class TestCapture:
     def test_capture_stdout_subprocess_kwargs(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hi", capture="stdout")
         kwargs = mock_run.call_args[1]
-        assert kwargs["stdout"] == subprocess.PIPE
-        assert kwargs["stderr"] == subprocess.PIPE
+        assert kwargs["stream_kwargs"]["stdout"] == subprocess.PIPE
+        assert kwargs["stream_kwargs"]["stderr"] == subprocess.PIPE
 
     def test_capture_stdout_nonzero_exit_includes_stderr(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stderr="something went wrong", returncode=1),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stderr="something went wrong", returncode=1),
         ):
             result = tool.execute(command="false", capture="stdout")
         assert result["status"] == "error"
@@ -522,8 +526,8 @@ class TestCapture:
         tool = make_tool(permission_required=False)
         long_stderr = "e" * 200
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stderr=long_stderr, returncode=1),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stderr=long_stderr, returncode=1),
         ):
             result = tool.execute(command="false", max_output_chars=10)
         assert result["status"] == "error"
@@ -532,12 +536,12 @@ class TestCapture:
     def test_capture_stderr_subprocess_uses_devnull_for_stdout(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hi", capture="stderr")
         kwargs = mock_run.call_args[1]
-        assert kwargs["stdout"] == subprocess.DEVNULL
-        assert kwargs["stderr"] == subprocess.PIPE
+        assert kwargs["stream_kwargs"]["stdout"] == subprocess.DEVNULL
+        assert kwargs["stream_kwargs"]["stderr"] == subprocess.PIPE
 
     def test_invalid_capture_returns_error(self):
         tool = make_tool(permission_required=False)
@@ -558,11 +562,12 @@ class TestCapture:
         assert result["error"] == "invalid_arguments"
 
     def test_capture_interleaved_nonzero_exit_includes_merged_output(self):
-        # With stderr=STDOUT, proc.stderr is None; merged output is in proc.stdout.
+        # interleaved merges stderr into stdout; error info is in stdout_text.
         tool = make_tool(permission_required=False)
-        mock_proc = _completed(stdout="merged error output\n", returncode=1)
-        mock_proc.stderr = None
-        with patch("ai_cli.tools.bash.subprocess.run", return_value=mock_proc):
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="merged error output\n", returncode=1),
+        ):
             result = tool.execute(command="false", capture="interleaved")
         assert result["status"] == "error"
         assert "merged error output" in result["message"]
@@ -577,19 +582,19 @@ class TestTruncation:
     def test_output_within_limit_has_no_warning(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hi\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hi\n"),
         ):
             result = tool.execute(command="echo hi", max_output_chars=100)
         assert "warning" not in result["data"]
         assert result["data"]["output"] == "hi\n"
 
     def test_output_exceeding_limit_is_truncated(self):
+        # _run_popen truncates and signals via truncated=True; execute() adds warning.
         tool = make_tool(permission_required=False)
-        long_output = "x" * 200
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout=long_output),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="x" * 10, truncated=True),
         ):
             result = tool.execute(command="echo x", max_output_chars=10)
         assert result["status"] == "success"
@@ -599,21 +604,19 @@ class TestTruncation:
 
     def test_output_at_exactly_limit_has_no_warning(self):
         tool = make_tool(permission_required=False)
-        exact_output = "a" * 10
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout=exact_output),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="a" * 10),
         ):
             result = tool.execute(command="echo a", max_output_chars=10)
         assert "warning" not in result["data"]
 
     def test_multibyte_characters_truncated_by_char_count(self):
-        # Each '€' is 3 UTF-8 bytes; truncation must count characters, not bytes.
+        # Each '€' is 3 UTF-8 bytes; _run_popen counts characters, not bytes.
         tool = make_tool(permission_required=False)
-        euro_output = "€" * 20
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout=euro_output),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="€" * 5, truncated=True),
         ):
             result = tool.execute(command="echo euro", max_output_chars=5)
         assert result["status"] == "success"
@@ -623,8 +626,8 @@ class TestTruncation:
     def test_separate_capture_warns_when_stdout_truncated(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="x" * 20, stderr="ok"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="x" * 5, stderr="ok", truncated=True),
         ):
             result = tool.execute(
                 command="echo x", capture="separate", max_output_chars=5
@@ -634,8 +637,8 @@ class TestTruncation:
     def test_separate_capture_warns_when_stderr_truncated(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="ok", stderr="e" * 20),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="ok", stderr="e" * 5, truncated=True),
         ):
             result = tool.execute(
                 command="echo ok", capture="separate", max_output_chars=5
@@ -645,8 +648,8 @@ class TestTruncation:
     def test_separate_capture_no_warning_when_both_within_limit(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="out", stderr="err"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="out", stderr="err"),
         ):
             result = tool.execute(
                 command="echo out", capture="separate", max_output_chars=100
@@ -655,17 +658,17 @@ class TestTruncation:
 
     def test_default_max_output_chars_is_1024(self):
         tool = make_tool(permission_required=False)
-        # 1024 chars fits, no warning
+        # 1024 chars fits, no warning (truncated=False).
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="a" * 1024),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="a" * 1024),
         ):
             result = tool.execute(command="echo a")
         assert "warning" not in result["data"]
-        # 1025 chars truncates
+        # 1025 chars: _run_popen would truncate and signal truncated=True.
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="a" * 1025),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="a" * 1024, truncated=True),
         ):
             result = tool.execute(command="echo a")
         assert "warning" in result["data"]
@@ -673,11 +676,36 @@ class TestTruncation:
     def test_warning_message_says_characters(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="x" * 200),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="x" * 10, truncated=True),
         ):
             result = tool.execute(command="echo x", max_output_chars=10)
         assert "characters" in result["data"]["warning"]
+
+    def test_killed_for_truncation_is_not_a_failure(self):
+        # A SIGKILL-terminated process (returncode < 0) that was truncated is
+        # success with a warning, not an error.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="x" * 10, returncode=-9, truncated=True),
+        ):
+            result = tool.execute(command="yes", max_output_chars=10)
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "x" * 10
+        assert "warning" in result["data"]
+
+    def test_nonzero_exit_with_truncation_is_still_failure(self):
+        # A process that exits with a positive error code AND happens to have
+        # truncated output is a genuine failure, not a kill-for-limit event.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="x" * 10, returncode=1, truncated=True),
+        ):
+            result = tool.execute(command="bad-cmd", max_output_chars=10)
+        assert result["status"] == "error"
+        assert result["error"] == "execution_error"
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +754,7 @@ class TestEnvVars:
     def test_env_var_passed_to_subprocess(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("123\n")
+            "ai_cli.tools.bash._run_popen", return_value=_run_result("123\n")
         ) as mock_run:
             tool.execute(command="MYVAR=123 python3 -c 'print(1)'")
         kwargs = mock_run.call_args[1]
@@ -745,7 +773,7 @@ class TestEnvVars:
                 clear=True,
             ),
             patch(
-                "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+                "ai_cli.tools.bash._run_popen", return_value=_run_result()
             ) as mock_run,
         ):
             tool.execute(command="MY_VAR=abc python3 -c 'pass'")
@@ -758,7 +786,7 @@ class TestEnvVars:
     def test_no_env_var_passes_none_as_env(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="ls -la")
         kwargs = mock_run.call_args[1]
@@ -770,7 +798,7 @@ class TestEnvVars:
         tool = make_tool(permission_required=False)
         with (
             patch.dict(os.environ, {"PATH": "/tmp/bin"}, clear=True),
-            patch("ai_cli.tools.bash.subprocess.run", return_value=_completed()),
+            patch("ai_cli.tools.bash._run_popen", return_value=_run_result()),
         ):
             before = dict(os.environ)
             tool.execute(command="SECRET=leaked ls")
@@ -780,7 +808,7 @@ class TestEnvVars:
     def test_subprocess_called_with_cmd_tokens_not_env_prefix(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="A=1 B=2 ls -la ./docs")
         args_passed = mock_run.call_args[0][0]
@@ -789,7 +817,7 @@ class TestEnvVars:
     def test_multiple_env_vars_all_passed(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="A=1 B=hello C=world python3 -c 'pass'")
         kwargs = mock_run.call_args[1]
@@ -1212,7 +1240,7 @@ class TestChainExecute:
     def test_chain_uses_shell_true(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("result\n")
+            "ai_cli.tools.bash._run_popen", return_value=_run_result("result\n")
         ) as mock_run:
             tool.execute(command="cat foo | grep bar")
         _, kwargs = mock_run.call_args
@@ -1222,7 +1250,7 @@ class TestChainExecute:
         tool = make_tool(permission_required=False)
         cmd = "cat foo | grep bar"
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("result\n")
+            "ai_cli.tools.bash._run_popen", return_value=_run_result("result\n")
         ) as mock_run:
             tool.execute(command=cmd)
         args_passed = mock_run.call_args[0][0]
@@ -1231,8 +1259,8 @@ class TestChainExecute:
     def test_chain_returns_stdout(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="matched\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="matched\n"),
         ):
             result = tool.execute(command="cat foo | grep bar")
         assert result["status"] == "success"
@@ -1241,8 +1269,8 @@ class TestChainExecute:
     def test_chain_nonzero_exit_returns_error(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(returncode=1, stderr="no match"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(returncode=1, stderr="no match"),
         ):
             result = tool.execute(command="cat foo | grep missing")
         assert result["status"] == "error"
@@ -1252,7 +1280,7 @@ class TestChainExecute:
     def test_chain_timeout_returns_error(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
+            "ai_cli.tools.bash._run_popen",
             side_effect=subprocess.TimeoutExpired(cmd="cat", timeout=30),
         ):
             result = tool.execute(command="cat foo | sleep 999")
@@ -1263,8 +1291,8 @@ class TestChainExecute:
     def test_chain_capture_separate(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="out\n", stderr="err\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="out\n", stderr="err\n"),
         ):
             result = tool.execute(command="cat foo | grep bar", capture="separate")
         assert result["status"] == "success"
@@ -1274,16 +1302,16 @@ class TestChainExecute:
     def test_chain_capture_interleaved_kwargs(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="cat foo | grep bar", capture="interleaved")
         kwargs = mock_run.call_args[1]
-        assert kwargs["stderr"] == subprocess.STDOUT
+        assert kwargs["stream_kwargs"]["stderr"] == subprocess.STDOUT
 
     def test_single_command_does_not_use_shell_true(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="ls -la")
         _, kwargs = mock_run.call_args
@@ -1306,7 +1334,7 @@ class TestChainExecute:
     def test_semicolon_chain_uses_shell_true(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed("done\n")
+            "ai_cli.tools.bash._run_popen", return_value=_run_result("done\n")
         ) as mock_run:
             tool.execute(command="ls; echo done")
         _, kwargs = mock_run.call_args
@@ -1919,7 +1947,7 @@ class TestRedirectionExecute:
     def test_stdout_redirect_uses_shell(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hello > /tmp/out.txt")
         _, kwargs = mock_run.call_args
@@ -1929,7 +1957,7 @@ class TestRedirectionExecute:
         tool = make_tool(permission_required=False)
         cmd = "echo hello > /tmp/out.txt"
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command=cmd)
         args_passed = mock_run.call_args[0][0]
@@ -1938,7 +1966,7 @@ class TestRedirectionExecute:
     def test_plain_command_no_redirect_does_not_use_shell(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="ls -la")
         _, kwargs = mock_run.call_args
@@ -1960,7 +1988,7 @@ class TestRedirectionExecute:
     def test_stdout_redirect_no_whitespace_uses_shell(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hi >output.txt")
         _, kwargs = mock_run.call_args
@@ -1975,7 +2003,7 @@ class TestRedirectionExecute:
     def test_operator_adjacent_to_word_uses_shell(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="echo hi>output.txt")
         _, kwargs = mock_run.call_args
@@ -2425,8 +2453,8 @@ class TestHeredocExecute:
     def test_heredoc_uses_shell_true(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hello\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hello\n"),
         ) as mock_run:
             tool.execute(command="cat <<EOF\nhello\nEOF")
         _, kwargs = mock_run.call_args
@@ -2436,8 +2464,8 @@ class TestHeredocExecute:
         tool = make_tool(permission_required=False)
         cmd = "cat <<EOF\nhello\nEOF"
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hello\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hello\n"),
         ) as mock_run:
             tool.execute(command=cmd)
         args_passed = mock_run.call_args[0][0]
@@ -2446,8 +2474,8 @@ class TestHeredocExecute:
     def test_heredoc_success_returns_output(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hello\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hello\n"),
         ):
             result = tool.execute(command="cat <<EOF\nhello\nEOF")
         assert result["status"] == "success"
@@ -2456,8 +2484,8 @@ class TestHeredocExecute:
     def test_heredoc_nonzero_exit_returns_error(self):
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(returncode=1, stderr="fail"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(returncode=1, stderr="fail"),
         ):
             result = tool.execute(command="false <<EOF\ntest\nEOF")
         assert result["status"] == "error"
@@ -2467,7 +2495,7 @@ class TestHeredocExecute:
         # Regression: plain commands without heredoc must still use direct execution.
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+            "ai_cli.tools.bash._run_popen", return_value=_run_result()
         ) as mock_run:
             tool.execute(command="ls -la")
         _, kwargs = mock_run.call_args
@@ -2478,8 +2506,8 @@ class TestHeredocExecute:
         # invalid_command — shlex-based parsing is skipped for heredoc commands.
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="hello 'world\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="hello 'world\n"),
         ) as mock_run:
             result = tool.execute(command="cat <<EOF\nhello 'world\nEOF")
         assert result["status"] == "success"
@@ -2491,8 +2519,8 @@ class TestHeredocExecute:
         # the chain parser — the whole command goes to the shell as-is.
         tool = make_tool(permission_required=False)
         with patch(
-            "ai_cli.tools.bash.subprocess.run",
-            return_value=_completed(stdout="a | b\n"),
+            "ai_cli.tools.bash._run_popen",
+            return_value=_run_result(stdout="a | b\n"),
         ) as mock_run:
             result = tool.execute(command="cat <<EOF\na | b\nEOF")
         assert result["status"] == "success"
@@ -2554,3 +2582,184 @@ class TestHeredocPermissionParseFailure:
         first_count = tool._permission_manager.request.call_count
         tool.request_permission("run", command="cat <<EOF\nhello 'world\nEOF")
         assert tool._permission_manager.request.call_count == first_count * 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: streaming output capture (_run_popen integration tests)
+# ---------------------------------------------------------------------------
+
+
+class TestStreaming:
+    """Integration tests that call _run_popen directly with real subprocesses."""
+
+    def test_large_output_killed_mid_stream(self):
+        # The subprocess writes output slowly and only creates a marker file if
+        # it reaches normal completion.  _run_popen must kill it at the output
+        # limit so the marker is never written.
+        max_chars = 100
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker_path = os.path.join(tmpdir, "completed.txt")
+            script = (
+                "import sys, time\n"
+                f"marker = {marker_path!r}\n"
+                "for _ in range(1000):\n"
+                "    sys.stdout.write('x' * 10)\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.05)\n"
+                "open(marker, 'w').write('done')\n"
+            )
+            rc, stdout, stderr, truncated = _run_popen(
+                [sys.executable, "-c", script],
+                shell=False,
+                capture="stdout",
+                stream_kwargs={
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                },
+                max_output_chars=max_chars,
+                cwd=tmpdir,
+                env=None,
+                timeout=10.0,
+            )
+            assert truncated is True
+            assert len(stdout) == max_chars
+            assert not os.path.exists(marker_path)
+
+    def test_output_within_limit_not_truncated(self):
+        rc, stdout, stderr, truncated = _run_popen(
+            [sys.executable, "-c", "print('hello')"],
+            shell=False,
+            capture="stdout",
+            stream_kwargs={
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            },
+            max_output_chars=1024,
+            cwd=tempfile.gettempdir(),
+            env=None,
+            timeout=10.0,
+        )
+        assert rc == 0
+        assert truncated is False
+        assert "hello" in stdout
+
+    def test_timeout_raises_timeout_expired(self):
+        # A command that produces continuous output; should raise TimeoutExpired.
+        # Use sys.executable so this test runs without bash on PATH.
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\nwhile True:\n sys.stdout.write('x')\n sys.stdout.flush()",
+                ],
+                shell=False,
+                capture="stdout",
+                stream_kwargs={
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                },
+                max_output_chars=10_000_000,
+                cwd=tempfile.gettempdir(),
+                env=None,
+                timeout=0.2,
+            )
+
+    def test_execute_timeout_returns_error(self):
+        # Via execute(): a timed-out streaming command returns the execution_error.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            side_effect=subprocess.TimeoutExpired(cmd="bash", timeout=30),
+        ):
+            result = tool.execute(command="bash -c 'while true; do echo x; done'")
+        assert result["status"] == "error"
+        assert result["error"] == "execution_error"
+        assert "timed out" in result["message"]
+
+    def test_separate_mode_still_buffered(self):
+        # separate uses communicate(); both stdout and stderr returned correctly.
+        rc, stdout, stderr, truncated = _run_popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('out'); print('err', file=sys.stderr)",
+            ],
+            shell=False,
+            capture="separate",
+            stream_kwargs={
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            },
+            max_output_chars=1024,
+            cwd=tempfile.gettempdir(),
+            env=None,
+            timeout=10.0,
+        )
+        assert rc == 0
+        assert "out" in stdout
+        assert "err" in stderr
+        assert truncated is False
+
+    def test_separate_mode_truncation_applied(self):
+        # separate mode: output exceeding max_output_chars is truncated.
+        max_chars = 5
+        rc, stdout, stderr, truncated = _run_popen(
+            [sys.executable, "-c", f"print('x' * {max_chars * 10}, end='')"],
+            shell=False,
+            capture="separate",
+            stream_kwargs={
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            },
+            max_output_chars=max_chars,
+            cwd=tempfile.gettempdir(),
+            env=None,
+            timeout=10.0,
+        )
+        assert rc == 0
+        assert truncated is True
+        assert len(stdout) == max_chars
+
+    def test_stderr_capture_mode_streams_stderr(self):
+        rc, stdout, stderr, truncated = _run_popen(
+            [sys.executable, "-c", "import sys; print('err', file=sys.stderr)"],
+            shell=False,
+            capture="stderr",
+            stream_kwargs={
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
+            },
+            max_output_chars=1024,
+            cwd=tempfile.gettempdir(),
+            env=None,
+            timeout=10.0,
+        )
+        assert rc == 0
+        assert stdout == ""
+        assert "err" in stderr
+        assert truncated is False
+
+    def test_interleaved_capture_mode_merges_streams(self):
+        rc, stdout, stderr, truncated = _run_popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('out'); print('err', file=sys.stderr)",
+            ],
+            shell=False,
+            capture="interleaved",
+            stream_kwargs={
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+            },
+            max_output_chars=1024,
+            cwd=tempfile.gettempdir(),
+            env=None,
+            timeout=10.0,
+        )
+        assert rc == 0
+        assert "out" in stdout
+        assert "err" in stdout  # merged into stdout
+        assert stderr == ""
+        assert truncated is False

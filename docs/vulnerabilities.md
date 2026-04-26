@@ -466,6 +466,35 @@ re-raising, so the sessions directory stays clean.
 
 ---
 
+## VULN-013 — Streaming integration tests assume POSIX environment
+
+**Component:** `tests/test_bash.py` — `TestStreaming`
+
+**Severity:** Very Low (Windows-only; affects both tests and production streaming on Windows)
+
+**Status:** Deferred — Windows support is currently low priority
+
+### Description
+
+The `selectors.DefaultSelector` used in `_run_popen`'s streaming read loop falls
+back to `select.select` on Windows, which does not support pipe file descriptors.
+This means the entire streaming path (all capture modes except `separate`) will
+fail or behave incorrectly on Windows, in both tests and production use.
+
+### Conditions required
+
+- Tests must be run on Windows.
+- Production use on Windows would also expose the `selectors`/pipe limitation.
+
+### Proposed mitigation
+
+1. Mark `TestStreaming` tests with `@pytest.mark.skipif(os.name == "nt", ...)`.
+2. In `_run_popen`, detect Windows (`os.name == "nt"`) and use `communicate()`
+   (buffered) for all modes when `selectors` cannot be used with pipes, or use
+   `asyncio.ProactorEventLoop` which supports pipe I/O on Windows.
+
+---
+
 ## VULN-006 — `IgnoreFilter` implements only a subset of full `.gitignore` syntax
 
 **Component:** `ai_cli/utils/ignore_filter.py` — `IgnoreFilter`
