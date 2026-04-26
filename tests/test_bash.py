@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from ai_cli.tools.bash import (
     BashTool,
     _chain_summary,
+    _has_heredoc,
     _parse_chain,
     _parse_redirections,
     _redir_pattern_match,
@@ -2040,3 +2041,516 @@ class TestRedirectionInChain:
         tool._permission_manager.request.return_value = (True, "yes")
         tool.request_permission("run", command="cat foo | grep bar > out.txt")
         assert tool._permission_manager.request.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: heredoc support
+# ---------------------------------------------------------------------------
+
+
+class TestHasHeredoc:
+    def test_heredoc_detected(self):
+        assert _has_heredoc("cat <<EOF\nhello\nEOF") is True
+
+    def test_heredoc_with_dash(self):
+        assert _has_heredoc("cat <<-EOF\nhello\nEOF") is True
+
+    def test_heredoc_with_space_before_marker(self):
+        assert _has_heredoc("cat << EOF\nhello\nEOF") is True
+
+    def test_plain_command_not_heredoc(self):
+        assert _has_heredoc("ls -la") is False
+
+    def test_redirect_less_than_not_heredoc(self):
+        assert _has_heredoc("cat < input.txt") is False
+
+    def test_append_not_heredoc(self):
+        assert _has_heredoc("echo hi >> log.txt") is False
+
+    def test_heredoc_in_chain_segment(self):
+        assert _has_heredoc("cat <<EOF\ntest\nEOF") is True
+
+    def test_stdin_redirect_alone_not_heredoc(self):
+        assert _has_heredoc("echo 2>&1") is False
+
+    # --- quote-awareness ---
+
+    def test_bitshift_inside_single_quotes_not_heredoc(self):
+        # << inside single quotes is a bitshift, not a heredoc operator.
+        assert _has_heredoc("python3 -c 'print(1<<2)'") is False
+
+    def test_bitshift_inside_double_quotes_not_heredoc(self):
+        assert _has_heredoc('python3 -c "print(1<<2)"') is False
+
+    def test_bitshift_inside_ansi_c_quotes_not_heredoc(self):
+        # << inside $'...' (ANSI-C quoting) must not be detected as a heredoc.
+        assert _has_heredoc("python3 -c $'print(1<<2)'") is False
+
+    def test_escaped_quote_in_ansi_c_does_not_exit_string(self):
+        # $'print(\'<<\')' — the \' sequences are escapes inside $'...', not
+        # string terminators.  The << must remain inside the quoted region.
+        assert _has_heredoc("python3 -c $'print(\\'<<\\')'") is False
+
+    def test_heredoc_after_ansi_c_quoted_arg_detected(self):
+        # The << is outside the $'...' region; it must still be detected.
+        assert _has_heredoc("cmd $'arg' <<EOF\ntest\nEOF") is True
+
+    def test_heredoc_after_single_quoted_arg_detected(self):
+        # The << is outside the quoted region.
+        assert _has_heredoc("cmd 'arg' <<EOF\ntest\nEOF") is True
+
+    def test_here_string_three_less_than_not_heredoc(self):
+        # <<< is a here-string (bash), not a heredoc.
+        assert _has_heredoc("cat <<<word") is False
+
+    def test_heredoc_with_quoted_marker_detected(self):
+        # <<'EOF' uses a quoted marker (suppresses variable expansion in body);
+        # the << operator itself is unquoted, so this IS a heredoc.
+        assert _has_heredoc("cat <<'EOF'\nhello\nEOF") is True
+
+    def test_heredoc_with_doublequoted_marker_detected(self):
+        assert _has_heredoc('cat <<"EOF"\nhello\nEOF') is True
+
+    def test_heredoc_without_quotes_detected(self):
+        assert _has_heredoc("cat <<MARKER\ntest\nMARKER") is True
+
+    def test_single_less_than_is_stdin_redirect(self):
+        assert _has_heredoc("cat <file.txt") is False
+
+    # --- arithmetic / conditional contexts that must not false-positive ---
+
+    def test_arithmetic_expansion_bitshift_not_heredoc(self):
+        # $((1<<2)) — << is inside an arithmetic expansion, not a heredoc.
+        assert _has_heredoc("echo $((1<<2))") is False
+
+    def test_compound_assign_shift_not_heredoc(self):
+        # ((x<<=1)) — <<= is the compound left-shift-assign operator.
+        assert _has_heredoc("((x<<=1))") is False
+
+    def test_conditional_shift_not_heredoc(self):
+        # [[ $a << $b ]] — << is inside [[ ]], so depth tracking suppresses
+        # heredoc detection in this conditional context.
+        assert _has_heredoc("[[ $a << $b ]]") is False
+
+    def test_if_conditional_shift_not_heredoc(self):
+        # Common real-world form: the [[ ... ]] command is prefixed by "if".
+        # The keyword "if" is recognised as command-introducing, so at_cmd_start
+        # becomes True before "[[" and depth tracking correctly suppresses "<<".
+        assert _has_heredoc("if [[ $a << $b ]]; then echo ok; fi") is False
+
+    def test_if_arithmetic_shift_not_heredoc(self):
+        # "if ((...))": the keyword "if" must reset at_cmd_start so that "(("
+        # is treated as an arithmetic compound command, not a literal argument.
+        assert _has_heredoc("if ((1<<2)); then echo ok; fi") is False
+
+    def test_if_arithmetic_no_space_not_heredoc(self):
+        # "if((" — no space between keyword and compound command.  _end_word()
+        # must be called on the first "(" so that "if" is recognised as a
+        # keyword before the "((" check fires.
+        assert _has_heredoc("if((1<<2)); then echo ok; fi") is False
+
+    def test_quoted_word_then_bracket_heredoc_detected(self):
+        # 'echo' is a quoted token, not a command-introducing keyword.
+        # at_cmd_start must be cleared so [[ is treated as a literal argument
+        # and the heredoc after it is still detected.
+        assert _has_heredoc("'echo' [[ foo <<EOF\nhello\nEOF") is True
+
+    def test_heredoc_without_newline_still_detected(self):
+        # "cat <<EOF" with no newline is detected as a heredoc — the scanner
+        # returns True as soon as it finds a valid letter-start delimiter after
+        # "<<", without requiring a newline.
+        assert _has_heredoc("cat <<EOF") is True
+
+    def test_heredoc_with_pipe_after_delimiter_detected(self):
+        # "cat <<EOF | wc" — extra operator after the delimiter; still a heredoc.
+        assert _has_heredoc("cat <<EOF | wc") is True
+
+    def test_heredoc_with_redirect_after_delimiter_detected(self):
+        # "cat <<EOF >out.txt" — redirection after the delimiter; still a heredoc.
+        assert _has_heredoc("cat <<EOF >out.txt") is True
+
+    def test_heredoc_trailing_whitespace_after_delimiter_detected(self):
+        # Shell allows trailing spaces/tabs after the delimiter before the newline.
+        assert _has_heredoc("cat <<EOF  \nhello\nEOF") is True
+
+    def test_heredoc_trailing_tab_after_delimiter_detected(self):
+        assert _has_heredoc("cat <<EOF\t\nhello\nEOF") is True
+
+    # --- delimiter forms: digit-start and backslash-escaped ---
+
+    def test_heredoc_digit_delimiter_detected(self):
+        # <<1 is a valid heredoc in bash/POSIX — digit-start delimiter.
+        assert _has_heredoc("cat <<1\nhello\n1") is True
+
+    def test_heredoc_backslash_escaped_delimiter_detected(self):
+        # <<\EOF is a valid heredoc — backslash escapes the delimiter.
+        assert _has_heredoc("cat <<\\EOF\nhello\nEOF") is True
+
+    def test_heredoc_non_alnum_start_delimiter_detected(self):
+        # "<< -EOF" uses "-EOF" as the delimiter (space separates << from -EOF).
+        assert _has_heredoc("cat << -EOF\nhello\n-EOF") is True
+
+    def test_heredoc_parameter_expanded_delimiter_detected(self):
+        # <<$DELIM is a heredoc — delimiter word begins with $.
+        assert _has_heredoc("cat <<$DELIM\nhello\n$DELIM") is True
+
+    def test_heredoc_quoted_parameter_expanded_delimiter_detected(self):
+        # <<"$DELIM" — quoted delimiter with parameter expansion inside.
+        assert _has_heredoc('cat <<"$DELIM"\nhello\n$DELIM') is True
+
+    # --- depth-tracking: only (( )) and [[ ]] suppress detection ---
+
+    def test_nested_arithmetic_in_command_substitution_not_heredoc(self):
+        # << is inside $((...)) nested within $(...); double-bracket depth
+        # tracking must suppress it while leaving the outer $(...) transparent.
+        assert _has_heredoc("echo $(printf '%s' $((1<<2)))") is False
+
+    def test_heredoc_inside_subshell_detected(self):
+        # A genuine heredoc inside a subshell must still be detected — single
+        # ( ) does not increment depth, so << is visible at depth zero.
+        assert _has_heredoc("(cat <<EOF\nhello\nEOF)") is True
+
+    def test_heredoc_with_quoted_delimiter_inside_subshell_detected(self):
+        # Quoted delimiter inside parentheses must also be detected.
+        assert _has_heredoc("(cat <<'EOF'\nhello\nEOF)") is True
+
+    def test_heredoc_after_literal_double_bracket_detected(self):
+        # "echo [[ foo <<EOF" — [[ is a literal argument to echo, not a
+        # compound conditional.  at_cmd_start is False after the word "echo",
+        # so [[ must not enter depth-tracking and the heredoc must be found.
+        assert _has_heredoc("echo [[ foo <<EOF\nhello\nEOF") is True
+
+    def test_heredoc_after_literal_double_paren_detected(self):
+        # "echo ((x)) <<EOF" — (( is a literal argument, not a compound
+        # arithmetic command.  Heredoc must still be detected.
+        assert _has_heredoc("echo ((x)) <<EOF\nhello\nEOF") is True
+
+    def test_nested_parens_inside_arithmetic_heredoc_detected(self):
+        # "echo $(( ((1<<2) ) )) <<EOF" — the inner (( is nested inside the
+        # $((…)) arithmetic expansion.  Lone ( inside a tracked construct must
+        # NOT increment depth (which would leave depth > 0 after the closing
+        # )) and prevent heredoc detection).
+        assert _has_heredoc("echo $(( ((1<<2) ) )) <<EOF\nhello\nEOF") is True
+
+    def test_reserved_word_as_argument_heredoc_detected(self):
+        # "echo if [[ foo <<EOF" — "if" is an argument to echo, not a
+        # command-introducing keyword.  word_started_at_cmd_start is False for
+        # "if" (because echo already cleared at_cmd_start), so _end_word()
+        # must NOT set at_cmd_start=True.  Consequently [[ is seen at a non-
+        # command position and heredoc detection is not suppressed.
+        assert _has_heredoc("echo if [[ foo <<EOF\nhello\nEOF") is True
+
+    # --- command prefixes: env assignments and leading redirects ---
+
+    def test_env_assignment_prefix_bracket_not_heredoc(self):
+        # "A=1 [[ $a << $b ]]" — A=1 is an env-var prefix, not a command word;
+        # at_cmd_start must remain True so [[ enters depth tracking and << is
+        # seen as an arithmetic comparison, not a heredoc.
+        assert _has_heredoc("A=1 [[ $a << $b ]]") is False
+
+    def test_env_assignment_prefix_heredoc_still_detected(self):
+        # Heredoc on an env-prefixed command must still be detected.
+        assert _has_heredoc("A=1 cmd <<EOF\nhello\nEOF") is True
+
+    def test_stdin_redirect_prefix_bracket_not_heredoc(self):
+        # "< /dev/null [[ $a << $b ]]" — the leading stdin redirect and its
+        # target consume two tokens; after them at_cmd_start must be True so
+        # [[ enters depth tracking and << is not mistaken for a heredoc.
+        assert _has_heredoc("< /dev/null [[ $a << $b ]]") is False
+
+    def test_stdin_redirect_prefix_heredoc_still_detected(self):
+        # Heredoc on a command with a leading stdin redirect must be detected.
+        assert _has_heredoc("< /dev/null cmd <<EOF\nhello\nEOF") is True
+
+    def test_stdout_redirect_prefix_bracket_not_heredoc(self):
+        # "> /dev/null [[ $a << $b ]]" — leading stdout redirect; after the
+        # target word at_cmd_start should be True for the same reason.
+        assert _has_heredoc("> /dev/null [[ $a << $b ]]") is False
+
+    def test_multiple_env_assignments_bracket_not_heredoc(self):
+        # Multiple env-var prefixes before [[ must each preserve at_cmd_start.
+        assert _has_heredoc("A=1 B=2 [[ $a << $b ]]") is False
+
+
+class TestHeredocExtraOptions:
+    def test_heredoc_command_returns_always_only(self):
+        # Heredoc: only "always" is offered (to intercept the universal always-
+        # choice); no wildcard pattern option since the content is dynamic.
+        tool = make_tool()
+        opts = tool.extra_permission_options(command="cat <<EOF\nhello\nEOF")
+        assert opts == ["always"]
+
+    def test_heredoc_with_dash_returns_always_only(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(command="python3 <<-EOF\nprint(1)\nEOF")
+        assert opts == ["always"]
+
+    def test_non_heredoc_command_returns_options(self):
+        tool = make_tool()
+        opts = tool.extra_permission_options(command="ls -la")
+        assert "always" in opts
+        assert len(opts) == 2
+
+    def test_redirection_kwarg_unaffected_by_heredoc(self):
+        # The redirection path is independent of heredoc detection.
+        tool = make_tool()
+        opts = tool.extra_permission_options(redirection="> output.txt")
+        assert "always" in opts
+        assert len(opts) == 2
+
+
+class TestHeredocPermission:
+    def test_heredoc_prompts_for_permission(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert allowed is True
+        tool._permission_manager.request.assert_called_once()
+
+    def test_heredoc_denial_returns_false(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        allowed, _ = tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert allowed is False
+
+    def test_heredoc_no_grant_stored_after_yes(self):
+        # Selecting yes must NOT store any grant — the next identical call must prompt.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        call_count_first = tool._permission_manager.request.call_count
+        # Second call with the identical command must still prompt.
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert tool._permission_manager.request.call_count == call_count_first * 2
+
+    def test_heredoc_no_grant_stored_after_always(self):
+        # Even if pm returns "always" (intercepted), no grant must be stored.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "always")
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert len(tool._exact_grants) == 0
+        assert len(tool._pattern_grants) == 0
+        # Next call must still prompt.
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert tool._permission_manager.request.call_count == 2
+
+    def test_heredoc_permission_not_required_skips_prompt(self):
+        tool = make_tool(permission_required=False)
+        allowed, _ = tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert allowed is True
+        tool._permission_manager.request.assert_not_called()
+
+    def test_heredoc_prompt_receives_always_in_extra_options(self):
+        # The "always" extra option is passed so pm cannot create a tool-wide grant.
+        received_extras: list[list] = []
+
+        def side_effect(**kwargs):
+            received_extras.append(kwargs.get("extra_options", []))
+            return (True, "yes")
+
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.side_effect = side_effect
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert received_extras[0] == ["always"]
+
+    def test_heredoc_uses_distinct_tool_name(self):
+        # Heredoc permission is requested under "bash_heredoc", not "bash", so
+        # a pre-existing tool-wide always-grant for bash cannot bypass prompting.
+        received_names: list[str] = []
+
+        def side_effect(**kwargs):
+            received_names.append(kwargs.get("tool_name", ""))
+            return (True, "yes")
+
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.side_effect = side_effect
+        tool.request_permission("run", command="cat <<EOF\nhello\nEOF")
+        assert received_names[0] == "bash_heredoc"
+
+    def test_mixed_chain_heredoc_whole_command_one_time(self):
+        # Any command containing a heredoc gets a single one-time permission prompt;
+        # _parse_chain is bypassed so the body's operators are not misread.
+        # No grant is stored — not even for the non-heredoc segment.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "always")
+        tool.request_permission("run", command="echo hello | cat <<EOF\ntest\nEOF")
+        assert len(tool._exact_grants) == 0
+        assert len(tool._pattern_grants) == 0
+        tool._permission_manager.request.assert_called_once()
+
+    def test_mixed_chain_heredoc_one_prompt_with_always_interception(self):
+        # The single prompt receives only ["always"] — no wildcard grant option.
+        received_extras: list[list] = []
+
+        def side_effect(**kwargs):
+            received_extras.append(kwargs.get("extra_options") or [])
+            return (True, "yes")
+
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.side_effect = side_effect
+        tool.request_permission("run", command="echo hello | cat <<EOF\ntest\nEOF")
+        assert tool._permission_manager.request.call_count == 1
+        assert received_extras[0] == ["always"]
+
+    def test_heredoc_denial_in_chain_denies_whole_command(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        allowed, _ = tool.request_permission(
+            "run", command="echo hello | cat <<EOF\ntest\nEOF"
+        )
+        assert allowed is False
+        tool._permission_manager.request.assert_called_once()
+
+    def test_heredoc_body_with_pipe_one_time_permission(self):
+        # A heredoc whose body contains "|" must NOT be split by _parse_chain.
+        # The whole command gets a single one-time permission prompt.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="cat <<EOF\na | b\nEOF")
+        assert allowed is True
+        tool._permission_manager.request.assert_called_once()
+        assert len(tool._exact_grants) == 0
+
+    def test_heredoc_body_with_and_op_one_time_permission(self):
+        # A heredoc whose body contains "&&" must NOT be split by _parse_chain.
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission("run", command="cat <<EOF\na && b\nEOF")
+        assert allowed is True
+        tool._permission_manager.request.assert_called_once()
+        assert len(tool._exact_grants) == 0
+
+
+class TestHeredocExecute:
+    def test_heredoc_uses_shell_true(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hello\n"),
+        ) as mock_run:
+            tool.execute(command="cat <<EOF\nhello\nEOF")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_heredoc_passes_full_command_string(self):
+        tool = make_tool(permission_required=False)
+        cmd = "cat <<EOF\nhello\nEOF"
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hello\n"),
+        ) as mock_run:
+            tool.execute(command=cmd)
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == cmd
+
+    def test_heredoc_success_returns_output(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hello\n"),
+        ):
+            result = tool.execute(command="cat <<EOF\nhello\nEOF")
+        assert result["status"] == "success"
+        assert result["data"]["output"] == "hello\n"
+
+    def test_heredoc_nonzero_exit_returns_error(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(returncode=1, stderr="fail"),
+        ):
+            result = tool.execute(command="false <<EOF\ntest\nEOF")
+        assert result["status"] == "error"
+        assert result["error"] == "execution_error"
+
+    def test_plain_command_not_affected_by_heredoc_detection(self):
+        # Regression: plain commands without heredoc must still use direct execution.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run", return_value=_completed()
+        ) as mock_run:
+            tool.execute(command="ls -la")
+        _, kwargs = mock_run.call_args
+        assert not kwargs.get("shell")
+
+    def test_heredoc_body_with_unmatched_quote_uses_shell(self):
+        # A heredoc whose body contains an unmatched single quote must NOT return
+        # invalid_command — shlex-based parsing is skipped for heredoc commands.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="hello 'world\n"),
+        ) as mock_run:
+            result = tool.execute(command="cat <<EOF\nhello 'world\nEOF")
+        assert result["status"] == "success"
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("shell") is True
+
+    def test_heredoc_body_with_pipe_uses_shell(self):
+        # A heredoc whose body contains a pipe character must NOT be split by
+        # the chain parser — the whole command goes to the shell as-is.
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash.subprocess.run",
+            return_value=_completed(stdout="a | b\n"),
+        ) as mock_run:
+            result = tool.execute(command="cat <<EOF\na | b\nEOF")
+        assert result["status"] == "success"
+        assert mock_run.call_args[0][0] == "cat <<EOF\na | b\nEOF"
+
+
+class TestHeredocPermissionParseFailure:
+    """Heredoc commands with bodies containing unmatched quotes or operators.
+
+    request_permission() bypasses _parse_chain for all heredoc commands, so
+    these cases never reach the chain parser regardless of body content.
+    """
+
+    def test_parse_failure_still_prompts_once(self):
+        # An unmatched quote in the heredoc body causes _parse_chain to fail;
+        # request_permission must still prompt once (not raise or silently allow).
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        allowed, _ = tool.request_permission(
+            "run", command="cat <<EOF\nhello 'world\nEOF"
+        )
+        assert allowed is True
+        tool._permission_manager.request.assert_called_once()
+
+    def test_parse_failure_no_grant_stored(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat <<EOF\nhello 'world\nEOF")
+        assert len(tool._exact_grants) == 0
+        assert len(tool._pattern_grants) == 0
+
+    def test_parse_failure_always_intercepted(self):
+        # Even on parse failure, the "always" choice must NOT create a tool-wide grant.
+        received_extras: list[list] = []
+
+        def side_effect(**kwargs):
+            received_extras.append(kwargs.get("extra_options", []))
+            return (True, "always")
+
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.side_effect = side_effect
+        tool.request_permission("run", command="cat <<EOF\nhello 'world\nEOF")
+        assert received_extras[0] == ["always"]
+        # No grant must be stored after "always" on a heredoc parse-failure path.
+        assert len(tool._exact_grants) == 0
+
+    def test_parse_failure_denial_returns_false(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (False, "Permission denied.")
+        allowed, _ = tool.request_permission(
+            "run", command="cat <<EOF\nhello 'world\nEOF"
+        )
+        assert allowed is False
+
+    def test_parse_failure_re_prompt_on_next_call(self):
+        tool = make_tool(permission_required=True)
+        tool._permission_manager.request.return_value = (True, "yes")
+        tool.request_permission("run", command="cat <<EOF\nhello 'world\nEOF")
+        first_count = tool._permission_manager.request.call_count
+        tool.request_permission("run", command="cat <<EOF\nhello 'world\nEOF")
+        assert tool._permission_manager.request.call_count == first_count * 2
