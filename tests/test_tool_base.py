@@ -200,3 +200,78 @@ class TestResultHelpers:
         result = Tool._err("bad_input", "Invalid range.", 400, {})
         assert "details" in result
         assert result["details"] == {}
+
+
+class TestTypedErrorWrappers:
+    """Each wrapper must encode the correct error code and HTTP status."""
+
+    def _assert_error(
+        self,
+        result: dict,
+        *,
+        error: str,
+        code: int,
+        message: str = "msg",
+    ) -> None:
+        assert result["status"] == "error"
+        assert result["error"] == error
+        assert result["code"] == code
+        assert result["message"] == message
+        assert "details" not in result
+
+    def test_err_invalid_arguments(self):
+        self._assert_error(
+            Tool._err_invalid_arguments("msg"),
+            error="invalid_arguments",
+            code=400,
+        )
+
+    def test_err_invalid_range(self):
+        self._assert_error(
+            Tool._err_invalid_range("msg"),
+            error="invalid_range",
+            code=400,
+        )
+
+    def test_err_read_error(self):
+        self._assert_error(
+            Tool._err_read_error("msg"),
+            error="read_error",
+            code=400,
+        )
+
+    def test_err_write_error(self):
+        self._assert_error(
+            Tool._err_write_error("msg"),
+            error="write_error",
+            code=400,
+        )
+
+    def test_err_execution_error(self):
+        self._assert_error(
+            Tool._err_execution_error("msg"),
+            error="execution_error",
+            code=400,
+        )
+
+    def test_err_timeout(self):
+        self._assert_error(
+            Tool._err_timeout("msg"),
+            error="timeout",
+            code=408,
+        )
+
+    def test_err_internal_error(self):
+        self._assert_error(
+            Tool._err_internal_error("msg"),
+            error="internal_error",
+            code=500,
+        )
+
+    def test_details_forwarded_when_provided(self):
+        result = Tool._err_invalid_arguments("bad", {"field": "path"})
+        assert result["details"] == {"field": "path"}
+
+    def test_details_absent_when_not_provided(self):
+        result = Tool._err_timeout("timed out")
+        assert "details" not in result
