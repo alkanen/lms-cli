@@ -386,3 +386,38 @@ class Tool(ABC):
         if details is not None:
             result["details"] = details
         return result
+
+    @staticmethod
+    def _err_invalid_arguments(message: str, details: dict | None = None) -> dict:
+        """The LLM supplied a bad argument value (HTTP 400)."""
+        return Tool._err("invalid_arguments", message, 400, details)
+
+    @staticmethod
+    def _err_invalid_range(message: str, details: dict | None = None) -> dict:
+        """A numeric range argument is out of bounds or inverted (HTTP 400)."""
+        return Tool._err("invalid_range", message, 400, details)
+
+    @staticmethod
+    def _err_read_error(message: str, details: dict | None = None) -> dict:
+        """A file could not be read (HTTP 400)."""
+        return Tool._err("read_error", message, 400, details)
+
+    @staticmethod
+    def _err_write_error(message: str, details: dict | None = None) -> dict:
+        """A file could not be written (HTTP 400)."""
+        return Tool._err("write_error", message, 400, details)
+
+    @staticmethod
+    def _err_execution_error(message: str, details: dict | None = None) -> dict:
+        """A subprocess exited with a non-zero status (HTTP 400)."""
+        return Tool._err("execution_error", message, 400, details)
+
+    @staticmethod
+    def _err_timeout(message: str, details: dict | None = None) -> dict:
+        """A subprocess or operation exceeded its time limit (HTTP 408)."""
+        return Tool._err("timeout", message, 408, details)
+
+    @staticmethod
+    def _err_internal_error(message: str, details: dict | None = None) -> dict:
+        """An unexpected internal failure occurred (HTTP 500)."""
+        return Tool._err("internal_error", message, 500, details)
