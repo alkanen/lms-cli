@@ -267,11 +267,7 @@ class ReadFileTool(Tool):
             try:
                 full_text = resolved_target.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                return self._err(
-                    "read_error",
-                    f"Cannot read '{path}': {exc}",
-                    400,
-                )
+                return self._err_read_error(f"Cannot read '{path}': {exc}")
             return self._apply_line_range(full_text, path, start_line, end_line)
 
         # For absolute paths that fall under an external indexed root, bypass
@@ -284,11 +280,11 @@ class ReadFileTool(Tool):
             ei = self._workspace.embedding_index
             if ei is not None and ei.is_indexed_path(resolved_abs):
                 if not resolved_abs.is_file():
-                    return self._err("read_error", f"File not found: '{path}'", 400)
+                    return self._err_read_error(f"File not found: '{path}'")
                 try:
                     full_text = resolved_abs.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
-                    return self._err("read_error", f"Cannot read '{path}': {exc}", 400)
+                    return self._err_read_error(f"Cannot read '{path}': {exc}")
                 # Fall through to the common line-range handling below.
                 return self._apply_line_range(full_text, path, start_line, end_line)
 
@@ -297,7 +293,7 @@ class ReadFileTool(Tool):
             full_text = self._workspace.read_file(path)
         except WorkspaceError as exc:
             logger.debug("read_file: error reading '%s': %s", path, exc)
-            return self._err("read_error", str(exc), 400)
+            return self._err_read_error(str(exc))
 
         return self._apply_line_range(full_text, path, start_line, end_line)
 
@@ -306,17 +302,13 @@ class ReadFileTool(Tool):
         base_dir: str,
     ) -> tuple[Path | None, dict | None]:
         if not isinstance(base_dir, str) or not base_dir.strip():
-            return None, self._err(
-                "invalid_arguments",
-                "'base_dir' must be a non-empty string.",
-                400,
+            return None, self._err_invalid_arguments(
+                "'base_dir' must be a non-empty string."
             )
 
         if self._skill_registry is None:
-            return None, self._err(
-                "invalid_arguments",
-                "'base_dir' is only supported when skills are loaded.",
-                400,
+            return None, self._err_invalid_arguments(
+                "'base_dir' is only supported when skills are loaded."
             )
 
         base_path = Path(base_dir)
@@ -330,10 +322,8 @@ class ReadFileTool(Tool):
             spec.base_dir.resolve() for spec in self._skill_registry.skills.values()
         }
         if resolved_base not in allowed_dirs:
-            return None, self._err(
-                "invalid_arguments",
-                "'base_dir' must match a currently loaded skill base_dir.",
-                400,
+            return None, self._err_invalid_arguments(
+                "'base_dir' must match a currently loaded skill base_dir."
             )
 
         return resolved_base, None
@@ -353,14 +343,12 @@ class ReadFileTool(Tool):
         try:
             resolved_target.relative_to(base_dir)
         except ValueError:
-            return None, self._err(
-                "read_error",
-                f"Path '{path}' resolves outside base_dir.",
-                400,
+            return None, self._err_read_error(
+                f"Path '{path}' resolves outside base_dir."
             )
 
         if not resolved_target.is_file():
-            return None, self._err("read_error", f"File not found: '{path}'", 400)
+            return None, self._err_read_error(f"File not found: '{path}'")
 
         return resolved_target, None
 
@@ -378,30 +366,22 @@ class ReadFileTool(Tool):
 
         # Validate requested range.
         if start_line is not None and start_line < 1:
-            return self._err(
-                "invalid_range", f"start_line must be >= 1, got {start_line}.", 400
+            return self._err_invalid_range(
+                f"start_line must be >= 1, got {start_line}."
             )
         if end_line is not None and end_line < 1:
-            return self._err(
-                "invalid_range", f"end_line must be >= 1, got {end_line}.", 400
-            )
+            return self._err_invalid_range(f"end_line must be >= 1, got {end_line}.")
         if start_line is not None and end_line is not None and start_line > end_line:
-            return self._err(
-                "invalid_range",
-                f"start_line ({start_line}) must be <= end_line ({end_line}).",
-                400,
+            return self._err_invalid_range(
+                f"start_line ({start_line}) must be <= end_line ({end_line})."
             )
         if start_line is not None and start_line > total_lines:
-            return self._err(
-                "invalid_range",
-                f"start_line ({start_line}) exceeds file length ({total_lines} line(s)) for '{path}'.",
-                400,
+            return self._err_invalid_range(
+                f"start_line ({start_line}) exceeds file length ({total_lines} line(s)) for '{path}'."
             )
         if end_line is not None and end_line > total_lines:
-            return self._err(
-                "invalid_range",
-                f"end_line ({end_line}) exceeds file length ({total_lines} line(s)) for '{path}'.",
-                400,
+            return self._err_invalid_range(
+                f"end_line ({end_line}) exceeds file length ({total_lines} line(s)) for '{path}'."
             )
 
         # Empty file: return a consistent zero-based sentinel so that
