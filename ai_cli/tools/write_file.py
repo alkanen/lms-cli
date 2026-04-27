@@ -221,27 +221,21 @@ class WriteFileTool(Tool):
         )
         # Reject supplying only one of the pair.
         if (start_line is None) != (end_line is None):
-            return self._err(
-                "invalid_range",
-                "start_line and end_line must be provided together for a partial write.",
-                400,
+            return self._err_invalid_range(
+                "start_line and end_line must be provided together for a partial write."
             )
 
         # Pre-validate range values so callers get 'invalid_range' (bad input)
         # rather than 'write_error' (I/O failure) for out-of-bounds line numbers.
         if start_line is not None and start_line < 1:
-            return self._err(
-                "invalid_range", f"start_line must be >= 1, got {start_line}.", 400
+            return self._err_invalid_range(
+                f"start_line must be >= 1, got {start_line}."
             )
         if end_line is not None and end_line < 1:
-            return self._err(
-                "invalid_range", f"end_line must be >= 1, got {end_line}.", 400
-            )
+            return self._err_invalid_range(f"end_line must be >= 1, got {end_line}.")
         if start_line is not None and end_line is not None and start_line > end_line:
-            return self._err(
-                "invalid_range",
-                f"start_line ({start_line}) must be <= end_line ({end_line}).",
-                400,
+            return self._err_invalid_range(
+                f"start_line ({start_line}) must be <= end_line ({end_line})."
             )
 
         try:
@@ -249,7 +243,7 @@ class WriteFileTool(Tool):
                 path, content, start_line=start_line, end_line=end_line
             )
         except WorkspaceError as exc:
-            return self._err("write_error", str(exc), 400)
+            return self._err_write_error(str(exc))
 
         lines_written = len(content.splitlines()) if content else 0
         logger.info(
