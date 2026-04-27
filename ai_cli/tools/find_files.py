@@ -162,7 +162,7 @@ class FindFilesTool(Tool):
     ) -> dict:
         logger.debug("find_files: pattern=%r", pattern)
         if not pattern:
-            return self._err("invalid_input", "'pattern' must not be empty.", 400)
+            return self._err_invalid_arguments("'pattern' must not be empty.")
 
         # Reject absolute patterns and any path traversal via ..
         # NOTE: Access control for external indexed roots (via
@@ -170,14 +170,10 @@ class FindFilesTool(Tool):
         # update when an optional 'path' parameter is added to this tool.
         # Currently all patterns are workspace-relative only.
         if pattern.startswith("/"):
-            return self._err(
-                "invalid_input", "Pattern must not be an absolute path.", 400
-            )
+            return self._err_invalid_arguments("Pattern must not be an absolute path.")
         if re.search(r"(^|/)\.\.(/|$)", pattern):
-            return self._err(
-                "invalid_input",
-                "Pattern must not contain '..' path traversal segments.",
-                400,
+            return self._err_invalid_arguments(
+                "Pattern must not contain '..' path traversal segments."
             )
 
         canonical_pattern = _normalize_workspace_glob(pattern)
@@ -185,7 +181,7 @@ class FindFilesTool(Tool):
         try:
             compiled = _compile_glob(canonical_pattern)
         except re.error as exc:
-            return self._err("invalid_input", f"Invalid glob pattern: {exc}", 400)
+            return self._err_invalid_arguments(f"Invalid glob pattern: {exc}")
 
         workspace_root = self._workspace.root
         matches: list[str] = []
@@ -240,7 +236,7 @@ class FindFilesTool(Tool):
             try:
                 entries = sorted(walk_root.iterdir())
             except OSError as exc:
-                return self._err("search_error", str(exc), 500)
+                return self._err_internal_error(str(exc))
             for entry in entries:
                 if not entry.is_file():
                     continue

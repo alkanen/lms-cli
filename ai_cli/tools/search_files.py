@@ -102,16 +102,14 @@ class SearchFilesTool(Tool):
                 "not_enabled",
                 "Embedding index is not enabled or not initialised. "
                 "Enable embeddings in config and run /index.",
-                400,
+                503,
             )
 
         k = min(max(1, k), 20)
 
         if level not in ("chunk", "document", "both"):
-            return self._err(
-                "invalid_input",
-                f"'level' must be 'chunk', 'document', or 'both'; got {level!r}.",
-                400,
+            return self._err_invalid_arguments(
+                f"'level' must be 'chunk', 'document', or 'both'; got {level!r}."
             )
 
         t0 = time.monotonic()
@@ -120,7 +118,7 @@ class SearchFilesTool(Tool):
             results = ei.search(query, k=k, level=level, path_glob=path_glob)
         except Exception as exc:
             logger.exception("search_files: search failed")
-            return self._err("search_error", f"Search failed: {exc}", 500)
+            return self._err_internal_error(f"Search failed: {exc}")
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 

@@ -453,7 +453,8 @@ class TestErrorCases:
         tool = make_tool(tmp_path)
         result = tool.execute(pattern="[z-a].py")
         assert result["status"] == "error"
-        assert result["error"] == "invalid_input"
+        assert result["error"] == "invalid_arguments"
+        assert result["code"] == 400
 
     def test_dotdot_pattern_segment_returns_error(self, tmp_path):
         tool = make_tool(tmp_path)

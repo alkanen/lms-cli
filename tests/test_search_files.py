@@ -100,7 +100,7 @@ def test_execute_no_embedding_index():
     result = tool.execute(query="find something")
     assert result["status"] == "error"
     assert result["error"] == "not_enabled"
-    assert result["code"] == 400
+    assert result["code"] == 503
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ def test_execute_invalid_level() -> None:
     tool = _make_tool(embedding_index=ei)
     result = tool.execute(query="q", level="invalid")
     assert result["status"] == "error"
-    assert result["error"] == "invalid_input"
+    assert result["error"] == "invalid_arguments"
 
 
 def test_execute_includes_query_time_ms() -> None:
@@ -222,7 +222,7 @@ def test_execute_search_exception() -> None:
     tool = _make_tool(embedding_index=ei)
     result = tool.execute(query="q")
     assert result["status"] == "error"
-    assert result["error"] == "search_error"
+    assert result["error"] == "internal_error"
     assert result["code"] == 500
 
 
