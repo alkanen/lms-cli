@@ -1251,17 +1251,13 @@ class BashTool(Tool):
         max_output_chars: int = _DEFAULT_MAX_OUTPUT_CHARS,
     ) -> dict:
         if capture not in _CAPTURE_MODES:
-            return self._err(
-                "invalid_arguments",
+            return self._err_invalid_arguments(
                 f"Invalid capture mode {capture!r}. Must be one of: "
-                + ", ".join(_CAPTURE_MODES),
-                400,
+                + ", ".join(_CAPTURE_MODES)
             )
         if max_output_chars < 1:
-            return self._err(
-                "invalid_arguments",
-                f"max_output_chars must be >= 1, got {max_output_chars}.",
-                400,
+            return self._err_invalid_arguments(
+                f"max_output_chars must be >= 1, got {max_output_chars}."
             )
 
         # Detect chain operators / redirections to choose execution strategy.
@@ -1323,14 +1319,12 @@ class BashTool(Tool):
                 logger.warning(
                     "bash: shell command timed out after %ds", _DEFAULT_TIMEOUT
                 )
-                return self._err(
-                    "execution_error",
-                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
-                    408,
+                return self._err_timeout(
+                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds."
                 )
             except Exception as exc:
                 logger.exception("bash: unexpected error running shell command")
-                return self._err("execution_error", str(exc), 500)
+                return self._err_internal_error(str(exc))
         else:
             if not segments:
                 return self._err("invalid_command", "Command is empty.", 400)
@@ -1360,21 +1354,17 @@ class BashTool(Tool):
                 )
             except FileNotFoundError:
                 logger.debug("bash: executable not found: %r", cmd_args[0])
-                return self._err(
-                    "execution_error", f"Command not found: {cmd_args[0]}", 400
-                )
+                return self._err_execution_error(f"Command not found: {cmd_args[0]}")
             except subprocess.TimeoutExpired:
                 logger.warning(
                     "bash: %r timed out after %ds", cmd_args[0], _DEFAULT_TIMEOUT
                 )
-                return self._err(
-                    "execution_error",
-                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds.",
-                    408,
+                return self._err_timeout(
+                    f"Command timed out after {_DEFAULT_TIMEOUT} seconds."
                 )
             except Exception as exc:
                 logger.exception("bash: unexpected error running %r", cmd_args[0])
-                return self._err("execution_error", str(exc), 500)
+                return self._err_internal_error(str(exc))
 
         # A process we killed to enforce the output limit exits with a negative
         # signal-based returncode on POSIX (e.g. -9 for SIGKILL).  That is not
@@ -1393,7 +1383,7 @@ class BashTool(Tool):
             if raw_error:
                 error_output, _ = _truncate(raw_error, max_output_chars)
                 message = f"{message} {error_output}"
-            return self._err("execution_error", message, 400)
+            return self._err_execution_error(message)
 
         if capture == "separate":
             data: dict[str, Any] = {"stdout": stdout_text, "stderr": stderr_text}
