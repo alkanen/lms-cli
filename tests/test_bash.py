@@ -173,7 +173,7 @@ class TestExecute:
         assert result["error"] == "execution_error"
         assert "no_such_exe" in result["message"]
 
-    def test_timeout_returns_execution_error(self):
+    def test_timeout_returns_timeout(self):
         tool = make_tool(permission_required=False)
         with patch(
             "ai_cli.tools.bash._run_popen",
@@ -181,8 +181,31 @@ class TestExecute:
         ):
             result = tool.execute(command="sleep 999")
         assert result["status"] == "error"
-        assert result["error"] == "execution_error"
+        assert result["error"] == "timeout"
+        assert result["code"] == 408
         assert "timed out" in result["message"]
+
+    def test_unexpected_exception_returns_internal_error(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            side_effect=RuntimeError("something exploded"),
+        ):
+            result = tool.execute(command="ls")
+        assert result["status"] == "error"
+        assert result["error"] == "internal_error"
+        assert result["code"] == 500
+
+    def test_unexpected_exception_shell_path_returns_internal_error(self):
+        tool = make_tool(permission_required=False)
+        with patch(
+            "ai_cli.tools.bash._run_popen",
+            side_effect=RuntimeError("something exploded"),
+        ):
+            result = tool.execute(command="ls | cat")
+        assert result["status"] == "error"
+        assert result["error"] == "internal_error"
+        assert result["code"] == 500
 
     def test_invalid_shlex_returns_invalid_command(self):
         tool = make_tool(permission_required=False)
@@ -1277,7 +1300,7 @@ class TestChainExecute:
         assert result["error"] == "execution_error"
         assert "status 1" in result["message"]
 
-    def test_chain_timeout_returns_error(self):
+    def test_chain_timeout_returns_timeout(self):
         tool = make_tool(permission_required=False)
         with patch(
             "ai_cli.tools.bash._run_popen",
@@ -1285,7 +1308,8 @@ class TestChainExecute:
         ):
             result = tool.execute(command="cat foo | sleep 999")
         assert result["status"] == "error"
-        assert result["error"] == "execution_error"
+        assert result["error"] == "timeout"
+        assert result["code"] == 408
         assert "timed out" in result["message"]
 
     def test_chain_capture_separate(self):
@@ -2665,8 +2689,8 @@ class TestStreaming:
                 timeout=0.2,
             )
 
-    def test_execute_timeout_returns_error(self):
-        # Via execute(): a timed-out streaming command returns the execution_error.
+    def test_execute_timeout_returns_timeout(self):
+        # Via execute(): a timed-out streaming command returns timeout.
         tool = make_tool(permission_required=False)
         with patch(
             "ai_cli.tools.bash._run_popen",
@@ -2674,7 +2698,8 @@ class TestStreaming:
         ):
             result = tool.execute(command="bash -c 'while true; do echo x; done'")
         assert result["status"] == "error"
-        assert result["error"] == "execution_error"
+        assert result["error"] == "timeout"
+        assert result["code"] == 408
         assert "timed out" in result["message"]
 
     def test_separate_mode_still_buffered(self):
