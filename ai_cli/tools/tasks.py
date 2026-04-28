@@ -97,11 +97,11 @@ class _TaskTool(Tool):
                 "not_found", exc.args[0] if exc.args else str(exc), code=404
             )
         except TaskValidationError as exc:
-            logger.info("Task tool '%s' validation_error: %s", self.name, exc)
-            return self._err("validation_error", str(exc), code=400)
+            logger.info("Task tool '%s' invalid_arguments: %s", self.name, exc)
+            return self._err_invalid_arguments(str(exc))
         except TaskStorageError as exc:
-            logger.info("Task tool '%s' storage_error: %s", self.name, exc)
-            return self._err("storage_error", str(exc), code=500)
+            logger.info("Task tool '%s' internal_error: %s", self.name, exc)
+            return self._err_internal_error(str(exc))
 
     def _parse_task_path(
         self, kwargs: dict[str, Any], key: str = "task_path"
@@ -111,8 +111,8 @@ class _TaskTool(Tool):
         try:
             return normalize_task_path(raw), None
         except TaskValidationError:
-            return "", self._err(
-                "validation_error", f"'{key}' must be a non-empty string.", code=400
+            return "", self._err_invalid_arguments(
+                f"'{key}' must be a non-empty string."
             )
 
     def _parse_parent_path(
@@ -123,9 +123,7 @@ class _TaskTool(Tool):
         if raw is None or raw == "":
             return None, None
         if not isinstance(raw, str):
-            return None, self._err(
-                "validation_error", "'parent_path' must be a string.", code=400
-            )
+            return None, self._err_invalid_arguments("'parent_path' must be a string.")
         normalized_raw = raw.strip()
         if not normalized_raw:
             return None, None
@@ -134,10 +132,8 @@ class _TaskTool(Tool):
         try:
             return normalize_task_path(raw), None
         except TaskValidationError:
-            return None, self._err(
-                "validation_error",
-                "'parent_path' must be a non-empty string.",
-                code=400,
+            return None, self._err_invalid_arguments(
+                "'parent_path' must be a non-empty string."
             )
 
 
@@ -311,21 +307,13 @@ class TasksCreateTool(_TaskTool):
             return err
 
         if not isinstance(name, str) or not name.strip():
-            return self._err(
-                "validation_error", "'name' must be a non-empty string.", code=400
-            )
+            return self._err_invalid_arguments("'name' must be a non-empty string.")
         if not isinstance(dod, str):
-            return self._err(
-                "validation_error", "'definition_of_done' must be a string.", code=400
-            )
+            return self._err_invalid_arguments("'definition_of_done' must be a string.")
         if not isinstance(description, str):
-            return self._err(
-                "validation_error", "'description' must be a string.", code=400
-            )
+            return self._err_invalid_arguments("'description' must be a string.")
         if not isinstance(priority, str):
-            return self._err(
-                "validation_error", "'priority' must be a string.", code=400
-            )
+            return self._err_invalid_arguments("'priority' must be a string.")
 
         logger.debug(
             "Task tool '%s' invoked: name=%r parent_path=%r priority=%r",
@@ -458,10 +446,8 @@ class TasksUpdateTool(_TaskTool):
         requested_parent_path = update_fields.pop("parent_path", None)
 
         if not update_fields and not reparent_requested:
-            return self._err(
-                "validation_error",
-                "At least one field must be provided to update.",
-                code=400,
+            return self._err_invalid_arguments(
+                "At least one field must be provided to update."
             )
 
         if reparent_requested:
@@ -469,10 +455,8 @@ class TasksUpdateTool(_TaskTool):
                 # Treat null as omitted: leave parent unchanged.
                 pass
             elif not isinstance(requested_parent_path, str):
-                return self._err(
-                    "validation_error",
-                    "'parent_path' must be a string when provided.",
-                    code=400,
+                return self._err_invalid_arguments(
+                    "'parent_path' must be a string when provided."
                 )
             else:
                 normalized_requested_parent = requested_parent_path.strip()
@@ -487,18 +471,14 @@ class TasksUpdateTool(_TaskTool):
                             requested_parent_path
                         )
                     except TaskValidationError:
-                        return self._err(
-                            "validation_error",
-                            "'parent_path' must be a valid task path.",
-                            code=400,
+                        return self._err_invalid_arguments(
+                            "'parent_path' must be a valid task path."
                         )
                     update_fields["_resolved_parent_path"] = normalized_parent_path
 
         if not update_fields:
-            return self._err(
-                "validation_error",
-                "At least one field must be provided to update.",
-                code=400,
+            return self._err_invalid_arguments(
+                "At least one field must be provided to update."
             )
 
         logger.debug(
@@ -567,9 +547,7 @@ class TasksAddNoteTool(_TaskTool):
             return err
         note: str = kwargs.get("note", "")
         if not isinstance(note, str) or not note.strip():
-            return self._err(
-                "validation_error", "'note' must be a non-empty string.", code=400
-            )
+            return self._err_invalid_arguments("'note' must be a non-empty string.")
 
         logger.debug(
             "Task tool '%s' invoked: task_path=%r note_chars=%d",
@@ -642,13 +620,11 @@ class TasksObsoleteNoteTool(_TaskTool):
 
         note_index = kwargs.get("note_index")
         if not isinstance(note_index, int):
-            return self._err(
-                "validation_error", "'note_index' must be an integer.", code=400
-            )
+            return self._err_invalid_arguments("'note_index' must be an integer.")
 
         reason = kwargs.get("reason", "")
         if not isinstance(reason, str):
-            return self._err("validation_error", "'reason' must be a string.", code=400)
+            return self._err_invalid_arguments("'reason' must be a string.")
 
         logger.debug(
             "Task tool '%s' invoked: task_path=%r note_index=%d",

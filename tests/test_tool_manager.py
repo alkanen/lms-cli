@@ -150,13 +150,13 @@ class TestEnableAction:
         tool = _make_tool(_make_registry())
         result = tool.execute(action="enable", tool_names=[])
         assert result["status"] == "error"
-        assert result["error"] == "invalid_input"
+        assert result["error"] == "invalid_arguments"
 
     def test_enable_without_tool_names_returns_error(self):
         tool = _make_tool(_make_registry())
         result = tool.execute(action="enable")
         assert result["status"] == "error"
-        assert result["error"] == "invalid_input"
+        assert result["error"] == "invalid_arguments"
 
     def test_enable_calls_enable_transient_for_each_name(self):
         schema = {"type": "function", "function": {"name": "find_files"}}
@@ -182,7 +182,7 @@ class TestUnknownAction:
         tool = _make_tool(_make_registry())
         result = tool.execute(action="dance")
         assert result["status"] == "error"
-        assert result["error"] == "invalid_input"
+        assert result["error"] == "invalid_arguments"
         assert "dance" in result["message"]
 
 

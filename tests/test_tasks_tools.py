@@ -204,11 +204,11 @@ class TestTasksListTool:
         assert result["status"] == "success"
         assert len(result["data"]["tasks"]) == 1
 
-    def test_list_non_string_parent_path_returns_validation_error(self, tmp_path):
+    def test_list_non_string_parent_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksListTool, tmp_path)
         result = tool.execute(parent_path=0)
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_list_unknown_parent_path_returns_not_found(self, tmp_path):
         tool, _ = _make_tool(TasksListTool, tmp_path)
@@ -243,11 +243,11 @@ class TestTasksListTool:
         tm.list_tasks.assert_called_once_with(parent_id="p1")
         assert result == _ok({"tasks": []})
 
-    def test_parent_path_dot_only_returns_validation_error(self, tmp_path):
+    def test_parent_path_dot_only_returns_invalid_arguments(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksListTool)
         result = tool.execute(parent_path=".")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
         tm.resolve_path_to_id.assert_not_called()
         tm.list_tasks.assert_not_called()
 
@@ -270,7 +270,7 @@ class TestTasksListTool:
         tm.list_tasks.side_effect = TaskStorageError("disk failure")
         result = tool.execute()
         assert result["status"] == "error"
-        assert result["error"] == "storage_error"
+        assert result["error"] == "internal_error"
         assert result["code"] == 500
 
 
@@ -302,17 +302,17 @@ class TestTasksGetTool:
         assert result["error"] == "not_found"
         assert result["code"] == 404
 
-    def test_empty_task_path_returns_validation_error(self, tmp_path):
+    def test_empty_task_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksGetTool, tmp_path)
         result = tool.execute(task_path="")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_missing_task_path_returns_validation_error(self, tmp_path):
+    def test_missing_task_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksGetTool, tmp_path)
         result = tool.execute()
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_delegates_to_task_manager(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksGetTool)
@@ -380,31 +380,31 @@ class TestTasksCreateTool:
         subtasks = tm.list_tasks(parent_id=child["id"])
         assert any(s["name"] == "Leaf" for s in subtasks)
 
-    def test_short_dod_returns_validation_error(self, tmp_path):
+    def test_short_dod_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksCreateTool, tmp_path)
         result = tool.execute(name="T", definition_of_done="hi")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_empty_name_returns_validation_error(self, tmp_path):
+    def test_empty_name_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksCreateTool, tmp_path)
         result = tool.execute(name="", definition_of_done="DoD here")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_missing_name_returns_validation_error(self, tmp_path):
+    def test_missing_name_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksCreateTool, tmp_path)
         result = tool.execute(definition_of_done="DoD here")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_non_string_parent_path_returns_validation_error(self, tmp_path):
+    def test_non_string_parent_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksCreateTool, tmp_path)
         result = tool.execute(
             name="T", definition_of_done="DoD here", parent_path=False
         )
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_unknown_parent_returns_not_found(self, tmp_path):
         tool, _ = _make_tool(TasksCreateTool, tmp_path)
@@ -510,12 +510,12 @@ class TestTasksUpdateTool:
         assert result["status"] == "success"
         assert result["data"]["task"]["status"] == "blocked"
 
-    def test_update_done_status_returns_validation_error(self, tmp_path):
+    def test_update_done_status_returns_invalid_arguments(self, tmp_path):
         tool, tm = _make_tool(TasksUpdateTool, tmp_path)
         tm.create_task("T", "DoD here")
         result = tool.execute(task_path="T", status="done")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_unknown_task_returns_not_found(self, tmp_path):
         tool, _ = _make_tool(TasksUpdateTool, tmp_path)
@@ -523,19 +523,19 @@ class TestTasksUpdateTool:
         assert result["status"] == "error"
         assert result["error"] == "not_found"
 
-    def test_empty_task_path_returns_validation_error(self, tmp_path):
+    def test_empty_task_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksUpdateTool, tmp_path)
         result = tool.execute(task_path="")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_only_task_path_returns_validation_error(self, tmp_path):
-        """Calling with only task_path (no fields to update) must return validation_error."""
+    def test_only_task_path_returns_invalid_arguments(self, tmp_path):
+        """Calling with only task_path (no fields to update) must return invalid_arguments."""
         tool, tm = _make_tool(TasksUpdateTool, tmp_path)
         tm.create_task("T", "DoD here")
         result = tool.execute(task_path="T")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_delegates_only_update_fields(self, tmp_path):
         """task_path must not be passed as an update field to TaskManager."""
@@ -595,7 +595,7 @@ class TestTasksUpdateTool:
         assert result == _ok({"task": detail})
 
     @pytest.mark.parametrize("noop_parent_path", [None, "", "   "])
-    def test_parent_path_noop_without_other_fields_returns_validation_error(
+    def test_parent_path_noop_without_other_fields_returns_invalid_arguments(
         self, tmp_path, noop_parent_path
     ):
         tool, tm = _make_tool_with_mock_tm(TasksUpdateTool)
@@ -603,7 +603,7 @@ class TestTasksUpdateTool:
         result = tool.execute(task_path="Task", parent_path=noop_parent_path)
 
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
         tm.resolve_path_to_id.assert_not_called()
         tm.update_task.assert_not_called()
 
@@ -651,18 +651,18 @@ class TestTasksAddNoteTool:
         assert result["status"] == "success"
         assert any("Working on it." in n for n in result["data"]["task"]["notes"])
 
-    def test_empty_note_returns_validation_error(self, tmp_path):
+    def test_empty_note_returns_invalid_arguments(self, tmp_path):
         tool, tm = _make_tool(TasksAddNoteTool, tmp_path)
         tm.create_task("T", "DoD here")
         result = tool.execute(task_path="T", note="")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_empty_task_path_returns_validation_error(self, tmp_path):
+    def test_empty_task_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksAddNoteTool, tmp_path)
         result = tool.execute(task_path="", note="Something.")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_unknown_task_returns_not_found(self, tmp_path):
         tool, _ = _make_tool(TasksAddNoteTool, tmp_path)
@@ -715,7 +715,7 @@ class TestTasksObsoleteNoteTool:
         tm.create_task("T", "DoD here")
         result = tool.execute(task_path="T", note_index="0")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_delegates_to_task_manager(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksObsoleteNoteTool)
@@ -750,15 +750,15 @@ class TestTasksMarkDoneTool:
         assert result["status"] == "success"
         assert result["data"]["task"]["status"] == "done"
 
-    def test_subtask_not_done_returns_validation_error(self, tmp_path):
+    def test_subtask_not_done_returns_invalid_arguments(self, tmp_path):
         tool, tm = _make_tool(TasksMarkDoneTool, tmp_path)
         parent = tm.create_task("Parent", "Parent DoD")
         tm.create_task("Child", "Child DoD", parent_id=parent["id"])
         result = tool.execute(task_path="Parent")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
-    def test_missing_dod_returns_validation_error(self, tmp_path):
+    def test_missing_dod_returns_invalid_arguments(self, tmp_path):
         tool, tm = _make_tool(TasksMarkDoneTool, tmp_path)
         task = tm.create_task("T", "DoD here")
         # Corrupt the DoD directly in the in-memory cache (TaskManager no longer
@@ -766,7 +766,7 @@ class TestTasksMarkDoneTool:
         tm._cache["tasks"][task["id"]]["definition_of_done"] = ""
         result = tool.execute(task_path="T")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_unknown_task_returns_not_found(self, tmp_path):
         tool, _ = _make_tool(TasksMarkDoneTool, tmp_path)
@@ -774,11 +774,11 @@ class TestTasksMarkDoneTool:
         assert result["status"] == "error"
         assert result["error"] == "not_found"
 
-    def test_empty_task_path_returns_validation_error(self, tmp_path):
+    def test_empty_task_path_returns_invalid_arguments(self, tmp_path):
         tool, _ = _make_tool(TasksMarkDoneTool, tmp_path)
         result = tool.execute(task_path="")
         assert result["status"] == "error"
-        assert result["error"] == "validation_error"
+        assert result["error"] == "invalid_arguments"
 
     def test_delegates_to_task_manager(self, tmp_path):
         tool, tm = _make_tool_with_mock_tm(TasksMarkDoneTool)
@@ -796,5 +796,5 @@ class TestTasksMarkDoneTool:
         tm.mark_done.side_effect = TaskStorageError("I/O error")
         result = tool.execute(task_path="T")
         assert result["status"] == "error"
-        assert result["error"] == "storage_error"
+        assert result["error"] == "internal_error"
         assert result["code"] == 500
