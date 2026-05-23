@@ -115,28 +115,24 @@ class ToolManagerTool(Tool):
             return self._do_list()
         if action == "enable":
             return self._do_enable(tool_names or [])
-        return self._err(
-            "invalid_input",
-            f"Unknown action {action!r}.  Valid actions: 'list', 'enable'.",
-            400,
+        return self._err_invalid_arguments(
+            f"Unknown action {action!r}.  Valid actions: 'list', 'enable'."
         )
 
     def _do_list(self) -> dict:
         if self._registry is None:
-            return self._err("internal_error", "Registry not available.", 500)
+            return self._err_internal_error("Registry not available.")
         tools = self._registry.list_all()
         logger.debug("tool_manager: listing %d tool(s)", len(tools))
         return self._ok({"tools": tools})
 
     def _do_enable(self, tool_names: list[str]) -> dict:
         if not tool_names:
-            return self._err(
-                "invalid_input",
-                "'tool_names' must be a non-empty list when action='enable'.",
-                400,
+            return self._err_invalid_arguments(
+                "'tool_names' must be a non-empty list when action='enable'."
             )
         if self._registry is None:
-            return self._err("internal_error", "Registry not available.", 500)
+            return self._err_internal_error("Registry not available.")
 
         enabled: list[str] = []
         unknown: list[str] = []

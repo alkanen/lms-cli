@@ -55,17 +55,9 @@ class SkillsTool(Tool):
     def execute(self, **kwargs: Any) -> dict:
         requested_name = kwargs.get("name")
         if not isinstance(requested_name, str):
-            return self._err(
-                "invalid_arguments",
-                "'name' must be a string.",
-                code=400,
-            )
+            return self._err_invalid_arguments("'name' must be a string.")
         if not requested_name.strip():
-            return self._err(
-                "invalid_arguments",
-                "'name' must be a non-empty string.",
-                code=400,
-            )
+            return self._err_invalid_arguments("'name' must be a non-empty string.")
 
         skill = self._skills.get(requested_name)
         if skill is None:
