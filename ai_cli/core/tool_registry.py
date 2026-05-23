@@ -301,6 +301,60 @@ def _check_bounds(val: object, arg: ToolArgument) -> str | None:
     return None
 
 
+def _has_read_tool_interface(tool: object) -> bool:
+    """Return True if *tool* exposes the kwargs expected by UpdateTool/WriteTool.
+
+    Checks that ``has_been_read`` and ``validate_content`` each accept a
+    ``caller`` kwarg and that ``record_hash`` accepts a ``writer`` kwarg,
+    so a third-party tool named ``"read"`` with an incompatible signature
+    is rejected before it can cause a ``TypeError`` during live tool
+    execution.
+
+    Also verifies each method accepts the required number of positional
+    arguments (or declares ``*args``), so a signature like
+    ``validate_content(file_path, **kwargs)`` — which is missing the
+    ``content`` positional — is correctly rejected.
+    """
+    # (method_name, kwarg_name, min_positional_args)
+    required: list[tuple[str, str, int]] = [
+        ("has_been_read", "caller", 1),
+        ("validate_content", "caller", 2),
+        ("record_hash", "writer", 2),
+    ]
+    for method_name, kwarg, min_positional in required:
+        method = getattr(tool, method_name, None)
+        if not callable(method):
+            return False
+        try:
+            sig = inspect.signature(method)
+        except (ValueError, TypeError):
+            return False
+        params = sig.parameters.values()
+        has_kwarg = (
+            kwarg in sig.parameters
+            and sig.parameters[kwarg].kind != inspect.Parameter.POSITIONAL_ONLY
+        )
+        has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        if not has_kwarg and not has_var_keyword:
+            return False
+        has_var_positional = any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+        )
+        if not has_var_positional:
+            positional_count = sum(
+                1
+                for p in params
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.POSITIONAL_ONLY,
+                )
+            )
+            if positional_count < min_positional:
+                return False
+    return True
+
+
 class ToolRegistry:
     """
     Discovers, loads, and dispatches tool calls.
@@ -732,6 +786,49 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         """Return the named tool, or ``None`` if not registered."""
         return self._tools.get(name)
+
+    def wire_read_tools(self) -> None:
+        """Inject the ``read`` tool into ``update`` and ``write`` so that
+        read-before-edit/overwrite enforcement works in every registry
+        instance (REPL and sub-agents alike).
+
+        Safe to call when any of the three tools are absent — each wiring
+        is a no-op if the target tool is not registered.
+
+        The ``read`` tool is only wired when it implements the expected
+        interface: ``has_been_read(caller=)``, ``validate_content(caller=)``,
+        and ``record_hash(writer=)`` must all be present and callable.  A
+        third-party tool named ``"read"`` that lacks any of these is passed
+        as ``None`` so that ``update``/``write`` silently skip enforcement
+        rather than raising ``AttributeError`` or ``TypeError`` at runtime.
+        """
+        read_tool = self._tools.get("read")
+        incompatible = False
+        if read_tool is not None and not _has_read_tool_interface(read_tool):
+            logger.warning(
+                "wire_read_tools: registered 'read' tool (%s) does not implement "
+                "the required interface (has_been_read/validate_content/record_hash "
+                "with caller=/writer= kwargs); read-before-edit enforcement disabled",
+                type(read_tool).__name__,
+            )
+            read_tool = None
+            incompatible = True
+        dependent_tools = [
+            name for name in ("update", "write") if self._tools.get(name) is not None
+        ]
+        if read_tool is None and not incompatible and dependent_tools:
+            logger.warning(
+                "wire_read_tools: 'read' tool not registered; "
+                "read-before-edit enforcement disabled for: %s",
+                ", ".join(dependent_tools),
+            )
+        for name in ("update", "write"):
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            setter = getattr(tool, "set_read_tool", None)
+            if callable(setter):
+                setter(read_tool)
 
     def is_allowed(self, name: str) -> bool:
         """Return whether *name* is registered and currently allowed.

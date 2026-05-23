@@ -527,6 +527,7 @@ def _cmd_repl(
     for warning in alias_warnings:
         print(f"Warning: {warning}", file=sys.stderr)
     _wire_skills(skills, tool_registry, workspace, permission_manager)
+    tool_registry.wire_read_tools()
 
     def _build_active_system_prompt(current_skills: SkillRegistry) -> str:
         base_prompt = load_system_prompt(root, global_dir)

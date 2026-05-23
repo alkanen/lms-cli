@@ -1398,3 +1398,249 @@ class TestToolNamePattern:
         from ai_cli.core.tool_registry import TOOL_NAME_RE
 
         assert TOOL_NAME_RE.match("") is None
+
+
+# ---------------------------------------------------------------------------
+# wire_read_tools / _has_read_tool_interface
+# ---------------------------------------------------------------------------
+
+
+class _FakeReadTool:
+    """Minimal object satisfying the ReadTool interface."""
+
+    def has_been_read(self, file_path: str, *, caller: str | None = None) -> bool:
+        return False
+
+    def validate_content(
+        self, file_path: str, content: str, *, caller: str | None = None
+    ) -> bool:
+        return False
+
+    def record_hash(
+        self, file_path: str, content: str, *, writer: str | None = None
+    ) -> None:
+        pass
+
+
+class _KwargsReadTool:
+    """ReadTool whose methods forward via **kwargs — must still be accepted."""
+
+    def has_been_read(self, file_path: str, **kwargs: Any) -> bool:
+        return False
+
+    def validate_content(self, file_path: str, content: str, **kwargs: Any) -> bool:
+        return False
+
+    def record_hash(self, file_path: str, content: str, **kwargs: Any) -> None:
+        pass
+
+
+class _BadReadTool:
+    """Named 'read' but missing required kwargs — must be rejected."""
+
+    def has_been_read(self, file_path: str) -> bool:
+        return False
+
+    def validate_content(self, file_path: str, content: str) -> bool:
+        return False
+
+    def record_hash(self, file_path: str, content: str) -> None:
+        pass
+
+
+class _UpdateStub(Tool):
+    NAME = "update"
+    DESCRIPTION = "stub"
+    PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = False
+    _wired: object = None
+
+    def set_read_tool(self, rt: object) -> None:
+        self.__class__._wired = rt
+
+    def definition(self) -> ToolSchema:
+        return ToolSchema(name=self.name, description=self.description)
+
+    def execute(self, **kwargs: Any) -> dict:
+        return self._ok()
+
+
+class _WriteStub(Tool):
+    NAME = "write"
+    DESCRIPTION = "stub"
+    PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = False
+    _wired: object = None
+
+    def set_read_tool(self, rt: object) -> None:
+        self.__class__._wired = rt
+
+    def definition(self) -> ToolSchema:
+        return ToolSchema(name=self.name, description=self.description)
+
+    def execute(self, **kwargs: Any) -> dict:
+        return self._ok()
+
+
+class _ReadStub(Tool):
+    NAME = "read"
+    DESCRIPTION = "stub"
+    PERMISSION_REQUIRED = False
+    DISABLED_BY_DEFAULT = False
+
+    def definition(self) -> ToolSchema:
+        return ToolSchema(name=self.name, description=self.description)
+
+    def execute(self, **kwargs: Any) -> dict:
+        return self._ok()
+
+    def has_been_read(self, file_path: str, *, caller: str | None = None) -> bool:
+        return False
+
+    def validate_content(
+        self, file_path: str, content: str, *, caller: str | None = None
+    ) -> bool:
+        return False
+
+    def record_hash(
+        self, file_path: str, content: str, *, writer: str | None = None
+    ) -> None:
+        pass
+
+
+class TestHasReadToolInterface:
+    def test_compatible_tool_accepted(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        assert _has_read_tool_interface(_FakeReadTool()) is True
+
+    def test_kwargs_forwarding_accepted(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        assert _has_read_tool_interface(_KwargsReadTool()) is True
+
+    def test_missing_kwargs_rejected(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        assert _has_read_tool_interface(_BadReadTool()) is False
+
+    def test_missing_method_rejected(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        class _NoValidate:
+            def has_been_read(self, f: str, *, caller: str | None = None) -> bool:
+                return False
+
+            def record_hash(self, f: str, c: str, *, writer: str | None = None) -> None:
+                pass
+
+        assert _has_read_tool_interface(_NoValidate()) is False
+
+    def test_non_callable_rejected(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        class _AttrNotCallable:
+            has_been_read = "not callable"
+            validate_content = "not callable"
+            record_hash = "not callable"
+
+        assert _has_read_tool_interface(_AttrNotCallable()) is False
+
+    def test_positional_only_kwarg_rejected(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        class _PositionalOnly:
+            # caller and writer are positional-only (/)
+            def has_been_read(self, file_path: str, caller: str | None = None, /):
+                return False
+
+            def validate_content(
+                self, file_path: str, content: str, caller: str | None = None, /
+            ):
+                return False
+
+            def record_hash(
+                self, file_path: str, content: str, writer: str | None = None, /
+            ):
+                pass
+
+        assert _has_read_tool_interface(_PositionalOnly()) is False
+
+    def test_too_few_positional_args_rejected(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        class _TooFewPositional:
+            # validate_content and record_hash need 2 positional args but only have 1
+            def has_been_read(self, file_path: str, *, caller: str | None = None):
+                return False
+
+            def validate_content(self, file_path: str, **kwargs):  # missing content
+                return False
+
+            def record_hash(self, file_path: str, **kwargs):  # missing content
+                pass
+
+        assert _has_read_tool_interface(_TooFewPositional()) is False
+
+    def test_var_positional_accepted(self):
+        from ai_cli.core.tool_registry import _has_read_tool_interface
+
+        class _VarPositional:
+            # *args covers positional requirements; **kwargs covers keyword
+            def has_been_read(self, *args, **kwargs):
+                return False
+
+            def validate_content(self, *args, **kwargs):
+                return False
+
+            def record_hash(self, *args, **kwargs):
+                pass
+
+        assert _has_read_tool_interface(_VarPositional()) is True
+
+
+class TestWireReadTools:
+    def test_wires_read_into_update_and_write(self, tmp_path):
+        _UpdateStub._wired = "sentinel"
+        _WriteStub._wired = "sentinel"
+        reg = make_registry(tmp_path, [_ReadStub, _UpdateStub, _WriteStub])
+        reg.wire_read_tools()
+        assert isinstance(_UpdateStub._wired, _ReadStub)
+        assert isinstance(_WriteStub._wired, _ReadStub)
+
+    def test_noop_when_read_absent(self, tmp_path):
+        _UpdateStub._wired = "sentinel"
+        reg = make_registry(tmp_path, [_UpdateStub])
+        reg.wire_read_tools()
+        assert _UpdateStub._wired is None
+
+    def test_noop_when_update_and_write_absent(self, tmp_path):
+        reg = make_registry(tmp_path, [_ReadStub])
+        reg.wire_read_tools()  # must not raise
+
+    def test_incompatible_read_tool_wires_none(self, tmp_path, caplog):
+        import logging
+
+        _UpdateStub._wired = "sentinel"
+        _WriteStub._wired = "sentinel"
+
+        class _BadRead(_BadReadTool, Tool):
+            NAME = "read"
+            DESCRIPTION = "bad"
+            PERMISSION_REQUIRED = False
+            DISABLED_BY_DEFAULT = False
+
+            def definition(self) -> ToolSchema:
+                return ToolSchema(name=self.name, description=self.description)
+
+            def execute(self, **kwargs: Any) -> dict:
+                return self._ok()
+
+        reg = make_registry(tmp_path, [_BadRead, _UpdateStub, _WriteStub])
+        with caplog.at_level(logging.WARNING, logger="ai_cli.core.tool_registry"):
+            reg.wire_read_tools()
+        assert _UpdateStub._wired is None
+        assert _WriteStub._wired is None
+        assert "wire_read_tools" in caplog.text
+        # incompatible tool must not also trigger the "not registered" warning
+        assert "not registered" not in caplog.text
