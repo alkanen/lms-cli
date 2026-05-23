@@ -968,6 +968,8 @@ def build_agent_tool_registry(
                 name,
             )
 
+    registry.wire_read_tools()
+
     logger.info(
         "Agent '%s': scoped tool registry ready with %d registered tools and %d permission overrides",
         spec.name,
