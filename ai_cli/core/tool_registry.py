@@ -81,7 +81,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
+from ai_cli.core.workspace import get_global_dir
 from ai_cli.tools.base import Tool, ToolArgument, ToolSchema
 
 if TYPE_CHECKING:
@@ -426,7 +426,7 @@ class ToolRegistry:
         if global_tools.is_dir():
             self._load_from_directory(global_tools, tier="global")
 
-        project_tools = self._workspace.root / _DOT_AI_CLI / "tools"
+        project_tools = self._workspace.ai_cli_dir / "tools"
         if project_tools.is_dir():
             self._load_from_directory(project_tools, tier="project")
 
@@ -1188,8 +1188,8 @@ class ToolRegistry:
     # ------------------------------------------------------------------
 
     def _persist_tool_setting(self, name: str, key: str, value: object) -> None:
-        """Write a single tool setting to project .ai-cli/config.yaml."""
-        config_path = self._workspace.root / _DOT_AI_CLI / "config.yaml"
+        """Write a single tool setting to the project's config.yaml."""
+        config_path = self._workspace.ai_cli_dir / "config.yaml"
         try:
             if config_path.is_file():
                 text = config_path.read_text(encoding="utf-8")

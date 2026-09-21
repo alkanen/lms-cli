@@ -452,9 +452,21 @@ class Workspace:
         ``object`` until ``ai_cli.core.config_manager`` is implemented.
     """
 
-    def __init__(self, root: Path, config_manager: object) -> None:
+    def __init__(
+        self,
+        root: Path,
+        config_manager: object,
+        ai_cli_dir: Path | None = None,
+    ) -> None:
         self._root = root.resolve()
         self._config = config_manager
+        # Where this project's settings live.  Normally `<root>/.ai-cli/`, but
+        # an explicit directory (--ai-cli-dir) decouples "where the files are"
+        # from "where the settings are", so a config bundle can be shared by
+        # several workspaces or shipped with an embedding application.
+        self._ai_cli_dir = (
+            ai_cli_dir.resolve() if ai_cli_dir is not None else self._root / _DOT_AI_CLI
+        )
 
         # Build a single IgnoreFilter from three sources, evaluated in order
         # so that later sources override earlier ones ("last match wins"):
@@ -466,7 +478,7 @@ class Workspace:
         combined = (
             IgnoreFilter.read_patterns(get_global_dir() / ".ignore")
             + IgnoreFilter.read_patterns(self._root / ".gitignore")
-            + IgnoreFilter.read_patterns(self._root / _DOT_AI_CLI / ".ignore")
+            + IgnoreFilter.read_patterns(self._ai_cli_dir / ".ignore")
         )
         self._ignore_filter = IgnoreFilter(self._root, combined)
 
@@ -485,8 +497,12 @@ class Workspace:
 
     @property
     def ai_cli_dir(self) -> Path:
-        """Absolute path to the project-level `.ai-cli/` directory."""
-        return self._root / _DOT_AI_CLI
+        """Absolute path to this project's config directory.
+
+        ``<root>/.ai-cli/`` unless an explicit directory was supplied, in which
+        case that directory is used verbatim and need not be named ``.ai-cli``.
+        """
+        return self._ai_cli_dir
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -528,15 +544,23 @@ class Workspace:
             candidate = parent
 
     @staticmethod
-    def initialise(path: Path) -> None:
+    def initialise(path: Path, ai_cli_dir: Path | None = None) -> None:
         """
         Create a `.ai-cli/` scaffold under *path*.
 
-        If `.ai-cli/` already exists the caller is responsible for asking
+        With *ai_cli_dir*, the scaffold is written to that directory instead,
+        verbatim — so a standalone config bundle can be created anywhere, under
+        any name.
+
+        If the target already exists the caller is responsible for asking
         the user whether to proceed; this method does not overwrite existing
         files and does not delete unrecognised content.
         """
-        dot = path.resolve() / _DOT_AI_CLI
+        dot = (
+            ai_cli_dir.resolve()
+            if ai_cli_dir is not None
+            else path.resolve() / _DOT_AI_CLI
+        )
         Workspace._write_scaffold(dot)
 
     @staticmethod

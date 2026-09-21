@@ -666,6 +666,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
         read_file_tool = MagicMock()
@@ -696,6 +697,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         session = MagicMock()
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
@@ -731,6 +733,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         session = MagicMock()
         session.get_messages.return_value = [
             {"role": "system", "content": "live prompt"}
@@ -781,6 +784,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
         read_file_tool = MagicMock()
@@ -811,6 +815,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
         read_file_tool = MagicMock()
@@ -852,6 +857,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
         read_file_tool = MagicMock()
@@ -897,6 +903,7 @@ class TestREPLSlashCommands:
         display = MagicMock()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         tool_registry = MagicMock()
         tool_registry.permission_manager = MagicMock()
         read_file_tool = MagicMock()
@@ -1518,6 +1525,7 @@ class TestREPLAtReferences:
     def _make_workspace(self, is_ignored: bool = False, root=None):
         ws = MagicMock()
         ws.root = root if root is not None else self._root
+        ws.ai_cli_dir = ws.root / ".ai-cli"
         ws.is_ignored.return_value = is_ignored
         return ws
 
@@ -1608,6 +1616,7 @@ class TestREPLAtReferencesImages:
             img_bytes = self._valid_png()
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         for name in [
             "diagram.png",
@@ -1692,6 +1701,7 @@ class TestREPLAtReferencesImages:
         # No file written — read_bytes() raises FileNotFoundError (subclass of OSError)
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         display = MagicMock()
         repl = _make_repl(workspace=workspace, display=display)
@@ -1704,6 +1714,7 @@ class TestREPLAtReferencesImages:
         (self._root / "shot.png").write_bytes(self._valid_png())
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         repl = _make_repl(workspace=workspace)
         result = repl._preprocess_at_references("code @src.py image @shot.png")
@@ -1718,6 +1729,7 @@ class TestREPLAtReferencesImages:
         (self._root / "b.png").write_bytes(png)
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         repl = _make_repl(workspace=workspace)
         result = repl._preprocess_at_references("before @a.png middle @b.png after")
@@ -1743,6 +1755,7 @@ class TestREPLAtReferencesImages:
 
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         display = MagicMock()
 
@@ -1776,6 +1789,7 @@ class TestREPLAtReferencesImages:
 
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
 
         repl = _make_repl(workspace=workspace)
@@ -1788,6 +1802,7 @@ class TestREPLAtReferencesImages:
         (self._root / "corrupt.png").write_bytes(b"not an image")
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         display = MagicMock()
         repl = _make_repl(workspace=workspace, display=display)
@@ -1807,6 +1822,7 @@ class TestREPLAtReferencesImages:
 
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
 
         config = MagicMock()
@@ -1839,6 +1855,7 @@ class TestREPLAtReferencesImages:
 
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
 
         config = MagicMock()
@@ -1896,6 +1913,7 @@ class TestREPLAtReferencesImages:
         # No file written — image read will fail.
         workspace = MagicMock()
         workspace.root = self._root
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         workspace.is_ignored.return_value = False
         session = MagicMock()
         display = MagicMock()
@@ -2382,6 +2400,7 @@ class TestRoundsCommand:
     def test_rounds_session_no_persist(self, tmp_path):
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         repl = _make_repl(workspace=workspace)
         repl._handle_input("/rounds --session 3")
         config_path = tmp_path / ".ai-cli" / "config.yaml"
@@ -2394,6 +2413,7 @@ class TestRoundsCommand:
         dot.mkdir()
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         repl = _make_repl(workspace=workspace)
         repl._handle_input("/rounds 7")
         config_path = dot / "config.yaml"
@@ -2481,6 +2501,7 @@ class TestRoundsCommand:
         # Simulate a write failure deterministically by patching write_text.
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         display = MagicMock()
         repl = _make_repl(workspace=workspace, display=display)
         with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):

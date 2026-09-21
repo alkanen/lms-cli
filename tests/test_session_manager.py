@@ -61,6 +61,7 @@ def _make_session(tmp_path: Path, llm: MagicMock | None = None) -> Session:
 def _make_workspace(root: Path) -> MagicMock:
     ws = MagicMock()
     ws.root = root
+    ws.ai_cli_dir = ws.root / ".ai-cli"
     return ws
 
 

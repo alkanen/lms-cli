@@ -42,7 +42,7 @@ from ai_cli.cli.completer import (
 from ai_cli.core.agent import Agent, AgentSpec
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.skill_registry import SkillRegistry
-from ai_cli.core.workspace import _DOT_AI_CLI, get_global_dir
+from ai_cli.core.workspace import get_global_dir
 
 try:
     import termios
@@ -2295,12 +2295,12 @@ class REPL:
     # ------------------------------------------------------------------
 
     def _persist_setting(self, key: str, value: object) -> bool:
-        """Write a top-level key to the project .ai-cli/config.yaml.
+        """Write a top-level key to the project's config.yaml.
 
         Returns ``True`` on success, ``False`` if the write failed (the error
         is logged as a warning in that case).
         """
-        config_path = self._workspace.root / _DOT_AI_CLI / "config.yaml"
+        config_path = self._workspace.ai_cli_dir / "config.yaml"
         try:
             if config_path.is_file():
                 data: dict = (

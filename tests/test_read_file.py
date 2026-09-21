@@ -35,6 +35,7 @@ def make_tool(
 ) -> ReadFileTool:
     workspace = MagicMock()
     workspace.root = tmp_path
+    workspace.ai_cli_dir = workspace.root / ".ai-cli"
     workspace.resolve.side_effect = lambda p: (tmp_path / p.lstrip("./")).resolve()
     pm = MagicMock()
     pm.request.return_value = (True, "")

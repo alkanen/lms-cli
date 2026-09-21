@@ -81,6 +81,7 @@ def _completions(completer: REPLCompleter, text: str) -> list[str]:
 def _make_workspace(root: Path, is_ignored: bool = False) -> MagicMock:
     ws = MagicMock()
     ws.root = root
+    ws.ai_cli_dir = ws.root / ".ai-cli"
     ws.is_ignored.return_value = is_ignored
     return ws
 

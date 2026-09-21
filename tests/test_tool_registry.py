@@ -79,6 +79,7 @@ def make_registry(
     """
     workspace = MagicMock()
     workspace.root = tmp_path
+    workspace.ai_cli_dir = workspace.root / ".ai-cli"
     (tmp_path / ".ai-cli").mkdir(exist_ok=True)
 
     config = MagicMock()
@@ -752,6 +753,7 @@ class TestExecute:
 
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         (tmp_path / ".ai-cli").mkdir(exist_ok=True)
         config = MagicMock()
         config.get.return_value = {}
@@ -768,6 +770,7 @@ class TestExecute:
     def test_permission_denied_returns_error(self, tmp_path):
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         (tmp_path / ".ai-cli").mkdir(exist_ok=True)
         config = MagicMock()
         config.get.return_value = {}
@@ -797,6 +800,7 @@ class TestExecute:
 
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         (tmp_path / ".ai-cli").mkdir(exist_ok=True)
         config = MagicMock()
         config.get.return_value = {}
@@ -822,6 +826,7 @@ class TestExecute:
 
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         (tmp_path / ".ai-cli").mkdir(exist_ok=True)
         config = MagicMock()
         config.get.return_value = {}
@@ -1277,6 +1282,7 @@ class TestRegisterViaInstance:
         """Return a ToolRegistry with no tools pre-registered."""
         workspace = MagicMock()
         workspace.root = tmp_path
+        workspace.ai_cli_dir = workspace.root / ".ai-cli"
         (tmp_path / ".ai-cli").mkdir(exist_ok=True)
         config = MagicMock()
         config.get.return_value = {}
