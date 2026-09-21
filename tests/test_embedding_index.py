@@ -52,6 +52,7 @@ def _make_provider(dimension: int = 4) -> MagicMock:
 def _make_workspace(root: Path) -> MagicMock:
     ws = MagicMock()
     ws.root = root
+    ws.ai_cli_dir = ws.root / ".ai-cli"
     ws.is_ignored.return_value = False
     return ws
 

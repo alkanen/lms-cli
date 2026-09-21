@@ -104,16 +104,22 @@ class SkillRegistry:
         project_root: Path | None,
         *,
         global_dir: Path | None = None,
+        config_dir: Path | None = None,
     ) -> SkillRegistry:
         """Load skills from global + project scopes.
 
         Load order is global then project so project collisions override global.
+        *config_dir*, when given, replaces ``<project_root>/.ai-cli/`` as the
+        directory holding the project's ``skills/``.
         """
         resolved_global = global_dir if global_dir is not None else get_global_dir()
         global_skills_dir = resolved_global / "skills"
-        project_skills_dir = (
-            project_root / _DOT_AI_CLI / "skills" if project_root is not None else None
-        )
+        if config_dir is not None:
+            project_skills_dir: Path | None = config_dir / "skills"
+        elif project_root is not None:
+            project_skills_dir = project_root / _DOT_AI_CLI / "skills"
+        else:
+            project_skills_dir = None
 
         loader = _SkillLoader()
         loader.load_scope("global", global_skills_dir)

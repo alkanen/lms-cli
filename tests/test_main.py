@@ -1,5 +1,6 @@
 """Tests for ai_cli.__main__ entry point."""
 
+import io
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from ai_cli.__main__ import (
 from ai_cli.__main__ import _cmd_repl as _real_cmd_repl
 from ai_cli.core.agent import AgentSpec
 from ai_cli.core.agent_registry import AgentRegistry
+from ai_cli.core.llm_client import LLMError
 from ai_cli.core.session_manager import SessionError
 from ai_cli.core.skill_registry import SkillRegistry, SkillSpec
 from ai_cli.core.workspace import _DOT_AI_CLI, _INIT_TEMPLATES
@@ -1172,3 +1174,629 @@ class TestTaskManagerWiring:
 
         # Structural assertion: the file lives directly under .ai-cli/.
         assert (root / _DOT_AI_CLI / "tasks.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# --ask
+# ---------------------------------------------------------------------------
+
+
+def _fake_client(chunks: list[dict], sent: list | None = None) -> MagicMock:
+    """Return an LLMClient stub whose send() yields *chunks*."""
+    client = MagicMock()
+
+    def send(messages, tools, *args, **kwargs):
+        if sent is not None:
+            sent.append((messages, tools))
+        yield from chunks
+        yield {"type": "done", "stop_reason": "stop", "usage": {}}
+
+    client.send.side_effect = send
+    return client
+
+
+class TestAsk:
+    def test_prints_answer_and_drops_reasoning(self, monkeypatch, capsys):
+        chunks = [
+            {"type": "reasoning", "delta": "pondering hard"},
+            {"type": "text", "delta": "Hello, "},
+            {"type": "text", "delta": "world!"},
+        ]
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: _fake_client(chunks)
+        )
+        run_main(["--ask", "hi"])
+        assert capsys.readouterr().out == "Hello, world!\n"
+
+    def test_strips_think_tags_from_text_stream(self, monkeypatch, capsys):
+        # extract_think_tags off in config: tags arrive inside "text" chunks.
+        chunks = [
+            {"type": "text", "delta": "<think>hmm, let me "},
+            {"type": "text", "delta": "consider</think>\n\n  The answer.  \n\n"},
+        ]
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: _fake_client(chunks)
+        )
+        run_main(["--ask", "hi"])
+        assert capsys.readouterr().out == "The answer.\n"
+
+    def test_sends_single_user_message_and_no_tools(self, monkeypatch, capsys):
+        sent: list = []
+        chunks = [{"type": "text", "delta": "ok"}]
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client(chunks, sent),
+        )
+        run_main(["--ask", "  what is 2+2?  ", "--no-system-prompt"])
+        capsys.readouterr()
+        assert len(sent) == 1
+        messages, tools = sent[0]
+        assert messages == [{"role": "user", "content": "what is 2+2?"}]
+        assert tools == []
+
+    def test_reads_prompt_from_stdin_when_no_argument(self, monkeypatch, capsys):
+        sent: list = []
+        chunks = [{"type": "text", "delta": "ok"}]
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client(chunks, sent),
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO("from stdin\n"))
+        run_main(["--ask", "--no-system-prompt"])
+        assert capsys.readouterr().out == "ok\n"
+        assert sent[0][0] == [{"role": "user", "content": "from stdin"}]
+
+    def test_empty_prompt_exits_with_error(self, monkeypatch, capsys):
+        called: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: called.append(1)
+        )
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "   "])
+        assert exc.value.code == 1
+        assert "empty prompt" in capsys.readouterr().err
+        assert not called
+
+    def test_empty_response_exits_with_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: _fake_client([])
+        )
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "hi"])
+        assert exc.value.code == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "empty response" in err
+
+    def test_llm_error_exits_with_error(self, monkeypatch, capsys):
+        from ai_cli.core.llm_client import LLMError
+
+        client = MagicMock()
+
+        def send(messages, tools, *args, **kwargs):
+            yield {"type": "text", "delta": "partial"}
+            raise LLMError("backend exploded")
+
+        client.send.side_effect = send
+        monkeypatch.setattr("ai_cli.__main__.create_llm_client", lambda _cfg: client)
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "hi"])
+        assert exc.value.code == 1
+        out, err = capsys.readouterr()
+        assert out == "partial\n"
+        assert "backend exploded" in err
+
+
+class TestAskConfigBundle:
+    """--ask against a self-contained config bundle: --ai-cli-dir/--env/--system-prompt."""
+
+    @staticmethod
+    def _bundle(tmp_path, *, name=".ai-cli", system_prompt=None, model="bundle-model"):
+        """Create a config directory and return its path."""
+        bundle = tmp_path / name
+        bundle.mkdir(parents=True)
+        (bundle / "config.yaml").write_text(
+            f"backend: openai\nmodel: {model}\n"
+            "context_window: 4096\nmax_response_tokens: 256\n",
+            encoding="utf-8",
+        )
+        if system_prompt is not None:
+            (bundle / "system_prompt.md").write_text(system_prompt, encoding="utf-8")
+        return bundle
+
+    def test_ai_cli_dir_supplies_config_and_system_prompt(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        # Deliberately not named .ai-cli: the directory is used verbatim.
+        bundle = self._bundle(
+            tmp_path, name="llm-config", system_prompt="You are a bundled assistant."
+        )
+        sent: list = []
+        seen_models: list = []
+
+        def make_client(cfg):
+            seen_models.append(cfg.get_model_config()["model"])
+            return _fake_client([{"type": "text", "delta": "ok"}], sent)
+
+        monkeypatch.setattr("ai_cli.__main__.create_llm_client", make_client)
+        run_main(["--ask", "hi", "--ai-cli-dir", str(bundle)])
+
+        assert capsys.readouterr().out == "ok\n"
+        assert seen_models == ["bundle-model"]
+        assert sent[0][0] == [
+            {"role": "system", "content": "You are a bundled assistant."},
+            {"role": "user", "content": "hi"},
+        ]
+
+    def test_ai_cli_dir_does_not_search_parent_directories(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        # A bundle one level up must NOT be picked up for the empty dir below it.
+        self._bundle(tmp_path, system_prompt="Parent prompt.")
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        sent: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}], sent),
+        )
+        run_main(["--ask", "hi", "--ai-cli-dir", str(empty)])
+        capsys.readouterr()
+        assert sent[0][0] == [{"role": "user", "content": "hi"}]
+
+    def test_ai_cli_dir_missing_exits_with_error(self, monkeypatch, capsys, tmp_path):
+        called: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: called.append(1)
+        )
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "hi", "--ai-cli-dir", str(tmp_path / "nope")])
+        assert exc.value.code == 1
+        assert "not a directory" in capsys.readouterr().err
+        assert not called
+
+    def test_system_prompt_file_overrides_bundle_prompt(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        bundle = self._bundle(tmp_path, system_prompt="Bundle prompt.")
+        persona = tmp_path / "persona.md"
+        persona.write_text("  Explicit persona.  \n", encoding="utf-8")
+        sent: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}], sent),
+        )
+        run_main(
+            [
+                "--ask",
+                "hi",
+                "--ai-cli-dir",
+                str(bundle),
+                "--system-prompt",
+                str(persona),
+            ]
+        )
+        capsys.readouterr()
+        assert sent[0][0][0] == {"role": "system", "content": "Explicit persona."}
+
+    def test_no_system_prompt_suppresses_bundle_prompt(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        bundle = self._bundle(tmp_path, system_prompt="Bundle prompt.")
+        sent: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}], sent),
+        )
+        run_main(["--ask", "hi", "--ai-cli-dir", str(bundle), "--no-system-prompt"])
+        capsys.readouterr()
+        assert sent[0][0] == [{"role": "user", "content": "hi"}]
+
+    def test_missing_system_prompt_file_exits_with_error(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        bundle = self._bundle(tmp_path)
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}]),
+        )
+        with pytest.raises(SystemExit) as exc:
+            run_main(
+                [
+                    "--ask",
+                    "hi",
+                    "--ai-cli-dir",
+                    str(bundle),
+                    "--system-prompt",
+                    str(tmp_path / "missing.md"),
+                ]
+            )
+        assert exc.value.code == 1
+        assert "cannot read system prompt file" in capsys.readouterr().err
+
+    def test_system_prompt_and_no_system_prompt_are_mutually_exclusive(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "hi", "--system-prompt", "x.md", "--no-system-prompt"])
+        assert exc.value.code == 2  # argparse usage error
+        assert "not allowed with" in capsys.readouterr().err
+
+    def test_env_file_is_loaded_and_overrides_environment(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        bundle = self._bundle(tmp_path)
+        (bundle / "config.yaml").write_text(
+            "backend: openai\nmodel: m\ncontext_window: 4096\n"
+            "max_response_tokens: 256\napi_key_env: BUNDLE_KEY\n",
+            encoding="utf-8",
+        )
+        env_file = tmp_path / "bundle.env"
+        env_file.write_text("BUNDLE_KEY=from-env-file\n", encoding="utf-8")
+        monkeypatch.setenv("BUNDLE_KEY", "from-ambient-environment")
+
+        seen_keys: list = []
+
+        def make_client(cfg):
+            seen_keys.append(cfg.get_model_config()["api_key"])
+            return _fake_client([{"type": "text", "delta": "ok"}])
+
+        monkeypatch.setattr("ai_cli.__main__.create_llm_client", make_client)
+        run_main(["--ask", "hi", "--ai-cli-dir", str(bundle), "--env", str(env_file)])
+        assert capsys.readouterr().out == "ok\n"
+        assert seen_keys == ["from-env-file"]
+
+    def test_missing_env_file_exits_with_error(self, monkeypatch, capsys, tmp_path):
+        called: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: called.append(1)
+        )
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ask", "hi", "--env", str(tmp_path / "missing.env")])
+        assert exc.value.code == 1
+        assert "env file not found" in capsys.readouterr().err
+        assert not called
+
+    def test_missing_ai_cli_dir_is_rejected_outside_ask_too(self, capsys, tmp_path):
+        with pytest.raises(SystemExit) as exc:
+            run_main(["--ai-cli-dir", str(tmp_path / "nope")])
+        assert exc.value.code == 1
+        assert "not a directory" in capsys.readouterr().err
+
+    def test_ask_does_not_prompt_to_create_missing_global_dir(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """A one-shot --ask must never block on stdin for the global dir."""
+        missing_global = tmp_path / "no-such-global"
+        monkeypatch.setattr("ai_cli.__main__.get_global_dir", lambda: missing_global)
+        monkeypatch.setattr(
+            "ai_cli.core.workspace.get_global_dir", lambda: missing_global
+        )
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("--ask must not prompt for the global directory")
+
+        monkeypatch.setattr("builtins.input", boom)
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}]),
+        )
+        bundle = self._bundle(tmp_path)
+        run_main(["--ask", "hi", "--ai-cli-dir", str(bundle)])
+        assert capsys.readouterr().out == "ok\n"
+        assert not missing_global.exists()
+
+
+class TestAskSpinner:
+    """The --ask spinner must never touch stdout, and must clear before output."""
+
+    class _Recorder:
+        """A stream double that appends every write to a shared event list."""
+
+        def __init__(self, events: list, label: str) -> None:
+            self._events = events
+            self._label = label
+
+        def write(self, text: str) -> int:
+            self._events.append((self._label, text))
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+    @staticmethod
+    def _fake_spinner_class(events: list):
+        class FakeSpinner:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                events.append(("spinner", "start"))
+
+            def stop(self) -> None:
+                events.append(("spinner", "stop"))
+
+        return FakeSpinner
+
+    def test_stops_before_the_first_stdout_write(self, monkeypatch):
+        events: list = []
+        monkeypatch.setattr("ai_cli.__main__.Spinner", self._fake_spinner_class(events))
+        monkeypatch.setattr("sys.stdout", self._Recorder(events, "stdout"))
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client(
+                [
+                    {"type": "reasoning", "delta": "thinking a while"},
+                    {"type": "text", "delta": "Answer."},
+                ]
+            ),
+        )
+        run_main(["--ask", "hi", "--no-system-prompt"])
+
+        assert events[0] == ("spinner", "start")
+        first_stdout = next(
+            i for i, (label, _) in enumerate(events) if label == "stdout"
+        )
+        assert ("spinner", "stop") in events[:first_stdout]
+
+    def test_stops_before_the_error_message(self, monkeypatch):
+        events: list = []
+        monkeypatch.setattr("ai_cli.__main__.Spinner", self._fake_spinner_class(events))
+        monkeypatch.setattr("sys.stderr", self._Recorder(events, "stderr"))
+        client = MagicMock()
+
+        def send(messages, tools, *args, **kwargs):
+            raise LLMError("backend exploded")
+            yield  # pragma: no cover — makes send() a generator
+
+        client.send.side_effect = send
+        monkeypatch.setattr("ai_cli.__main__.create_llm_client", lambda _cfg: client)
+
+        with pytest.raises(SystemExit):
+            run_main(["--ask", "hi", "--no-system-prompt"])
+
+        first_stderr = next(
+            i for i, (label, _) in enumerate(events) if label == "stderr"
+        )
+        assert ("spinner", "stop") in events[:first_stderr]
+
+    def test_stops_when_the_response_is_empty(self, monkeypatch, capsys):
+        events: list = []
+        monkeypatch.setattr("ai_cli.__main__.Spinner", self._fake_spinner_class(events))
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client", lambda _cfg: _fake_client([])
+        )
+        with pytest.raises(SystemExit):
+            run_main(["--ask", "hi", "--no-system-prompt"])
+        capsys.readouterr()
+        assert events.count(("spinner", "stop")) >= 1
+
+    def test_draws_nothing_when_stderr_is_not_a_tty(self, monkeypatch, capsys):
+        """The real Spinner, under capture: stdout clean and stderr silent."""
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "Answer."}]),
+        )
+        run_main(["--ask", "hi", "--no-system-prompt"])
+        out, err = capsys.readouterr()
+        assert out == "Answer.\n"
+        assert err == ""
+
+    def test_spinner_targets_stderr_not_stdout(self, monkeypatch):
+        """Constructed with no stream argument, so it defaults to sys.stderr."""
+        from ai_cli.utils import spinner as spinner_module
+
+        captured: list = []
+        real_init = spinner_module.Spinner.__init__
+
+        def spy_init(self, stream=None, *args, **kwargs):
+            captured.append(stream)
+            real_init(self, stream, *args, **kwargs)
+
+        monkeypatch.setattr(spinner_module.Spinner, "__init__", spy_init)
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda _cfg: _fake_client([{"type": "text", "delta": "ok"}]),
+        )
+        run_main(["--ask", "hi", "--no-system-prompt"])
+        # None means "default to sys.stderr" — and never sys.stdout.
+        assert captured == [None]
+
+
+class TestSettingsFlagsAcrossModes:
+    """--ai-cli-dir / --system-prompt are not ask-only: every mode honours them."""
+
+    @staticmethod
+    def _bundle(tmp_path, name="llm-config"):
+        bundle = tmp_path / name
+        bundle.mkdir(parents=True)
+        (bundle / "config.yaml").write_text(
+            "backend: openai\nmodel: bundle-model\n"
+            "context_window: 4096\nmax_response_tokens: 256\n",
+            encoding="utf-8",
+        )
+        return bundle
+
+    @staticmethod
+    def _capture_repl(monkeypatch):
+        """Replace _cmd_repl with a recorder (overrides the autouse stub)."""
+        calls: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__._cmd_repl",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        return calls
+
+    # -- forwarded to the REPL ------------------------------------------
+
+    def test_repl_receives_config_dir(self, monkeypatch, tmp_path):
+        bundle = self._bundle(tmp_path)
+        calls = self._capture_repl(monkeypatch)
+        run_main(["--ai-cli-dir", str(bundle)])
+        assert calls[0][1]["config_dir"] == bundle
+
+    def test_repl_receives_system_prompt_file(self, monkeypatch, tmp_path):
+        persona = tmp_path / "persona.md"
+        persona.write_text("Be terse.", encoding="utf-8")
+        calls = self._capture_repl(monkeypatch)
+        run_main(["--system-prompt", str(persona)])
+        assert calls[0][1]["system_prompt_file"] == persona
+        assert calls[0][1]["no_system_prompt"] is False
+
+    def test_repl_receives_no_system_prompt(self, monkeypatch):
+        calls = self._capture_repl(monkeypatch)
+        run_main(["--no-system-prompt"])
+        assert calls[0][1]["no_system_prompt"] is True
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["--continue"], ["--resume"], ["--resume", "abc123"]],
+    )
+    def test_resume_and_continue_receive_the_settings(
+        self, monkeypatch, tmp_path, argv
+    ):
+        bundle = self._bundle(tmp_path)
+        calls = self._capture_repl(monkeypatch)
+        run_main([*argv, "--ai-cli-dir", str(bundle)])
+        assert calls[0][1]["config_dir"] == bundle
+
+    # -- --init ----------------------------------------------------------
+
+    def test_init_scaffolds_into_the_given_directory(self, tmp_path):
+        target = tmp_path / "myapp" / "llm-config"
+        run_main(["--init", "--ai-cli-dir", str(target), "--workspace", str(tmp_path)])
+        assert target.is_dir()
+        for filename in _INIT_TEMPLATES:
+            assert (target / filename).is_file()
+        # The conventional location is NOT created when an explicit one is given.
+        assert not (tmp_path / _DOT_AI_CLI).exists()
+
+    # -- --summarize -----------------------------------------------------
+
+    def test_summarize_uses_the_bundle_config(self, monkeypatch, capsys, tmp_path):
+        bundle = self._bundle(tmp_path)
+        doc = tmp_path / "doc.md"
+        doc.write_text("some text to summarise", encoding="utf-8")
+
+        seen_models: list = []
+        monkeypatch.setattr(
+            "ai_cli.__main__.create_llm_client",
+            lambda cfg: seen_models.append(cfg.get_model_config()["model"]),
+        )
+        monkeypatch.setattr(
+            "ai_cli.core.embedding_index._summarize_document",
+            lambda *a, **k: "a summary",
+        )
+        run_main(["--summarize", str(doc), "--ai-cli-dir", str(bundle)])
+        assert seen_models == ["bundle-model"]
+        assert "a summary" in capsys.readouterr().out
+
+    # -- rejected only where genuinely meaningless -----------------------
+
+    @pytest.mark.parametrize(
+        "argv,mode",
+        [
+            (["--init", "--system-prompt", "p.md"], "--init"),
+            (["--init", "--no-system-prompt"], "--init"),
+            (["--summarize", "f.md", "--system-prompt", "p.md"], "--summarize"),
+            (["--summarize", "f.md", "--no-system-prompt"], "--summarize"),
+        ],
+    )
+    def test_system_prompt_flags_rejected_for_promptless_modes(
+        self, capsys, argv, mode
+    ):
+        with pytest.raises(SystemExit) as exc:
+            run_main(argv)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert f"cannot be used with {mode}" in err
+
+
+class TestCmdReplWithConfigDir:
+    """_cmd_repl end to end: project-scoped state follows an explicit config dir."""
+
+    def test_task_storage_follows_the_config_dir(
+        self, tmp_path, tmp_path_factory, monkeypatch
+    ):
+        # A workspace with NO .ai-cli/ anywhere, plus a separate config bundle.
+        root = tmp_path / "workspace"
+        root.mkdir()
+        bundle = tmp_path / "llm-config"
+        bundle.mkdir()
+        (bundle / "config.yaml").write_text(
+            "backend: openai\nmodel: m\ncontext_window: 4096\n"
+            "max_response_tokens: 256\n",
+            encoding="utf-8",
+        )
+        (bundle / "system_prompt.md").write_text("Bundled prompt.", encoding="utf-8")
+
+        captured_dirs: list = []
+        helper = TestTaskManagerWiring()
+        fake_session, _ = helper._patch_cmd_repl_dependencies(
+            monkeypatch, tmp_path_factory, captured_dirs=captured_dirs
+        )
+
+        _real_cmd_repl(root, tmp_path_factory.mktemp("global"), config_dir=bundle)
+
+        # Tasks live in the bundle, not in a conventional .ai-cli/ under root.
+        assert captured_dirs == [bundle]
+        assert not (root / _DOT_AI_CLI).exists()
+        # And the bundle's system_prompt.md was applied to the session.
+        fake_session.set_system_message.assert_called_once_with("Bundled prompt.")
+
+    def test_missing_project_scaffold_is_fine_with_a_config_dir(
+        self, tmp_path, tmp_path_factory, monkeypatch
+    ):
+        """Without --ai-cli-dir this exits 1; with it, no scaffold is needed."""
+        root = tmp_path / "workspace"
+        root.mkdir()
+        bundle = tmp_path / "llm-config"
+        bundle.mkdir()
+        (bundle / "config.yaml").write_text(
+            "backend: openai\nmodel: m\ncontext_window: 4096\n"
+            "max_response_tokens: 256\n",
+            encoding="utf-8",
+        )
+        captured_dirs: list = []
+        helper = TestTaskManagerWiring()
+        helper._patch_cmd_repl_dependencies(
+            monkeypatch, tmp_path_factory, captured_dirs=captured_dirs
+        )
+        # Must not raise SystemExit.
+        _real_cmd_repl(root, tmp_path_factory.mktemp("global"), config_dir=bundle)
+        assert captured_dirs == [bundle]
+
+
+class TestLoadSystemPromptConfigDir:
+    def test_config_dir_replaces_the_dot_ai_cli_candidate(self, tmp_path):
+        root = tmp_path / "ws"
+        (root / _DOT_AI_CLI).mkdir(parents=True)
+        (root / _DOT_AI_CLI / "system_prompt.md").write_text("conv", encoding="utf-8")
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        (bundle / "system_prompt.md").write_text("bundled", encoding="utf-8")
+        assert load_system_prompt(root, tmp_path / "global", bundle) == "bundled"
+
+    def test_agents_md_still_consulted_with_a_config_dir(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("agents", encoding="utf-8")
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()  # no system_prompt.md in the bundle
+        assert load_system_prompt(root, tmp_path / "global", bundle) == "agents"
+
+    def test_agents_md_skipped_without_a_workspace_root(self, tmp_path):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        (global_dir / "system_prompt.md").write_text("global", encoding="utf-8")
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        assert load_system_prompt(None, global_dir, bundle) == "global"
+
+    def test_falls_back_to_global_when_bundle_has_none(self, tmp_path):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        (global_dir / "system_prompt.md").write_text("global", encoding="utf-8")
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        root = tmp_path / "ws"
+        root.mkdir()
+        assert load_system_prompt(root, global_dir, bundle) == "global"

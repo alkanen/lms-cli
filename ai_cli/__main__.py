@@ -5,6 +5,13 @@ Run with:  python -m ai_cli [options]
 
 Currently implemented:
   --init [--workspace PATH]   Scaffold a .ai-cli/ project directory.
+  --ask [PROMPT]              One-shot: print the model's answer and exit.
+
+Settings can be pointed anywhere, in every mode:
+  --ai-cli-dir DIR            Use DIR as the project config directory.
+  --env FILE                  Load environment variables from FILE.
+  --system-prompt FILE        Use FILE as the system prompt.
+  --no-system-prompt          Send no system prompt.
   --resume [SESSION_ID]       Resume a session: pick from list, or load by ID.
   --continue                  Continue the most recent session (or start new).
   (no flags)                  Start the interactive REPL with a fresh session.
@@ -26,7 +33,12 @@ from ai_cli.cli.display import create_display
 from ai_cli.cli.repl import REPL, skill_aliases_for_registry
 from ai_cli.core.agent_registry import AgentRegistry, load_agent_specs
 from ai_cli.core.config_manager import ConfigError, ConfigManager
-from ai_cli.core.llm_client import LLMClient, LLMError, create_llm_client
+from ai_cli.core.llm_client import (
+    LLMClient,
+    LLMError,
+    _ThinkTagParser,
+    create_llm_client,
+)
 from ai_cli.core.mcp_manager import MCPManager
 from ai_cli.core.permission_manager import PermissionManager
 from ai_cli.core.session_manager import Session, SessionError, SessionManager
@@ -35,6 +47,7 @@ from ai_cli.core.task_manager import TaskManager
 from ai_cli.core.tool_registry import ToolRegistry
 from ai_cli.core.workspace import _DOT_AI_CLI, Workspace, WorkspaceError, get_global_dir
 from ai_cli.utils.logging_utils import setup_logging
+from ai_cli.utils.spinner import Spinner
 
 if TYPE_CHECKING:
     from ai_cli.cli.display import Display
@@ -46,6 +59,10 @@ _PREVIEW_LEN = 120  # max chars shown in the "unanswered message" notice
 # Sentinel stored by argparse when --resume is given with no SESSION_ID argument.
 # Using an object() ensures it cannot be confused with a real session-ID string.
 _RESUME_PICK: object = object()
+
+# Sentinel stored by argparse when --ask is given with no PROMPT argument;
+# the prompt is then read from stdin.
+_ASK_STDIN: object = object()
 
 
 def _truncate(text: str) -> str:
@@ -119,6 +136,61 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ask",
+        nargs="?",
+        const=_ASK_STDIN,
+        metavar="PROMPT",
+        help=(
+            "Send PROMPT to the configured LLM, print the answer, and exit. "
+            "Without PROMPT, the prompt is read from stdin. "
+            "No tools, no session, no REPL — reasoning output is stripped so "
+            "only the final answer reaches stdout."
+        ),
+    )
+    parser.add_argument(
+        "--ai-cli-dir",
+        dest="ai_cli_dir",
+        metavar="DIR",
+        help=(
+            "Use DIR as the project config directory, verbatim, instead of "
+            "locating '<workspace>/.ai-cli/'. DIR need not be named '.ai-cli' "
+            "and no parent directories are searched. Everything project-scoped "
+            "follows it: config.yaml, system_prompt.md, tools/, skills/, "
+            "mcp.yaml, .ignore and tasks.json. With --init, the scaffold is "
+            "created there."
+        ),
+    )
+    parser.add_argument(
+        "--env",
+        metavar="FILE",
+        help=(
+            "Load environment variables from FILE instead of discovering the "
+            "project's .env. Values in FILE override variables already set in "
+            "the environment."
+        ),
+    )
+    _prompt_group = parser.add_mutually_exclusive_group()
+    _prompt_group.add_argument(
+        "--system-prompt",
+        dest="system_prompt",
+        metavar="FILE",
+        help=(
+            "Use FILE as the system prompt, overriding the usual lookup. "
+            "Not applicable to --init or --summarize."
+        ),
+    )
+    _prompt_group.add_argument(
+        "--no-system-prompt",
+        dest="no_system_prompt",
+        action="store_true",
+        help=(
+            "Send no system prompt, even when a system_prompt.md would "
+            "otherwise be found. Skills guidance, which describes a callable "
+            "tool rather than persona instructions, is still included in the "
+            "REPL. Not applicable to --init or --summarize."
+        ),
+    )
+    parser.add_argument(
         "--summarize",
         metavar="FILE",
         help=(
@@ -139,13 +211,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_dotenv(start: Path) -> None:
-    """Load .env from the project root if one exists, otherwise no-op."""
+def _load_dotenv(start: Path, env_file: Path | None = None) -> None:
+    """Load environment variables from a .env file.
+
+    With *env_file*, that file is loaded and project discovery is skipped; the
+    file must exist, and its values override variables already present in the
+    environment (an explicit path is an explicit intent).  Without it, the
+    project root's ``.env`` is loaded when one exists — those values do *not*
+    override the ambient environment — and it is a no-op when no project root
+    or no ``.env`` is found.
+    """
+    if env_file is not None:
+        if not env_file.is_file():
+            print(f"Error: env file not found: {env_file}", file=sys.stderr)
+            sys.exit(1)
+        load_dotenv(env_file, override=True)
+        return
+
     root = Workspace.find_root(start)
     if root is not None:
-        env_file = root / ".env"
-        if env_file.is_file():
-            load_dotenv(env_file)
+        discovered = root / ".env"
+        if discovered.is_file():
+            load_dotenv(discovered)
 
 
 def _pick_session(
@@ -198,8 +285,37 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # --init writes a scaffold and --summarize builds its own prompt, so
+    # neither has a system prompt to override.  Rejecting is more honest than
+    # accepting a flag that would silently do nothing.
+    promptless = "--init" if args.init else ("--summarize" if args.summarize else "")
+    if promptless:
+        unusable = [
+            name
+            for name, given in (
+                ("--system-prompt", args.system_prompt is not None),
+                ("--no-system-prompt", args.no_system_prompt),
+            )
+            if given
+        ]
+        if unusable:
+            print(
+                f"Error: {', '.join(unusable)} cannot be used with "
+                f"{promptless}, which sends no system prompt.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    config_dir = Path(args.ai_cli_dir) if args.ai_cli_dir else None
+    # --init creates the directory; every other mode must find it already there.
+    if config_dir is not None and not args.init and not config_dir.is_dir():
+        print(f"Error: not a directory: {config_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    system_prompt_file = Path(args.system_prompt) if args.system_prompt else None
+
     try:
-        _load_dotenv(start)
+        _load_dotenv(start, Path(args.env) if args.env else None)
         global_dir = get_global_dir()
     except ValueError as exc:
         print("Error: invalid AI_CLI_GLOBAL_DIR environment variable.", file=sys.stderr)
@@ -210,48 +326,46 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Dispatched before _ensure_global_dir: --ask is a non-interactive
+    # one-shot, so it must never block on the "create global dir?" prompt.
+    if args.ask is not None:
+        prompt = sys.stdin.read() if args.ask is _ASK_STDIN else str(args.ask)
+        _cmd_ask(
+            prompt,
+            start,
+            global_dir,
+            config_dir=config_dir,
+            system_prompt_file=system_prompt_file,
+            no_system_prompt=args.no_system_prompt,
+        )
+        return
+
     if not _ensure_global_dir(global_dir):
         sys.exit(0)
 
     if args.init:
-        _cmd_init(start)
+        _cmd_init(start, config_dir)
         return
 
     if args.summarize is not None:
-        _cmd_summarize(Path(args.summarize), start)
+        _cmd_summarize(Path(args.summarize), start, config_dir)
         return
 
+    repl_kwargs: dict = {
+        "display": args.display,
+        "max_tool_rounds": args.max_tool_rounds,
+        "config_dir": config_dir,
+        "system_prompt_file": system_prompt_file,
+        "no_system_prompt": args.no_system_prompt,
+    }
     if args.resume is _RESUME_PICK:
-        _cmd_repl(
-            start,
-            global_dir,
-            resume_list=True,
-            display=args.display,
-            max_tool_rounds=args.max_tool_rounds,
-        )
+        _cmd_repl(start, global_dir, resume_list=True, **repl_kwargs)
     elif args.resume is not None:
-        _cmd_repl(
-            start,
-            global_dir,
-            resume_id=str(args.resume),
-            display=args.display,
-            max_tool_rounds=args.max_tool_rounds,
-        )
+        _cmd_repl(start, global_dir, resume_id=str(args.resume), **repl_kwargs)
     elif args.continue_:
-        _cmd_repl(
-            start,
-            global_dir,
-            continue_=True,
-            display=args.display,
-            max_tool_rounds=args.max_tool_rounds,
-        )
+        _cmd_repl(start, global_dir, continue_=True, **repl_kwargs)
     else:
-        _cmd_repl(
-            start,
-            global_dir,
-            display=args.display,
-            max_tool_rounds=args.max_tool_rounds,
-        )
+        _cmd_repl(start, global_dir, **repl_kwargs)
 
 
 def _show_resume_context(session: Session, ui: Display) -> None:
@@ -384,13 +498,21 @@ def _is_placeholder_only(text: str) -> bool:
     return not _HTML_COMMENT_RE.sub("", text).strip()
 
 
-def load_system_prompt(workspace_root: Path, global_dir: Path) -> str:
+def load_system_prompt(
+    workspace_root: Path | None,
+    global_dir: Path,
+    config_dir: Path | None = None,
+) -> str:
     """Resolve the system prompt using a three-level lookup.
 
     Checked in order:
 
-    1. ``<workspace_root>/.ai-cli/system_prompt.md`` — project-level override.
-    2. ``<workspace_root>/AGENTS.md`` — industry-standard convention.
+    1. ``<config dir>/system_prompt.md`` — project-level override, where the
+       config dir is *config_dir* when given, else
+       ``<workspace_root>/.ai-cli/``.
+    2. ``<workspace_root>/AGENTS.md`` — industry-standard convention.  Skipped
+       when there is no workspace root, since it is a property of the project
+       tree rather than of the config bundle.
     3. ``<global_dir>/system_prompt.md`` — user-level default.
 
     Each candidate is skipped if the file only contains HTML comments and
@@ -399,11 +521,23 @@ def load_system_prompt(workspace_root: Path, global_dir: Path) -> str:
     Returns an empty string when none of the candidates yield usable content,
     which causes the system message to be omitted from the request entirely.
     """
-    candidates: list[Path] = [
-        workspace_root / _DOT_AI_CLI / "system_prompt.md",
-        workspace_root / "AGENTS.md",
-        global_dir / "system_prompt.md",
-    ]
+    candidates: list[Path] = []
+    if config_dir is not None:
+        candidates.append(config_dir / "system_prompt.md")
+    elif workspace_root is not None:
+        candidates.append(workspace_root / _DOT_AI_CLI / "system_prompt.md")
+    if workspace_root is not None:
+        candidates.append(workspace_root / "AGENTS.md")
+    candidates.append(global_dir / "system_prompt.md")
+    return _first_usable_prompt(candidates)
+
+
+def _first_usable_prompt(candidates: list[Path]) -> str:
+    """Return the first candidate's stripped content, or ``""`` if none is usable.
+
+    A candidate is skipped when it cannot be read, holds non-UTF-8 bytes, is
+    blank, or contains only HTML comments (a placeholder scaffold file).
+    """
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8")
@@ -415,6 +549,40 @@ def load_system_prompt(workspace_root: Path, global_dir: Path) -> str:
         if stripped:
             return stripped
     return ""
+
+
+def resolve_system_prompt(
+    global_dir: Path,
+    *,
+    explicit: Path | None,
+    disabled: bool,
+    config_dir: Path | None,
+    workspace_root: Path | None,
+) -> str:
+    """Resolve the base system prompt, honouring the CLI overrides.
+
+    Precedence: ``--no-system-prompt`` beats ``--system-prompt FILE``, which
+    beats :func:`load_system_prompt`.  An explicit file is read verbatim (no
+    placeholder-only filtering) and a missing or unreadable one is a hard
+    error — naming a file that cannot be used is a mistake worth reporting,
+    not something to silently fall back from.
+
+    Returns ``""`` when no system message should be sent.  For the REPL that is
+    the *base* prompt only: skills guidance is still appended by
+    :func:`compose_system_prompt`, since it describes a tool the model can call
+    rather than persona instructions the user asked to drop.
+    """
+    if disabled:
+        return ""
+
+    if explicit is not None:
+        try:
+            return explicit.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"Error: cannot read system prompt file: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    return load_system_prompt(workspace_root, global_dir, config_dir)
 
 
 def compose_system_prompt(base_prompt: str, skills: SkillRegistry) -> str:
@@ -461,16 +629,33 @@ def _cmd_repl(
     continue_: bool = False,
     display: str | None = None,
     max_tool_rounds: int | None = None,
+    config_dir: Path | None = None,
+    system_prompt_file: Path | None = None,
+    no_system_prompt: bool = False,
 ) -> None:
-    """Bootstrap all core objects and start the interactive REPL."""
-    root = Workspace.find_root(start)
-    if root is None:
-        print(
-            f"No .ai-cli/ project found in '{start}' or any parent directory.\n"
-            "Run 'ai-cli --init' to create one.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    """Bootstrap all core objects and start the interactive REPL.
+
+    With *config_dir*, settings are read from that directory instead of a
+    discovered ``.ai-cli/``, and the workspace root becomes *start* itself — no
+    project scaffold has to exist anywhere in the tree.  Everything
+    project-scoped follows the config dir, because it all hangs off
+    :attr:`Workspace.ai_cli_dir`.
+    """
+    if config_dir is not None:
+        # The config bundle is explicit, so the tree needs no .ai-cli/ at all:
+        # files come from *start*, settings come from *config_dir*.
+        root = start
+    else:
+        found = Workspace.find_root(start)
+        if found is None:
+            print(
+                f"No .ai-cli/ project found in '{start}' or any parent directory.\n"
+                "Run 'ai-cli --init' to create one, or point --ai-cli-dir at an "
+                "existing config directory.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        root = found
 
     cli_overrides: dict = {}
     if display is not None:
@@ -478,8 +663,8 @@ def _cmd_repl(
     if max_tool_rounds is not None:
         cli_overrides["max_tool_rounds"] = max_tool_rounds
     try:
-        config = ConfigManager(root, cli_overrides)
-        workspace = Workspace(root, config)
+        config = ConfigManager(root, cli_overrides, config_dir=config_dir)
+        workspace = Workspace(root, config, ai_cli_dir=config_dir)
         llm_client = create_llm_client(config)
         _init_embedding_index(workspace, config, llm_client)
     except (ConfigError, WorkspaceError, LLMError) as exc:
@@ -520,7 +705,7 @@ def _cmd_repl(
     # Load skills registry early so validation warnings are visible at startup.
     # PR1 scope: discovery + validation + warning surface.
     # PR2 scope: model-facing ``skills`` tool registration when skills exist.
-    skills = SkillRegistry.load(root, global_dir=global_dir)
+    skills = SkillRegistry.load(root, global_dir=global_dir, config_dir=config_dir)
     for warning in skills.warnings:
         print(f"Warning: {warning}", file=sys.stderr)
     _, alias_warnings = skill_aliases_for_registry(skills)
@@ -529,7 +714,13 @@ def _cmd_repl(
     _wire_skills(skills, tool_registry, workspace, permission_manager)
 
     def _build_active_system_prompt(current_skills: SkillRegistry) -> str:
-        base_prompt = load_system_prompt(root, global_dir)
+        base_prompt = resolve_system_prompt(
+            global_dir,
+            explicit=system_prompt_file,
+            disabled=no_system_prompt,
+            config_dir=config_dir,
+            workspace_root=root,
+        )
         return compose_system_prompt(base_prompt, current_skills)
 
     # Resolve and apply the active session system prompt before the first LLM call.
@@ -548,7 +739,7 @@ def _cmd_repl(
 
     # Wire up MCP servers (connect, discover tools, register proxies).
     mcp_manager = _wire_mcp(
-        global_dir, root, tool_registry, workspace, permission_manager
+        global_dir, workspace.ai_cli_dir, tool_registry, workspace, permission_manager
     )
 
     if resumed:
@@ -706,7 +897,7 @@ def _wire_skills(
 
 def _wire_mcp(
     global_dir: Path,
-    project_root: Path,
+    project_config_dir: Path,
     tool_registry: ToolRegistry,
     workspace: Workspace,
     permission_manager: PermissionManager,
@@ -718,7 +909,7 @@ def _wire_mcp(
     Errors are logged as warnings; the CLI continues regardless.
     """
     global_mcp = global_dir / "mcp.yaml"
-    project_mcp = project_root / _DOT_AI_CLI / "mcp.yaml"
+    project_mcp = project_config_dir / "mcp.yaml"
 
     if not global_mcp.is_file() and not project_mcp.is_file():
         return None
@@ -787,8 +978,131 @@ def _ensure_global_dir(global_dir: Path) -> bool:
     return True
 
 
-def _cmd_summarize(file_path: Path, start: Path) -> None:
-    """Read *file_path*, call the LLM to summarise it, and print the result."""
+def _cmd_ask(
+    prompt: str,
+    start: Path,
+    global_dir: Path,
+    *,
+    config_dir: Path | None = None,
+    system_prompt_file: Path | None = None,
+    no_system_prompt: bool = False,
+) -> None:
+    """Send *prompt* to the configured LLM and print only the answer text.
+
+    A one-shot mode: no session, no tools, no REPL.  ``reasoning`` chunks are
+    dropped and ``<think>…</think>`` tags are stripped (even when
+    ``extract_think_tags`` is off in config), so stdout carries the cleaned-up
+    answer and nothing else.  Leading and trailing whitespace is trimmed while
+    still streaming, so piping the output stays predictable.
+
+    While waiting for the model a spinner is drawn on **stderr** (never stdout,
+    and only when stderr is a terminal), so an interactive caller can see the
+    command has not hung without corrupting captured output.
+
+    A system prompt is resolved via :func:`_resolve_ask_system_prompt` and sent
+    as a leading system message when one is found.  Skills guidance is never
+    appended — this mode exposes no tools for a skill to drive.
+
+    With *config_dir*, ``config.yaml`` and ``system_prompt.md`` are read from
+    that directory verbatim and no project root is searched for, so the mode can
+    run against a self-contained bundle owned by another application.
+    """
+    prompt = prompt.strip()
+    if not prompt:
+        print("Error: empty prompt.", file=sys.stderr)
+        sys.exit(1)
+
+    if config_dir is not None and not config_dir.is_dir():
+        print(f"Error: not a directory: {config_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # With an explicit config dir, take it verbatim; otherwise discover the
+    # workspace, falling back to global-only config when there is none.
+    root = None if config_dir is not None else Workspace.find_root(start)
+    try:
+        config = ConfigManager(root, {}, config_dir=config_dir)
+        llm_client = create_llm_client(config)
+    except (ConfigError, LLMError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    system_prompt = resolve_system_prompt(
+        global_dir,
+        explicit=system_prompt_file,
+        disabled=no_system_prompt,
+        config_dir=config_dir,
+        workspace_root=root,
+    )
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    parser = _ThinkTagParser()
+    spinner = Spinner()
+    started = False  # True once non-whitespace output has been written
+    pending = ""  # trailing whitespace held back until more text follows
+
+    def emit(text: str) -> None:
+        nonlocal started, pending
+        if not text:
+            return
+        if not started:
+            text = text.lstrip()
+            if not text:
+                return
+            started = True
+        stripped = text.rstrip()
+        if stripped:
+            # Erase the spinner before the first byte of the answer reaches the
+            # terminal, so it cannot overwrite the start of the output.
+            spinner.stop()
+            sys.stdout.write(pending + stripped)
+            sys.stdout.flush()
+            pending = text[len(stripped) :]
+        else:
+            pending += text
+
+    # The spinner covers the whole wait: reasoning tokens are discarded, so a
+    # reasoning model can stay silent on stdout for a long time before the
+    # first word of the answer appears.
+    spinner.start()
+    try:
+        for chunk in llm_client.send(messages, []):
+            if chunk.get("type") != "text":
+                continue  # drop reasoning, tool-call and done chunks
+            for part in parser.feed(chunk.get("delta", "")):
+                if part["type"] == "text":
+                    emit(part["delta"])
+        for part in parser.flush():
+            if part["type"] == "text":
+                emit(part["delta"])
+    except LLMError as exc:
+        spinner.stop()  # erase before the error, not after it
+        if started:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        spinner.stop()
+
+    if not started:
+        print("Error: the model returned an empty response.", file=sys.stderr)
+        sys.exit(1)
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _cmd_summarize(
+    file_path: Path, start: Path, config_dir: Path | None = None
+) -> None:
+    """Read *file_path*, call the LLM to summarise it, and print the result.
+
+    *config_dir* overrides where ``config.yaml`` is read from, so a summary can
+    be run against a standalone config bundle.
+    """
     # Ensure warnings from _summarize_document are visible on stderr.
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
@@ -797,12 +1111,9 @@ def _cmd_summarize(file_path: Path, start: Path) -> None:
         sys.exit(1)
 
     # Load config from workspace if one exists; fall back to global-only config.
-    root = Workspace.find_root(start)
+    root = None if config_dir is not None else Workspace.find_root(start)
     try:
-        if root is not None:
-            config = ConfigManager(root, {})
-        else:
-            config = ConfigManager(None, {})
+        config = ConfigManager(root, {}, config_dir=config_dir)
     except ConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -855,8 +1166,13 @@ def _cmd_summarize(file_path: Path, start: Path) -> None:
     print(summary)
 
 
-def _cmd_init(path: Path) -> None:
-    dot = path / _DOT_AI_CLI
+def _cmd_init(path: Path, config_dir: Path | None = None) -> None:
+    """Scaffold a project config directory.
+
+    Creates ``<path>/.ai-cli/`` unless *config_dir* names somewhere else, in
+    which case the scaffold is written there verbatim.
+    """
+    dot = config_dir if config_dir is not None else path / _DOT_AI_CLI
     if dot.exists():
         try:
             answer = (
@@ -871,13 +1187,13 @@ def _cmd_init(path: Path) -> None:
             return
 
     try:
-        Workspace.initialise(path)
+        Workspace.initialise(path, config_dir)
     except (WorkspaceError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Initialised ai-cli project in '{dot}'.")
-    print("Edit '.ai-cli/config.yaml' to configure your backend and model.")
+    print(f"Edit '{dot / 'config.yaml'}' to configure your backend and model.")
 
 
 if __name__ == "__main__":

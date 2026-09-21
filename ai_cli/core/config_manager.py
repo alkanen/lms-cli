@@ -65,6 +65,22 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _project_config_dir(
+    project_root: Path | None,
+    config_dir: Path | None,
+) -> Path | None:
+    """Return the directory holding the project config, or ``None`` if there is none.
+
+    An explicit *config_dir* wins and is used verbatim (it need not be named
+    ``.ai-cli``); otherwise the conventional ``<project_root>/.ai-cli/`` is used.
+    """
+    if config_dir is not None:
+        return config_dir
+    if project_root is not None:
+        return project_root / _DOT_AI_CLI
+    return None
+
+
 class ConfigManager:
     """
     Loads and merges configuration from global, project, and CLI sources.
@@ -78,12 +94,18 @@ class ConfigManager:
     cli_overrides:
         Dict of key/value pairs provided via CLI flags.  These take
         highest priority and override everything else.
+    config_dir:
+        Directory holding the project ``config.yaml``, used *verbatim* and
+        in place of ``<project_root>/.ai-cli/``.  The directory need not be
+        named ``.ai-cli``.  ``None`` (default) derives it from *project_root*
+        as usual.
     """
 
     def __init__(
         self,
         project_root: Path | None,
         cli_overrides: dict,
+        config_dir: Path | None = None,
     ) -> None:
         global_path = get_global_dir() / "config.yaml"
         global_cfg = _load_yaml(global_path)
@@ -92,8 +114,9 @@ class ConfigManager:
         )
 
         project_cfg: dict = {}
-        if project_root is not None:
-            project_path = project_root / _DOT_AI_CLI / "config.yaml"
+        project_dir = _project_config_dir(project_root, config_dir)
+        if project_dir is not None:
+            project_path = project_dir / "config.yaml"
             project_cfg = _load_yaml(project_path)
             logger.debug(
                 "Project config loaded from %s (%d key(s))",
